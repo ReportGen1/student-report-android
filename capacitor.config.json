@@ -1,7 +1,7 @@
 
 {
   "appId": "com.reportgen1.reportsheet",
-  "appName": "reportsheet",
+  "appName": "Digital Schools Solution",
   "webDir": "www",
   "server": {
     "url": "https://reportgen1.github.io/ReportSheet/"
