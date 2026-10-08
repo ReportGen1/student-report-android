@@ -9,5 +9,8 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(PrintPlugin.class);
         super.onCreate(savedInstanceState);
+
+        // Ignore the phone's font-size setting so printed layout matches the browser.
+        getBridge().getWebView().getSettings().setTextZoom(100);
     }
 }
