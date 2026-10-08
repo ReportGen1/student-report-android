@@ -1,5 +1,9 @@
+
 {
   "appId": "com.reportgen1.reportsheet",
-  "appName": "ReportSheet",
-  "webDir": "www"
+  "appName": "reportsheet",
+  "webDir": "www",
+  "server": {
+    "url": "https://reportgen1.github.io/ReportSheet/"
+  }
 }
