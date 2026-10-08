@@ -21,8 +21,8 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Build APK
+        working-directory: android
         run: |
-          cd android
           chmod +x gradlew
           ./gradlew assembleDebug
 
