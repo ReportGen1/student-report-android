@@ -16142,7 +16142,17 @@ function buildReportPrintLayer() {
 
 }
 
+/* Android app: the app print flow below builds and fits the print layer
+   itself. The WebView can ALSO fire "beforeprint" when the print job starts,
+   and the website handler would then throw that layer away and rebuild it
+   with the website sizing (shrink only, never enlarge) - which is why the
+   app print kept coming out the same whatever was changed. This flag makes
+   the website handler leave the app's layer alone. */
+let appPrintLayerReady = false;
+
 function prepareReportsForPrint() {
+    if (appPrintLayerReady && reportPrintLayer) return;
+
     if (!reportContainer) return;
 
     buildReportPrintLayer();
@@ -16239,7 +16249,7 @@ function waitForPrintImages(layer, maxMs) {
    (boxes of known size) instead of the report, so the real behaviour of the
    Android print engine can be measured. Set to false (or delete this block)
    when the test is done. */
-const PRINT_CALIBRATE = true;
+const PRINT_CALIBRATE = false;
 
 function buildCalibrationHtml() {
     const probe = document.createElement("div");
@@ -16289,6 +16299,7 @@ async function prepareReportsForPrintInApp() {
 
     if (PRINT_CALIBRATE && reportPrintLayer) {
         reportPrintLayer.innerHTML = buildCalibrationHtml();
+        appPrintLayerReady = true;
         document.documentElement.classList.add("printing-reports");
         return;
     }
@@ -16309,10 +16320,12 @@ async function prepareReportsForPrintInApp() {
             " | svg pages: " + (reportPrintLayer ? reportPrintLayer.querySelectorAll("svg.report-svg-page").length : 0));
     }
 
+    appPrintLayerReady = true;
     document.documentElement.classList.add("printing-reports");
 }
 
 function restoreReportsAfterPrint() {
+    appPrintLayerReady = false;
     document.documentElement.classList.remove("printing-reports");
 
     if (reportPrintLayer) {
