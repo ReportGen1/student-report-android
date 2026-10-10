@@ -16011,10 +16011,7 @@ function fitReportsToSinglePage(layer, fillPage) {
                 }
             }
 
-            const printedPx = printedHeightAt(low);
-            window.__printDebug = "NEW fit code v2 | scale " + low.toFixed(2) +
-                " | fills " + Math.round(printedPx / maxInnerHeightPx * 100) + "% of page height" +
-                " | natural height " + Math.round(naturalHeightPx) + "px";
+            printedHeightAt(low);
             report.style.setProperty("height", pageHeightMm + "mm", "important");
             wrapReportAsSvgPage(report, pageWidthMm, pageHeightMm);
         } else if (naturalHeightPx > maxInnerHeightPx && naturalHeightPx > 0) {
@@ -16245,64 +16242,10 @@ function waitForPrintImages(layer, maxMs) {
     ]);
 }
 
-/* TEMPORARY TEST: when true, the Print button in the app prints a ruler page
-   (boxes of known size) instead of the report, so the real behaviour of the
-   Android print engine can be measured. Set to false (or delete this block)
-   when the test is done. */
-const PRINT_CALIBRATE = false;
-
-function buildCalibrationHtml() {
-    const probe = document.createElement("div");
-    probe.style.cssText = "position:fixed;left:-9999px;top:0;visibility:hidden;";
-    probe.innerHTML = '<div style="width:210mm;height:1px"></div><div style="width:100mm;height:1px"></div>';
-    document.body.appendChild(probe);
-    const mm210 = probe.children[0].getBoundingClientRect().width;
-    const mm100 = probe.children[1].getBoundingClientRect().width;
-    probe.remove();
-
-    const ua = (navigator.userAgent.match(/Chrome\/[\d.]+/) || ["?"])[0];
-    const info =
-        "innerWidth " + window.innerWidth + " | innerHeight " + window.innerHeight +
-        " | dpr " + window.devicePixelRatio + " | screen " + screen.width + "x" + screen.height +
-        " | 210mm = " + mm210.toFixed(1) + "px | 100mm = " + mm100.toFixed(1) + "px | " + ua;
-
-    const bar = function (label, width, color) {
-        return '<div style="width:' + width + ';height:9mm;background:' + color +
-            ';color:#000;font:bold 12px Arial;line-height:9mm;padding-left:2mm;box-sizing:border-box;' +
-            'margin:0 0 2mm 0;border-right:3px solid #000;">' + label + '</div>';
-    };
-
-    return '<div style="margin:0;padding:3mm 0 0 0;background:#fff;color:#000;font:16px Arial;">' +
-        '<div style="font:bold 13px Arial;margin:0 0 2mm 0;">PRINT TEST v1</div>' +
-        '<div style="font:11px Arial;margin:0 0 3mm 0;word-break:break-all;">' + info + '</div>' +
-        bar("A: width 210mm", "210mm", "#f99") +
-        bar("B: width 100% of page", "100%", "#9d9") +
-        bar("C: width 794px", "794px", "#9bf") +
-        bar("D: width 100mm", "100mm", "#fc8") +
-        bar("E: width 50%", "50%", "#dcf") +
-        '<div style="margin:0 0 3mm 0;"><span style="font-size:12px;">F: 12px text</span> ' +
-        '<span style="font-size:16px;">16px text</span> <span style="font-size:24px;">24px text</span></div>' +
-        '<svg class="report-svg-page" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 794 420" preserveAspectRatio="xMinYMin meet">' +
-        '<foreignObject x="0" y="0" width="794" height="420">' +
-        '<div xmlns="http://www.w3.org/1999/xhtml" style="width:794px;height:420px;box-sizing:border-box;border:8px solid #000;' +
-        'background:#eef;font:20px Arial;padding:10px;">G: SVG frame 794 x 420 px (should touch both page edges)' +
-        '<div style="font:12px Arial;margin-top:8px;">12px text inside the SVG</div>' +
-        '<div style="font:16px Arial;margin-top:8px;">16px text inside the SVG</div></div>' +
-        '</foreignObject></svg>' +
-        '</div>';
-}
-
 async function prepareReportsForPrintInApp() {
     if (!reportContainer) return;
 
     buildReportPrintLayer();
-
-    if (PRINT_CALIBRATE && reportPrintLayer) {
-        reportPrintLayer.innerHTML = buildCalibrationHtml();
-        appPrintLayerReady = true;
-        document.documentElement.classList.add("printing-reports");
-        return;
-    }
 
     if (reportPrintLayer) await waitForPrintImages(reportPrintLayer, 4000);
 
@@ -16311,13 +16254,6 @@ async function prepareReportsForPrintInApp() {
     } catch (error) {
         console.error("Desktop-width fit failed, using on-screen fit:", error);
         fitReportsToSinglePage(reportPrintLayer, true);
-    }
-
-    /* TEMPORARY: shows the fit numbers so you can confirm the new code is
-       running in the app. Delete this line when the print looks right. */
-    if (window.__printDebug) {
-        alert(window.__printDebug.replace("NEW fit code v2", "NEW fit code v3 (SVG page)") +
-            " | svg pages: " + (reportPrintLayer ? reportPrintLayer.querySelectorAll("svg.report-svg-page").length : 0));
     }
 
     appPrintLayerReady = true;
