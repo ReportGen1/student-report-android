@@ -15903,6 +15903,42 @@ const APP_PAD_SIDE_MM = 6;
 const APP_PAD_BOTTOM_MM = 2;
 const APP_MAX_GROW = 3.0;            // never enlarge more than this, so a tiny report is not blown up absurdly
 
+/* Android app only. The Android print engine lays the page out at a width
+   that is not the same as the A4 width the report was measured at, so a
+   report built from mm and px sizes came out smaller than the page. Putting
+   the finished report inside an SVG with a fixed viewBox makes the engine
+   scale the WHOLE report evenly to the page width, so it fills the page
+   whatever width the engine uses. Text stays sharp (it is not an image). */
+function wrapReportAsSvgPage(report, pageWidthMm, pageHeightMm) {
+    const doc = report.ownerDocument;
+    const NS = "http://www.w3.org/2000/svg";
+    const widthPx = pageWidthMm * MM_TO_PX;
+    const heightPx = pageHeightMm * MM_TO_PX;
+
+    /* The svg page break replaces the report's own page break. */
+    report.style.setProperty("break-after", "auto", "important");
+    report.style.setProperty("page-break-after", "auto", "important");
+    report.style.setProperty("break-before", "auto", "important");
+    report.style.setProperty("page-break-before", "auto", "important");
+    report.style.setProperty("margin", "0", "important");
+
+    const svg = doc.createElementNS(NS, "svg");
+    svg.setAttribute("class", "report-svg-page");
+    svg.setAttribute("xmlns", NS);
+    svg.setAttribute("viewBox", "0 0 " + widthPx + " " + heightPx);
+    svg.setAttribute("preserveAspectRatio", "xMinYMin meet");
+
+    const box = doc.createElementNS(NS, "foreignObject");
+    box.setAttribute("x", "0");
+    box.setAttribute("y", "0");
+    box.setAttribute("width", String(widthPx));
+    box.setAttribute("height", String(heightPx));
+
+    report.parentNode.insertBefore(svg, report);
+    svg.appendChild(box);
+    box.appendChild(report);
+}
+
 function fitReportsToSinglePage(layer, fillPage) {
     layer = layer || reportPrintLayer;
     if (!layer) return;
@@ -15980,6 +16016,7 @@ function fitReportsToSinglePage(layer, fillPage) {
                 " | fills " + Math.round(printedPx / maxInnerHeightPx * 100) + "% of page height" +
                 " | natural height " + Math.round(naturalHeightPx) + "px";
             report.style.setProperty("height", pageHeightMm + "mm", "important");
+            wrapReportAsSvgPage(report, pageWidthMm, pageHeightMm);
         } else if (naturalHeightPx > maxInnerHeightPx && naturalHeightPx > 0) {
             const scale = maxInnerHeightPx / naturalHeightPx;
             inner.style.transformOrigin = "top left";
@@ -16045,7 +16082,7 @@ function buildReportPrintLayer() {
         @media print {
             html,
             body {
-                width: 210mm !important;
+                width: ${isNativeApp() ? "100%" : "210mm"} !important;
                 min-width: 0 !important;
                 margin: 0 !important;
                 padding: 0 !important;
@@ -16079,6 +16116,23 @@ function buildReportPrintLayer() {
             }
 
             #reportPrintLayer .report:last-child {
+                break-after: auto;
+                page-break-after: auto;
+            }
+
+            #reportPrintLayer svg.report-svg-page {
+                display: block !important;
+                width: 100% !important;
+                height: auto !important;
+                margin: 0 !important;
+                overflow: hidden !important;
+                break-inside: avoid;
+                page-break-inside: avoid;
+                break-after: page;
+                page-break-after: always;
+            }
+
+            #reportPrintLayer svg.report-svg-page:last-child {
                 break-after: auto;
                 page-break-after: auto;
             }
