@@ -42,11 +42,46 @@ const SUPABASE_URL =
 const SUPABASE_KEY =
     "sb_publishable_Iaro_sV4r31wPbLycRB4Eg_OCDBy2u3";
 
+/* In the Android app (WebView) the browser Web Locks API can leave the
+   sign-in request waiting forever, so the app skips the lock. The app
+   runs a single page, so no lock is needed. Browsers are unchanged. */
+const IS_ANDROID_APP =
+    !!(window.Capacitor &&
+        typeof window.Capacitor.isNativePlatform === "function" &&
+        window.Capacitor.isNativePlatform());
+
 const supabaseClient =
     supabase.createClient(
         SUPABASE_URL,
-        SUPABASE_KEY
+        SUPABASE_KEY,
+        IS_ANDROID_APP
+            ? {
+                auth: {
+                    lock: async function (name, acquireTimeout, fn) {
+                        return await fn();
+                    }
+                }
+            }
+            : undefined
     );
+
+/* Android app only: show uncaught errors on screen so a silent failure
+   (e.g. a button that does nothing) can be diagnosed. */
+if (IS_ANDROID_APP) {
+    let shownErrors = 0;
+    const showAppError = function (label, message) {
+        if (shownErrors >= 3) return;
+        shownErrors++;
+        try { alert("\u26A0 " + label + ": " + message); } catch (e) { /* ignore */ }
+    };
+    window.addEventListener("error", function (event) {
+        showAppError("Script error", (event && event.message) + (event && event.lineno ? " (line " + event.lineno + ")" : ""));
+    });
+    window.addEventListener("unhandledrejection", function (event) {
+        const reason = event && event.reason;
+        showAppError("Unhandled error", reason && reason.message ? reason.message : String(reason));
+    });
+}
 
 
 /* =========================================================
@@ -1398,7 +1433,7 @@ function attachAuthenticationEvents() {
     printReportButton.addEventListener(
         "click",
         function () {
-            window.print();
+            printReportsPage();
         }
     );
     }
@@ -1525,7 +1560,8 @@ function attachAuthenticationEvents() {
                     );
 
                     setAuthStatus(
-                        "❌ An unexpected error occurred."
+                        "❌ An unexpected error occurred: " +
+                        (error && error.message ? error.message : error)
                     );
 
                 }
@@ -1626,7 +1662,8 @@ function attachAuthenticationEvents() {
                     );
 
                     setAuthStatus(
-                        "❌ Unable to sign in."
+                        "❌ Unable to sign in: " +
+                        (error && error.message ? error.message : error)
                     );
 
                 }
@@ -2049,6 +2086,111 @@ function withTimeout(promise, ms, fallbackValue) {
    - Staff: read-only copy of the owner's profile.
    ========================================================= */
 
+const SCHOOL_LOGO_BUCKET = "school-logos";
+const SCHOOL_LOGO_MAX_W = 200;
+const SCHOOL_LOGO_MAX_H = 250;
+const SCHOOL_LOGO_PNG_MAX_BYTES = 30 * 1024;   /* bigger than this -> saved as a small JPEG instead */
+
+/* Shrinks an image (File/Blob) to fit inside 200 x 250 px (keeps the shape,
+   never crops or stretches, never enlarges). Saved as PNG so a transparent
+   background is kept; if that is still over about 30 KB it is saved as a
+   white-background JPEG (about 8-14 KB). Falls back to the original file if
+   the browser cannot re-encode it. */
+function shrinkLogoBlob(blob) {
+    return new Promise(function (resolve) {
+        const url = URL.createObjectURL(blob);
+        const image = new Image();
+
+        image.onload = function () {
+            try {
+                const w = image.naturalWidth || 1;
+                const h = image.naturalHeight || 1;
+                const scale = Math.min(1, SCHOOL_LOGO_MAX_W / w, SCHOOL_LOGO_MAX_H / h);
+                const canvas = document.createElement("canvas");
+                canvas.width = Math.max(1, Math.round(w * scale));
+                canvas.height = Math.max(1, Math.round(h * scale));
+                const context = canvas.getContext("2d");
+                context.imageSmoothingQuality = "high";
+                context.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+                canvas.toBlob(function (png) {
+                    if (png && png.size <= SCHOOL_LOGO_PNG_MAX_BYTES) {
+                        URL.revokeObjectURL(url);
+                        resolve(png);
+                        return;
+                    }
+
+                    context.globalCompositeOperation = "destination-over";
+                    context.fillStyle = "#ffffff";
+                    context.fillRect(0, 0, canvas.width, canvas.height);
+
+                    canvas.toBlob(function (jpg) {
+                        URL.revokeObjectURL(url);
+                        resolve(jpg || png || blob);
+                    }, "image/jpeg", 0.72);
+                }, "image/png");
+            } catch (error) {
+                URL.revokeObjectURL(url);
+                resolve(blob);
+            }
+        };
+
+        image.onerror = function () {
+            URL.revokeObjectURL(url);
+            resolve(blob);
+        };
+
+        image.src = url;
+    });
+}
+
+/* Uploads the logo to Supabase Storage (one file per school) and returns its
+   public link. Only this short link is saved in the database tables. */
+async function uploadSchoolLogoToStorage(blob) {
+    const { data: userData, error: userError } = await supabaseClient.auth.getUser();
+
+    if (userError || !userData || !userData.user) {
+        throw new Error("Not signed in");
+    }
+
+    const small = await shrinkLogoBlob(blob);
+    const ext = small.type === "image/png" ? "png" : (small.type === "image/jpeg" ? "jpg" : "img");
+    const path = userData.user.id + "/logo." + ext;
+
+    const { error } = await supabaseClient.storage
+        .from(SCHOOL_LOGO_BUCKET)
+        .upload(path, small, {
+            upsert: true,
+            contentType: small.type || "image/png",
+            cacheControl: "3600"
+        });
+
+    if (error) throw error;
+
+    const { data } = supabaseClient.storage.from(SCHOOL_LOGO_BUCKET).getPublicUrl(path);
+
+    /* The file name never changes, so add a version to bypass old cached copies. */
+    return data.publicUrl + "?v=" + Date.now();
+}
+
+/* One-time move of an older logo that is still stored inside the database
+   (a "data:" image) into Storage. Returns true if the logo was replaced. */
+async function migrateSchoolLogoToStorage() {
+    const logo = reportSettings && reportSettings.schoolLogo;
+
+    if (staffContext || !logo || logo.indexOf("data:") !== 0) return false;
+
+    try {
+        const blob = await (await fetch(logo)).blob();
+        reportSettings.schoolLogo = await uploadSchoolLogoToStorage(blob);
+        return true;
+    } catch (error) {
+        /* Keep the old logo working; it will be tried again next login. */
+        console.error("Logo migration failed:", error);
+        return false;
+    }
+}
+
 const SCHOOL_PROFILE_TABLE = "school_profile";
 const SCHOOL_PROFILE_OWNER_KEY = "srgSchoolProfileOwner";
 
@@ -2113,6 +2255,8 @@ function applySchoolProfile(row) {
 
 function resetSchoolProfileState() {
 
+    resetStudentPhotoState();
+
     schoolProfileLoaded = false;
     lastSyncedProfileJson = "";
 
@@ -2170,6 +2314,9 @@ async function loadSchoolProfile(authUserId) {
 
             applySchoolProfile(data);
 
+            /* Older logos stored inside the database are moved to Storage. */
+            const migratedLogo = await migrateSchoolLogoToStorage();
+
             let uploadSubjects = false;
 
             if (!staffContext) {
@@ -2190,17 +2337,18 @@ async function loadSchoolProfile(authUserId) {
 
             }
 
-            lastSyncedProfileJson = uploadSubjects ? "" : JSON.stringify(buildSchoolProfilePayload());
+            lastSyncedProfileJson = (uploadSubjects || migratedLogo) ? "" : JSON.stringify(buildSchoolProfilePayload());
             saveAppData();
             loadSchoolInformation();
 
             if (!staffContext) renderSubjectList();
 
-            if (uploadSubjects) await syncSchoolProfile(true);
+            if (uploadSubjects || migratedLogo) await syncSchoolProfile(true);
 
         } else if (!staffContext && (!schoolInfoIsDefault() || !schoolSubjectsAreDefault())) {
 
             /* First time: upload what this browser already has. */
+            await migrateSchoolLogoToStorage();
             profileSubjects = schoolSubjects.slice();
             await syncSchoolProfile(true);
 
@@ -2317,6 +2465,8 @@ function prepareReportWatermark() {
     image.onerror = function () {
         watermarkSmall = "";
     };
+
+    if (logo.indexOf("data:") !== 0) image.crossOrigin = "anonymous";
 
     image.src = logo;
 
@@ -2832,10 +2982,30 @@ async function refreshStaffManagement() {
 
         if (assignmentResult.error) throw assignmentResult.error;
 
+        /* Who may post announcements. Not fatal if announcements.sql has
+           not been run yet - the rest of staff management still works. */
+        let posters = [];
+        let postersAvailable = true;
+
+        const posterResult = await supabaseClient
+            .from("announcement_posters")
+            .select("id, staff_user_id")
+            .eq("owner_user_id", currentUserId)
+            .eq("website_id", WEBSITE_ID);
+
+        if (posterResult.error) {
+            console.error("Announcement posters load error:", posterResult.error);
+            postersAvailable = false;
+        } else {
+            posters = posterResult.data || [];
+        }
+
         staffManagementState = {
             code: codeResult.data || "",
             staff: staffResult.data || [],
-            assignments: assignmentResult.data || []
+            assignments: assignmentResult.data || [],
+            posters: posters,
+            postersAvailable: postersAvailable
         };
 
         renderStaffManagement();
@@ -2904,6 +3074,16 @@ function renderStaffManagement() {
                 }).join("") + "</ul>"
                 : "<p><em>No class or subject assigned yet.</em></p>";
 
+            const canPost = (state.posters || []).some(function (p) { return p.staff_user_id === s.staff_user_id; });
+
+            const posterRow = state.postersAvailable
+                ? '<div class="srg-staff-poster" style="margin:8px 0;">📢 <small>Announcements: ' +
+                  (canPost ? "<strong>allowed to post</strong>" : "cannot post") + "</small> " +
+                  '<button type="button" data-staff-action="' + (canPost ? "poster-off" : "poster-on") +
+                  '" data-id="' + s.id + '" data-staff-user="' + s.staff_user_id + '">' +
+                  (canPost ? "Stop allowing" : "Allow to post") + "</button></div>"
+                : '<div class="srg-staff-poster" style="margin:8px 0;"><small>📢 Announcement permission is not available yet (run announcements.sql in Supabase).</small></div>';
+
             return '<div class="srg-staff-card">' + person(s) + list +
                 '<div class="srg-staff-add">' +
                 '<select data-field="role"><option value="subject">Subject teacher</option>' +
@@ -2912,7 +3092,7 @@ function renderStaffManagement() {
                 '<input type="text" data-field="subject" list="srgSubjectOptions" placeholder="Subject (for subject teachers)"> ' +
                 '<button type="button" data-staff-action="add-assignment" data-id="' + s.id +
                 '" data-staff-user="' + s.staff_user_id + '">Add</button>' +
-                "</div>" +
+                "</div>" + posterRow +
                 '<div class="srg-staff-actions">' +
                 '<button type="button" data-staff-action="revoke" data-id="' + s.id + '">Remove access</button>' +
                 "</div></div>";
@@ -2993,6 +3173,19 @@ async function onStaffManagementClick(event) {
                 .eq("owner_user_id", currentUserId);
             if (result.error) throw result.error;
 
+            if (action === "revoke") {
+                const staffRow = staffManagementState.staff.find(function (x) { return String(x.id) === String(id); });
+                if (staffRow) {
+                    const posterCleanup = await supabaseClient
+                        .from("announcement_posters")
+                        .delete()
+                        .eq("owner_user_id", currentUserId)
+                        .eq("website_id", WEBSITE_ID)
+                        .eq("staff_user_id", staffRow.staff_user_id);
+                    if (posterCleanup.error) console.error("Poster cleanup error:", posterCleanup.error);
+                }
+            }
+
         } else if (action === "delete-staff") {
 
             const person = staffManagementState.staff.find(function (s) { return String(s.id) === String(id); });
@@ -3035,6 +3228,40 @@ async function onStaffManagementClick(event) {
             if (cleanup.error) {
                 console.error("Assignment cleanup error:", cleanup.error);
             }
+
+            const posterCleanup2 = await supabaseClient
+                .from("announcement_posters")
+                .delete()
+                .eq("owner_user_id", currentUserId)
+                .eq("website_id", WEBSITE_ID)
+                .eq("staff_user_id", button.getAttribute("data-staff-user"));
+
+            if (posterCleanup2.error) {
+                console.error("Poster cleanup error:", posterCleanup2.error);
+            }
+
+        } else if (action === "poster-on") {
+
+            const result = await supabaseClient
+                .from("announcement_posters")
+                .insert({
+                    owner_user_id: currentUserId,
+                    website_id: WEBSITE_ID,
+                    staff_user_id: button.getAttribute("data-staff-user")
+                });
+
+            /* 23505 = already allowed: nothing to do */
+            if (result.error && result.error.code !== "23505") throw result.error;
+
+        } else if (action === "poster-off") {
+
+            const result = await supabaseClient
+                .from("announcement_posters")
+                .delete()
+                .eq("owner_user_id", currentUserId)
+                .eq("website_id", WEBSITE_ID)
+                .eq("staff_user_id", button.getAttribute("data-staff-user"));
+            if (result.error) throw result.error;
 
         } else if (action === "remove-assignment") {
 
@@ -4127,48 +4354,35 @@ function handleSchoolLogoUpload(event) {
     }
 
 
-    const reader =
-        new FileReader();
+    if (schoolInformationStatus) {
+        schoolInformationStatus.textContent = "Uploading logo...";
+    }
 
+    uploadSchoolLogoToStorage(file)
+        .then(function (url) {
 
-    reader.onload =
-        function () {
-
-            reportSettings.schoolLogo =
-                reader.result;
-
+            reportSettings.schoolLogo = url;
 
             saveAppData();
 
-
             displaySchoolLogoPreview();
 
-
-            if (
-                schoolInformationStatus
-            ) {
-
-                schoolInformationStatus.textContent =
-                    "✓ School logo uploaded.";
-
+            if (schoolInformationStatus) {
+                schoolInformationStatus.textContent = "✓ School logo uploaded.";
             }
 
-        };
+        })
+        .catch(function (error) {
 
+            console.error("School logo upload error:", error);
 
-    reader.onerror =
-        function () {
+            if (schoolInformationStatus) {
+                schoolInformationStatus.textContent = "";
+            }
 
-            alert(
-                "Unable to read the school logo."
-            );
+            alert("Unable to upload the school logo. Check your internet connection and try again.");
 
-        };
-
-
-    reader.readAsDataURL(
-        file
-    );
+        });
 
 }
 
@@ -5299,15 +5513,30 @@ let rosterFetchFailed = false;
 let cumulativeModel = null;
 
 /* =========================================================
-   STUDENT PASSPORT PHOTOS — BROWSER ONLY
-   Photos are stored in IndexedDB, never in Supabase. A small in-memory
-   cache makes report generation synchronous after the photo is selected.
+   STUDENT PASSPORT PHOTOS — SAVED IN SUPABASE (table student_photos)
+   Photos now follow the school account, so they appear in the Android
+   app as well as in the browser. Each photo is resized on the phone
+   (max 400 px, JPEG) before it is saved. A small in-memory cache keeps
+   report generation synchronous.
+   The old browser-only store (IndexedDB) is only READ, once, to move
+   photos that were saved there earlier into the account.
    ========================================================= */
+const STUDENT_PHOTO_TABLE = "student_photos";
+/* Passport size: 4:5 portrait, matching how the report shows it (72 x 90).
+   200 x 250 px at JPEG quality 0.72 is about 8-14 KB per photo. */
+const STUDENT_PHOTO_WIDTH = 200;
+const STUDENT_PHOTO_HEIGHT = 250;
+const STUDENT_PHOTO_QUALITY = 0.72;
+const STUDENT_PHOTO_SHRINK_ABOVE = 20000;   /* characters; bigger saved photos get shrunk once */
+const STUDENT_PHOTO_MAX_FILE_BYTES = 8 * 1024 * 1024;
 const STUDENT_PHOTO_DB_NAME = "StudentReportGeneratorPhotos";
 const STUDENT_PHOTO_DB_VERSION = 1;
 const STUDENT_PHOTO_STORE = "photos";
 const studentPhotoCache = new Map();
 let studentPhotoDB = null;
+let studentPhotosLoadedFor = "";
+let studentPhotosLoading = null;
+let studentPhotoNotice = "";
 
 function studentPhotoKey(admissionNo, studentName) {
     const admission = normalizeStudentAdmissionNo(admissionNo);
@@ -5315,66 +5544,282 @@ function studentPhotoKey(admissionNo, studentName) {
     return "name:" + normalizeStudentName(studentName);
 }
 
+/* Owner, or a form master, may add / change / remove photos. */
+function canEditStudentPhotos() {
+    if (!staffContext) return true;
+    return staffContext.assignments.some(function (a) { return !a.subject; });
+}
+
+function resetStudentPhotoState() {
+    studentPhotoCache.clear();
+    studentPhotosLoadedFor = "";
+    studentPhotosLoading = null;
+    studentPhotoNotice = "";
+}
+
+/* ---- legacy browser store (read only, used once for moving photos) ---- */
 function openStudentPhotoDB() {
     if (!window.indexedDB) return Promise.resolve(null);
     if (studentPhotoDB) return Promise.resolve(studentPhotoDB);
     return new Promise(function (resolve) {
-        const request = indexedDB.open(STUDENT_PHOTO_DB_NAME, STUDENT_PHOTO_DB_VERSION);
-        request.onupgradeneeded = function () {
-            const db = request.result;
-            if (!db.objectStoreNames.contains(STUDENT_PHOTO_STORE)) {
-                db.createObjectStore(STUDENT_PHOTO_STORE);
-            }
-        };
-        request.onsuccess = function () {
-            studentPhotoDB = request.result;
-            resolve(studentPhotoDB);
-        };
-        request.onerror = function () { resolve(null); };
+        try {
+            const request = indexedDB.open(STUDENT_PHOTO_DB_NAME, STUDENT_PHOTO_DB_VERSION);
+            request.onupgradeneeded = function () {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(STUDENT_PHOTO_STORE)) {
+                    db.createObjectStore(STUDENT_PHOTO_STORE);
+                }
+            };
+            request.onsuccess = function () {
+                studentPhotoDB = request.result;
+                resolve(studentPhotoDB);
+            };
+            request.onerror = function () { resolve(null); };
+        } catch (e) { resolve(null); }
     });
 }
 
-async function loadStudentPhotosIntoCache() {
+async function readBrowserOnlyStudentPhotos() {
+    const found = new Map();
     const db = await openStudentPhotoDB();
-    if (!db) return;
+    if (!db) return found;
     await new Promise(function (resolve) {
         try {
             const tx = db.transaction(STUDENT_PHOTO_STORE, "readonly");
-            const store = tx.objectStore(STUDENT_PHOTO_STORE);
-            const request = store.openCursor();
+            const request = tx.objectStore(STUDENT_PHOTO_STORE).openCursor();
             request.onsuccess = function (event) {
                 const cursor = event.target.result;
                 if (!cursor) { resolve(); return; }
-                studentPhotoCache.set(String(cursor.key), cursor.value);
+                if (typeof cursor.value === "string" && cursor.value) {
+                    found.set(String(cursor.key), cursor.value);
+                }
                 cursor.continue();
             };
             request.onerror = function () { resolve(); };
         } catch (e) { resolve(); }
     });
+    return found;
 }
 
-async function saveStudentPhoto(key, dataUrl) {
-    studentPhotoCache.set(key, dataUrl);
-    const db = await openStudentPhotoDB();
-    if (!db) return false;
-    return new Promise(function (resolve) {
-        try {
-            const tx = db.transaction(STUDENT_PHOTO_STORE, "readwrite");
-            tx.objectStore(STUDENT_PHOTO_STORE).put(dataUrl, key);
-            tx.oncomplete = function () { resolve(true); };
-            tx.onerror = function () { resolve(false); };
-        } catch (e) { resolve(false); }
+/* ---- picture resizing ---- */
+function resizeStudentPhoto(source) {
+    return new Promise(function (resolve, reject) {
+        const isFile = typeof source !== "string";
+        const url = isFile ? URL.createObjectURL(source) : source;
+        const img = new Image();
+        img.onload = function () {
+            try {
+                const srcW = img.naturalWidth || img.width;
+                const srcH = img.naturalHeight || img.height;
+                const canvas = document.createElement("canvas");
+                canvas.width = STUDENT_PHOTO_WIDTH;
+                canvas.height = STUDENT_PHOTO_HEIGHT;
+                const ctx = canvas.getContext("2d");
+                ctx.fillStyle = "#ffffff";
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                /* centre-crop to the passport shape (same as object-fit: cover) */
+                const scale = Math.max(canvas.width / srcW, canvas.height / srcH);
+                const drawW = srcW * scale;
+                const drawH = srcH * scale;
+                ctx.imageSmoothingQuality = "high";
+                ctx.drawImage(img, (canvas.width - drawW) / 2, (canvas.height - drawH) / 2, drawW, drawH);
+                if (isFile) URL.revokeObjectURL(url);
+                resolve(canvas.toDataURL("image/jpeg", STUDENT_PHOTO_QUALITY));
+            } catch (error) {
+                if (isFile) URL.revokeObjectURL(url);
+                reject(error);
+            }
+        };
+        img.onerror = function () {
+            if (isFile) URL.revokeObjectURL(url);
+            reject(new Error("Could not read that image."));
+        };
+        img.src = url;
     });
 }
 
-async function deleteStudentPhoto(key) {
-    studentPhotoCache.delete(key);
-    const db = await openStudentPhotoDB();
-    if (!db) return;
+/* ---- Supabase ---- */
+async function fetchStudentPhotosFromCloud() {
+    const photos = new Map();
+    const pageSize = 100;
+    for (let from = 0; ; from += pageSize) {
+        const { data, error } = await supabaseClient
+            .from(STUDENT_PHOTO_TABLE)
+            .select("photo_key, photo_data")
+            .eq("owner_user_id", currentUserId)
+            .eq("website_id", WEBSITE_ID)
+            .order("photo_key", { ascending: true })
+            .range(from, from + pageSize - 1);
+        if (error) return { error: error, photos: photos };
+        (data || []).forEach(function (row) {
+            if (row.photo_key && row.photo_data) photos.set(String(row.photo_key), row.photo_data);
+        });
+        if (!data || data.length < pageSize) break;
+    }
+    return { error: null, photos: photos };
+}
+
+async function uploadStudentPhotoRows(rows) {
+    if (!rows.length) return null;
+    const { error } = await supabaseClient
+        .from(STUDENT_PHOTO_TABLE)
+        .upsert(rows, { onConflict: "owner_user_id,website_id,photo_key" });
+    return error || null;
+}
+
+function buildStudentPhotoRow(key, dataUrl) {
+    return {
+        owner_user_id: currentUserId,
+        website_id: WEBSITE_ID,
+        photo_key: key,
+        photo_data: dataUrl,
+        updated_by: staffContext ? staffContext.userId : currentUserId,
+        updated_at: new Date().toISOString()
+    };
+}
+
+/* One-time move of photos that were saved in this browser only. */
+async function moveBrowserPhotosToAccount(cloudPhotos) {
+    if (!canEditStudentPhotos()) return 0;
+    const local = await readBrowserOnlyStudentPhotos();
+    const pending = [];
+    local.forEach(function (value, key) {
+        if (!cloudPhotos.has(key)) pending.push([key, value]);
+    });
+    if (!pending.length) return 0;
+
+    let moved = 0;
+    for (let i = 0; i < pending.length; i += 10) {
+        const rows = [];
+        for (const pair of pending.slice(i, i + 10)) {
+            try {
+                const small = await resizeStudentPhoto(pair[1]);
+                rows.push(buildStudentPhotoRow(pair[0], small));
+            } catch (e) { /* skip a damaged picture */ }
+        }
+        const error = await uploadStudentPhotosSafe(rows);
+        if (error) { console.error("Moving browser photos error:", error); break; }
+        rows.forEach(function (row) {
+            studentPhotoCache.set(row.photo_key, row.photo_data);
+            moved++;
+        });
+    }
+    return moved;
+}
+
+/* Photos saved earlier at a larger size are made smaller once. */
+async function shrinkLargeSavedStudentPhotos() {
+    if (!canEditStudentPhotos()) return 0;
+    const big = [];
+    studentPhotoCache.forEach(function (value, key) {
+        if (typeof value === "string" && value.length > STUDENT_PHOTO_SHRINK_ABOVE) big.push(key);
+    });
+    if (!big.length) return 0;
+
+    let done = 0;
+    for (let i = 0; i < big.length; i += 10) {
+        const rows = [];
+        for (const key of big.slice(i, i + 10)) {
+            try {
+                const small = await resizeStudentPhoto(studentPhotoCache.get(key));
+                if (small.length < studentPhotoCache.get(key).length) {
+                    rows.push(buildStudentPhotoRow(key, small));
+                }
+            } catch (e) { /* leave this photo as it is */ }
+        }
+        const error = await uploadStudentPhotosSafe(rows);
+        if (error) { console.error("Shrinking photos error:", error); break; }
+        rows.forEach(function (row) {
+            studentPhotoCache.set(row.photo_key, row.photo_data);
+            done++;
+        });
+    }
+    return done;
+}
+
+async function uploadStudentPhotosSafe(rows) {
+    try { return await uploadStudentPhotoRows(rows); }
+    catch (e) { return e; }
+}
+
+/* Loads this school's photos once per login. Safe to call many times. */
+function ensureStudentPhotosLoaded(force) {
+    if (!currentUserId) return Promise.resolve();
+    if (!force && studentPhotosLoadedFor === currentUserId) return Promise.resolve();
+    if (studentPhotosLoading) return studentPhotosLoading;
+
+    const userAtStart = currentUserId;
+
+    studentPhotosLoading = (async function () {
+        try {
+            const result = await fetchStudentPhotosFromCloud();
+
+            if (userAtStart !== currentUserId) return;
+
+            if (result.error) {
+                console.error("Load student photos error:", result.error);
+                studentPhotoNotice = "⚠ Student photos could not be loaded (has the student_photos SQL been run in Supabase?).";
+                return;
+            }
+
+            studentPhotoCache.clear();
+            result.photos.forEach(function (value, key) { studentPhotoCache.set(key, value); });
+            studentPhotosLoadedFor = userAtStart;
+            studentPhotoNotice = "";
+
+            const moved = await moveBrowserPhotosToAccount(result.photos);
+            if (moved > 0) {
+                studentPhotoNotice = "✅ " + moved + " photo(s) that were saved only on this browser have been moved to your account.";
+            }
+
+            const shrunk = await shrinkLargeSavedStudentPhotos();
+            if (shrunk > 0) {
+                studentPhotoNotice = (studentPhotoNotice ? studentPhotoNotice + " " : "") +
+                    "✅ " + shrunk + " saved photo(s) were made smaller to save space.";
+            }
+        } catch (error) {
+            console.error("Student photos error:", error);
+        } finally {
+            studentPhotosLoading = null;
+        }
+    })();
+
+    return studentPhotosLoading;
+}
+
+async function saveStudentPhoto(key, dataUrl) {
+    if (!currentUserId) return { ok: false, message: "Please sign in first." };
     try {
-        const tx = db.transaction(STUDENT_PHOTO_STORE, "readwrite");
-        tx.objectStore(STUDENT_PHOTO_STORE).delete(key);
-    } catch (e) {}
+        const error = await uploadStudentPhotoRows([buildStudentPhotoRow(key, dataUrl)]);
+        if (error) {
+            console.error("Save student photo error:", error);
+            return { ok: false, message: error.message || "The photo was not saved." };
+        }
+        studentPhotoCache.set(key, dataUrl);
+        return { ok: true };
+    } catch (error) {
+        return { ok: false, message: (error && error.message) || "The photo was not saved." };
+    }
+}
+
+async function deleteStudentPhoto(key) {
+    if (!currentUserId) return { ok: false, message: "Please sign in first." };
+    try {
+        const { error } = await supabaseClient
+            .from(STUDENT_PHOTO_TABLE)
+            .delete()
+            .eq("owner_user_id", currentUserId)
+            .eq("website_id", WEBSITE_ID)
+            .eq("photo_key", key);
+        if (error) {
+            console.error("Delete student photo error:", error);
+            return { ok: false, message: error.message || "The photo was not removed." };
+        }
+        studentPhotoCache.delete(key);
+        return { ok: true };
+    } catch (error) {
+        return { ok: false, message: (error && error.message) || "The photo was not removed." };
+    }
 }
 
 function getStudentPhoto(student) {
@@ -5387,10 +5832,13 @@ function getStudentPhoto(student) {
 function renderStudentPhotoManager() {
     if (!studentPhotoManager) return;
     if (!classRoster.length) {
-        studentPhotoManager.innerHTML = "<em>Upload a class list first. Your photos will stay on this browser.</em>";
+        studentPhotoManager.innerHTML = "<em>Upload a class list first. Photos are saved to your school account.</em>";
         return;
     }
-    let html = "<div style=\"display:grid;gap:10px;\">";
+    const canEdit = canEditStudentPhotos();
+    let html = "";
+    if (studentPhotoNotice) html += "<p style=\"margin:0 0 8px;\"><small>" + escapeHTML(studentPhotoNotice) + "</small></p>";
+    html += "<div style=\"display:grid;gap:10px;\">";
     classRoster.forEach(function (student, index) {
         const key = studentPhotoKey(student.admission_no, student.student_name);
         const photo = studentPhotoCache.get(key) || "";
@@ -5399,8 +5847,11 @@ function renderStudentPhotoManager() {
         html += photo ? "<img src=\"" + escapeHTML(photo) + "\" alt=\"Student photo\" style=\"width:100%;height:100%;object-fit:cover;\">" : "<span style=\"font-size:22px;\">👤</span>";
         html += "</div><div style=\"flex:1;min-width:180px;\"><strong>" + escapeHTML(student.student_name) + "</strong>";
         if (student.admission_no) html += "<br><small>" + escapeHTML(student.admission_no) + "</small>";
-        html += "</div><label style=\"margin:0;\"><span style=\"display:inline-block;padding:7px 10px;border:1px solid #bbb;border-radius:5px;cursor:pointer;background:#f8f8f8;\">📷 " + (photo ? "Change Photo" : "Add Photo") + "</span><input type=\"file\" accept=\"image/jpeg,image/png,image/webp\" data-student-photo-index=\"" + index + "\" style=\"display:none;\"></label>";
-        if (photo) html += "<button type=\"button\" data-remove-student-photo=\"" + index + "\">Remove</button>";
+        html += "</div>";
+        if (canEdit) {
+            html += "<label style=\"margin:0;\"><span style=\"display:inline-block;padding:7px 10px;border:1px solid #bbb;border-radius:5px;cursor:pointer;background:#f8f8f8;\">📷 " + (photo ? "Change Photo" : "Add Photo") + "</span><input type=\"file\" accept=\"image/jpeg,image/png,image/webp\" data-student-photo-index=\"" + index + "\" style=\"display:none;\"></label>";
+            if (photo) html += "<button type=\"button\" data-remove-student-photo=\"" + index + "\">Remove</button>";
+        }
         html += "</div>";
     });
     html += "</div>";
@@ -5416,30 +5867,46 @@ function attachStudentPhotoEvents() {
         const student = classRoster[index];
         if (!student) return;
         const file = input.files[0];
+        input.value = "";
+        if (!canEditStudentPhotos()) {
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ Only the school owner or the form master can change student photos.";
+            return;
+        }
         if (!/^image\/(jpeg|png|webp)$/i.test(file.type)) {
             if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ Please select a JPG, PNG or WebP image.";
             return;
         }
-        if (file.size > 2 * 1024 * 1024) {
-            if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ Please use a photo smaller than 2 MB.";
+        if (file.size > STUDENT_PHOTO_MAX_FILE_BYTES) {
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ Please use a photo smaller than 8 MB.";
             return;
         }
-        const reader = new FileReader();
-        reader.onload = async function () {
-            const ok = await saveStudentPhoto(studentPhotoKey(student.admission_no, student.student_name), reader.result);
+        if (studentPhotoStatus) studentPhotoStatus.textContent = "⏳ Saving photo…";
+        try {
+            const small = await resizeStudentPhoto(file);
+            const result = await saveStudentPhoto(studentPhotoKey(student.admission_no, student.student_name), small);
             renderStudentPhotoManager();
-            if (studentPhotoStatus) studentPhotoStatus.textContent = ok ? "✅ Photo saved on this browser only." : "⚠ Photo kept for this session, but browser storage was unavailable.";
-        };
-        reader.readAsDataURL(file);
+            if (studentPhotoStatus) {
+                studentPhotoStatus.textContent = result.ok
+                    ? "✅ Photo saved to your school account."
+                    : "❌ " + result.message;
+            }
+        } catch (error) {
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ " + ((error && error.message) || "Could not process that photo.");
+        }
     });
     studentPhotoManager.addEventListener("click", async function (event) {
         const button = event.target.closest("[data-remove-student-photo]");
         if (!button) return;
         const student = classRoster[Number(button.getAttribute("data-remove-student-photo"))];
         if (!student) return;
-        await deleteStudentPhoto(studentPhotoKey(student.admission_no, student.student_name));
+        if (!canEditStudentPhotos()) return;
+        const result = await deleteStudentPhoto(studentPhotoKey(student.admission_no, student.student_name));
         renderStudentPhotoManager();
-        if (studentPhotoStatus) studentPhotoStatus.textContent = "✅ Photo removed from this browser.";
+        if (studentPhotoStatus) {
+            studentPhotoStatus.textContent = result.ok
+                ? "✅ Photo removed."
+                : "❌ " + result.message;
+        }
     });
 }
 
@@ -5572,7 +6039,7 @@ function initializeAcademicWorkflow() {
     studentPhotoManager = document.getElementById("studentPhotoManager");
     studentPhotoStatus = document.getElementById("studentPhotoStatus");
     attachStudentPhotoEvents();
-    loadStudentPhotosIntoCache().then(function () { renderStudentPhotoManager(); });
+    ensureStudentPhotosLoaded().then(function () { renderStudentPhotoManager(); });
     cumulativeStudentSelect = document.getElementById("cumulativeStudentSelect");
     showCumulativeButton = document.getElementById("showCumulativeButton");
     downloadCumulativeButton = document.getElementById("downloadCumulativeButton");
@@ -7600,6 +8067,7 @@ async function loadClassRosterForContext() {
     }
 
     classRoster = await fetchClassRoster(context.className, context.session);
+    await withTimeout(ensureStudentPhotosLoaded(), 20000, null);
     renderStudentPreview();
 
     if (rosterFetchFailed) {
@@ -7719,7 +8187,117 @@ function applyRosterToScoresSheet(scoresSheet, roster, context) {
    every generated file also gets this "tap to save" banner.
    --------------------------------------------------------- */
 
+/* ---------------------------------------------------------
+   Android app (Capacitor) support.
+   The Android WebView ignores blob / a[download] links, so inside
+   the app the file is written with the Filesystem plugin and then
+   handed to the share sheet (Save to Files, Drive, WhatsApp, Excel).
+   In a normal browser nothing here runs.
+   --------------------------------------------------------- */
+
+/* ---------------------------------------------------------
+   printReportsPage
+   window.print() does nothing in the Android WebView, so inside the
+   app the custom PrintPlugin (PrintPlugin.java) opens Android's
+   print dialog (Save as PDF / printer). Browsers use window.print().
+   --------------------------------------------------------- */
+
+function printReportsPage() {
+
+    const plugin = isNativeApp() && window.Capacitor.Plugins && window.Capacitor.Plugins.PrintPlugin;
+
+    if (!plugin) {
+        if (isNativeApp()) {
+            alert("\u274C Printing is not available in this version of the app. Please install the latest version.");
+            return;
+        }
+        window.print();
+        return;
+    }
+
+    /* The Android WebView never fires "beforeprint", so the report-only
+       print layer and the shrink-to-one-page logic must be started by hand.
+       The layer is removed again when the app regains focus after the
+       print dialog closes (see the focus / visibilitychange handlers). */
+    prepareReportsForPrintInApp().catch(function (error) {
+        console.error("Print preparation error:", error);
+    }).then(function () {
+        setTimeout(function () {
+            plugin.print({ name: "Student_Reports" }).catch(function (error) {
+                console.error("Native print error:", error);
+                restoreReportsAfterPrint();
+                alert("\u274C Could not open the print dialog: " + (error && error.message ? error.message : error));
+            });
+        }, 250);
+    });
+
+}
+
+function isNativeApp() {
+    try {
+        return !!(window.Capacitor &&
+            typeof window.Capacitor.isNativePlatform === "function" &&
+            window.Capacitor.isNativePlatform());
+    } catch (e) {
+        return false;
+    }
+}
+
+function blobToBase64(blob) {
+    return new Promise(function (resolve, reject) {
+        const reader = new FileReader();
+        reader.onloadend = function () {
+            const result = String(reader.result || "");
+            resolve(result.substring(result.indexOf(",") + 1));
+        };
+        reader.onerror = function () { reject(reader.error || new Error("Could not read file")); };
+        reader.readAsDataURL(blob);
+    });
+}
+
+async function saveAndShareNative(url, fileName) {
+
+    const plugins = window.Capacitor && window.Capacitor.Plugins;
+    const Filesystem = plugins && plugins.Filesystem;
+    const Share = plugins && plugins.Share;
+
+    if (!Filesystem || !Share) {
+        throw new Error("Save plugins are missing from this app. Please install the latest version of the app.");
+    }
+
+    const response = await fetch(url);
+    const blob = await response.blob();
+    const data = await blobToBase64(blob);
+
+    const written = await Filesystem.writeFile({
+        path: fileName,
+        data: data,
+        directory: "CACHE"
+    });
+
+    await Share.share({
+        title: fileName,
+        url: written.uri,
+        dialogTitle: "Save or open " + fileName
+    });
+
+}
+
+/* ---------------------------------------------------------
+   showManualDownloadLink
+   Chrome treats a download started several seconds after the tap
+   (after waiting on the server) as an "automatic" download. It
+   allows the first one, then blocks the rest silently until the
+   page is refreshed. A real tap on a link is always allowed, so
+   every generated file also gets this "tap to save" banner.
+
+   In the Android app the banner button opens the share sheet
+   instead (and the sheet is also opened automatically once).
+   --------------------------------------------------------- */
+
 function showManualDownloadLink(url, fileName) {
+
+    const native = isNativeApp();
 
     const old = document.getElementById("manualDownloadBanner");
     if (old) old.remove();
@@ -7734,14 +8312,24 @@ function showManualDownloadLink(url, fileName) {
         "box-shadow:0 6px 20px rgba(0,0,0,.35);";
 
     const link = document.createElement("a");
-    link.href = url;
-    link.download = fileName;
-    link.textContent = "⬇ Tap here to save " + fileName;
+    link.href = native ? "#" : url;
+    if (!native) link.download = fileName;
+    link.textContent = (native ? "\u2B07 Tap here to save / share " : "\u2B07 Tap here to save ") + fileName;
     link.style.cssText = "color:#ffd54f;font-weight:700;text-decoration:underline;word-break:break-all;";
+
+    if (native) {
+        link.addEventListener("click", function (event) {
+            event.preventDefault();
+            saveAndShareNative(url, fileName).catch(function (error) {
+                console.error("Native save error:", error);
+                alert("\u274C Could not save the file: " + (error && error.message ? error.message : error));
+            });
+        });
+    }
 
     const close = document.createElement("button");
     close.type = "button";
-    close.textContent = "✕";
+    close.textContent = "\u2715";
     close.setAttribute("aria-label", "Close");
     close.style.cssText = "background:none;border:0;color:#fff;font-size:18px;cursor:pointer;";
     close.addEventListener("click", function () { box.remove(); });
@@ -7751,6 +8339,13 @@ function showManualDownloadLink(url, fileName) {
     document.body.appendChild(box);
 
     setTimeout(function () { if (box.parentNode) box.remove(); }, 240000);
+
+    if (native) {
+        saveAndShareNative(url, fileName).catch(function (error) {
+            console.error("Native save error:", error);
+            alert("\u274C Could not save the file: " + (error && error.message ? error.message : error));
+        });
+    }
 
 }
 
@@ -15276,6 +15871,7 @@ function escapeHTML(
    ========================================================= */
 
 let reportPrintLayer = null;
+let reportPrintStyle = null;
 
 /* =========================================================
    SHRINK-TO-FIT: force every report onto exactly one printed
@@ -15284,45 +15880,66 @@ let reportPrintLayer = null;
    report's content is measured against the real printable
    page area and scaled down (uniformly, so nothing looks
    stretched) just enough to fit.
+
+   Same sizing as script.js: the stylesheet has an 8mm @page
+   margin and the injected print style a 5mm one, so the more
+   conservative numbers are used on purpose.
    ========================================================= */
 
 const MM_TO_PX = 96 / 25.4;          // CSS-spec fixed conversion (96px = 1in = 25.4mm)
-const PAGE_CONTENT_HEIGHT_MM = 287;  // A4 height (297mm) minus the 5mm top+bottom @page margin
-const REPORT_WIDTH_MM = 200;         // A4 width (210mm) minus the 5mm left+right @page margin
-const REPORT_PAD_TOP_MM = 5;
-const REPORT_PAD_BOTTOM_MM = 4;
+const PAGE_CONTENT_HEIGHT_MM = 303;  // A4 height (297mm) minus the larger 8mm top+bottom @page margin
+const REPORT_WIDTH_MM = 217;         // A4 width (210mm) minus the larger 8mm left+right @page margin
+const REPORT_PAD_TOP_MM = 4;
+const REPORT_PAD_BOTTOM_MM = 2;
 
-function fitReportsToSinglePage() {
-    if (!reportPrintLayer) return;
+/* Android app only. PrintPlugin.java now prints on a full A4 sheet with no
+   margins, so the report gets the whole 210 x 297mm page (with its own inner
+   padding) and is scaled to FILL it, in both directions: shrunk when too
+   tall, enlarged when too short. The website keeps the script.js sizing. */
+const APP_PAGE_WIDTH_MM = 210;
+const APP_PAGE_HEIGHT_MM = 296;      // 1mm under 297mm so the page never spills onto a blank 2nd page
+const APP_PAD_TOP_MM = 5;
+const APP_PAD_SIDE_MM = 6;
+const APP_PAD_BOTTOM_MM = 2;
+const APP_MAX_GROW = 3.0;            // never enlarge more than this, so a tiny report is not blown up absurdly
 
-    const reports = reportPrintLayer.querySelectorAll(".report");
+function fitReportsToSinglePage(layer, fillPage) {
+    layer = layer || reportPrintLayer;
+    if (!layer) return;
+
+    const reports = layer.querySelectorAll(".report");
     if (!reports.length) return;
 
-    const maxInnerHeightPx =
-        (PAGE_CONTENT_HEIGHT_MM - REPORT_PAD_TOP_MM - REPORT_PAD_BOTTOM_MM) * MM_TO_PX;
+    const pageWidthMm  = fillPage ? APP_PAGE_WIDTH_MM  : REPORT_WIDTH_MM;
+    const pageHeightMm = fillPage ? APP_PAGE_HEIGHT_MM : PAGE_CONTENT_HEIGHT_MM;
+    const padTopMm     = fillPage ? APP_PAD_TOP_MM     : REPORT_PAD_TOP_MM;
+    const padSideMm    = fillPage ? APP_PAD_SIDE_MM    : REPORT_PAD_TOP_MM;
+    const padBottomMm  = fillPage ? APP_PAD_BOTTOM_MM  : REPORT_PAD_BOTTOM_MM;
+
+    const maxInnerHeightPx = (pageHeightMm - padTopMm - padBottomMm) * MM_TO_PX;
 
     /* Lay the layer out for measurement without letting it flash on screen. */
-    reportPrintLayer.style.display = "block";
-    reportPrintLayer.style.visibility = "hidden";
-    reportPrintLayer.style.position = "fixed";
-    reportPrintLayer.style.top = "0";
-    reportPrintLayer.style.left = "-99999px";
+    layer.style.display = "block";
+    layer.style.visibility = "hidden";
+    layer.style.position = "fixed";
+    layer.style.top = "0";
+    layer.style.left = "-99999px";
 
     reports.forEach(function (report) {
         /* Match the exact box the printed page will give this report. */
-        report.style.setProperty("width", REPORT_WIDTH_MM + "mm", "important");
+        report.style.setProperty("width", pageWidthMm + "mm", "important");
         report.style.setProperty("max-width", "none", "important");
         report.style.setProperty("min-height", "0", "important");
         report.style.setProperty(
             "padding",
-            REPORT_PAD_TOP_MM + "mm 5mm " + REPORT_PAD_BOTTOM_MM + "mm",
+            padTopMm + "mm " + padSideMm + "mm " + padBottomMm + "mm",
             "important"
         );
         report.style.setProperty("border", "0", "important");
         report.style.setProperty("overflow", "hidden", "important");
 
         /* Move the report's existing content into a scalable wrapper. */
-        const inner = document.createElement("div");
+        const inner = layer.ownerDocument.createElement("div");
         inner.className = "report-scale-wrap";
         while (report.firstChild) {
             inner.appendChild(report.firstChild);
@@ -15331,28 +15948,60 @@ function fitReportsToSinglePage() {
 
         const naturalHeightPx = inner.scrollHeight;
 
-        if (naturalHeightPx > maxInnerHeightPx && naturalHeightPx > 0) {
+        if (fillPage && naturalHeightPx > 0) {
+            /* Fill the page: scale up OR down. Changing the width changes how
+               the text wraps (and so the height), so the old "re-measure and
+               repeat" loop could bounce between two values and stop short,
+               leaving the bottom of the page empty. The printed height
+               (layout height x scale) only ever grows as the scale grows, so
+               a binary search always lands on the biggest scale that fits. */
+            inner.style.transformOrigin = "top left";
+
+            function printedHeightAt(candidate) {
+                inner.style.width = (100 / candidate) + "%";
+                inner.style.transform = "scale(" + candidate + ")";
+                return inner.scrollHeight * candidate;
+            }
+
+            let low = 0.05;                 // always fits
+            let high = APP_MAX_GROW;
+
+            if (printedHeightAt(high) <= maxInnerHeightPx) {
+                low = high;                 // even the biggest allowed scale fits
+            } else {
+                for (let pass = 0; pass < 14; pass++) {
+                    const middle = (low + high) / 2;
+                    if (printedHeightAt(middle) <= maxInnerHeightPx) low = middle; else high = middle;
+                }
+            }
+
+            const printedPx = printedHeightAt(low);
+            window.__printDebug = "NEW fit code v2 | scale " + low.toFixed(2) +
+                " | fills " + Math.round(printedPx / maxInnerHeightPx * 100) + "% of page height" +
+                " | natural height " + Math.round(naturalHeightPx) + "px";
+            report.style.setProperty("height", pageHeightMm + "mm", "important");
+        } else if (naturalHeightPx > maxInnerHeightPx && naturalHeightPx > 0) {
             const scale = maxInnerHeightPx / naturalHeightPx;
             inner.style.transformOrigin = "top left";
             inner.style.transform = "scale(" + scale + ")";
             /* Widen before scaling so the shrink is vertical-only visually,
                keeping the report's full page width after the transform. */
             inner.style.width = (100 / scale) + "%";
-            report.style.setProperty("height", PAGE_CONTENT_HEIGHT_MM + "mm", "important");
+            report.style.setProperty("height", pageHeightMm + "mm", "important");
         } else {
             report.style.setProperty("height", "auto", "important");
         }
     });
 
-    /* Hand back to the stylesheet's own @media print rules. */
-    reportPrintLayer.style.display = "";
-    reportPrintLayer.style.visibility = "";
-    reportPrintLayer.style.position = "";
-    reportPrintLayer.style.top = "";
-    reportPrintLayer.style.left = "";
+    /* Hand back to the existing print styling. */
+    layer.style.display = "";
+    layer.style.visibility = "";
+    layer.style.position = "";
+    layer.style.top = "";
+    layer.style.left = "";
 }
 
-function prepareReportsForPrint() {
+function buildReportPrintLayer() {
     if (!reportContainer) return;
 
     /* Remove an old layer if a mobile browser fires beforeprint twice. */
@@ -15361,12 +16010,194 @@ function prepareReportsForPrint() {
         reportPrintLayer = null;
     }
 
+    if (reportPrintStyle) {
+        reportPrintStyle.remove();
+        reportPrintStyle = null;
+    }
+
     reportPrintLayer = document.createElement("div");
     reportPrintLayer.id = "reportPrintLayer";
     reportPrintLayer.innerHTML = reportContainer.innerHTML;
+
+    /* Phones/WebViews "boost" text in wide blocks (text autosizing), which
+       makes the on-screen measurement taller than the real printed page and
+       shrinks the report too much. Switch that off for the print layer. */
+    reportPrintLayer.style.setProperty("-webkit-text-size-adjust", "100%", "important");
+    reportPrintLayer.style.setProperty("text-size-adjust", "100%", "important");
+    reportPrintLayer.querySelectorAll("*").forEach(function (node) {
+        node.style.setProperty("-webkit-text-size-adjust", "100%", "important");
+        node.style.setProperty("text-size-adjust", "100%", "important");
+    });
+
     document.body.appendChild(reportPrintLayer);
 
-    fitReportsToSinglePage();
+    /* Same print rules as script.js, injected so printing works even if the
+       main stylesheet lacks them. Each .report starts on a fresh A4 page
+       and cannot be split between two pages. */
+    reportPrintStyle = document.createElement("style");
+    reportPrintStyle.id = "reportPrintStyle";
+    reportPrintStyle.textContent = `
+        @page {
+            size: A4 portrait;
+            margin: ${isNativeApp() ? "0" : "5mm"};
+        }
+
+        @media print {
+            html,
+            body {
+                width: 210mm !important;
+                min-width: 0 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                background: #fff !important;
+            }
+
+            body > * {
+                display: none !important;
+            }
+
+            body > #reportPrintLayer {
+                display: block !important;
+                width: 100% !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                background: #fff !important;
+            }
+
+            #reportPrintLayer .report {
+                display: block !important;
+                width: 100% !important;
+                max-width: none !important;
+                margin: 0 !important;
+                box-sizing: border-box !important;
+                break-before: auto;
+                break-after: page;
+                break-inside: avoid;
+                page-break-before: auto;
+                page-break-after: always;
+                page-break-inside: avoid;
+            }
+
+            #reportPrintLayer .report:last-child {
+                break-after: auto;
+                page-break-after: auto;
+            }
+        }
+    `;
+    document.head.appendChild(reportPrintStyle);
+
+}
+
+function prepareReportsForPrint() {
+    if (!reportContainer) return;
+
+    buildReportPrintLayer();
+    fitReportsToSinglePage(reportPrintLayer);
+
+    document.documentElement.classList.add("printing-reports");
+}
+
+/* ---------------------------------------------------------
+   Android app: measure the reports in a hidden, desktop-width frame.
+   The stylesheet has phone-only rules (max-width 700px / 400px) that
+   re-flow the report (smaller fonts, stacked columns). Measured on the
+   phone screen the report looks taller than it prints, so it is shrunk
+   too much and the page is left part-empty. A wide frame gets the same
+   layout the printed page (and a desktop browser) uses.
+   --------------------------------------------------------- */
+
+function fitReportsInDesktopFrame() {
+
+    return new Promise(function (resolve, reject) {
+
+        const layer = reportPrintLayer;
+        if (!layer) { resolve(); return; }
+
+        const frame = document.createElement("iframe");
+        frame.setAttribute("aria-hidden", "true");
+        frame.style.cssText =
+            "position:fixed;left:-99999px;top:0;width:1200px;height:1600px;" +
+            "border:0;opacity:0;pointer-events:none;";
+
+        let finished = false;
+        let timer = null;
+
+        function finish(error) {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            if (frame.parentNode) frame.parentNode.removeChild(frame);
+            if (error) reject(error); else resolve();
+        }
+
+        timer = setTimeout(function () {
+            finish(new Error("Print measuring timed out"));
+        }, 6000);
+
+        frame.onload = function () {
+            try {
+                const frameLayer = frame.contentDocument.getElementById("reportPrintLayer");
+                fitReportsToSinglePage(frameLayer, true);
+                layer.innerHTML = frameLayer.innerHTML;
+                finish();
+            } catch (error) {
+                finish(error);
+            }
+        };
+
+        const styles = Array.prototype.filter.call(
+            document.querySelectorAll('link[rel="stylesheet"], style'),
+            function (node) {
+                return !(node.href && /fonts\.(googleapis|gstatic)\.com/.test(node.href));
+            }
+        ).map(function (node) { return node.outerHTML; }).join("\n");
+
+        frame.srcdoc =
+            '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+            '<base href="' + document.baseURI + '">' + styles + '</head><body>' +
+            '<div id="reportPrintLayer" style="display:block">' + layer.innerHTML + '</div>' +
+            '</body></html>';
+
+        document.body.appendChild(frame);
+
+    });
+
+}
+
+/* Waits (up to a few seconds) until the images in the print layer, such as
+   the school logo link from Storage, have loaded. */
+function waitForPrintImages(layer, maxMs) {
+    const images = Array.prototype.slice.call(layer.querySelectorAll("img"));
+
+    return Promise.race([
+        Promise.all(images.map(function (img) {
+            if (img.complete) return null;
+            return new Promise(function (done) {
+                img.addEventListener("load", done, { once: true });
+                img.addEventListener("error", done, { once: true });
+            });
+        })),
+        new Promise(function (done) { setTimeout(done, maxMs); })
+    ]);
+}
+
+async function prepareReportsForPrintInApp() {
+    if (!reportContainer) return;
+
+    buildReportPrintLayer();
+
+    if (reportPrintLayer) await waitForPrintImages(reportPrintLayer, 4000);
+
+    try {
+        await fitReportsInDesktopFrame();
+    } catch (error) {
+        console.error("Desktop-width fit failed, using on-screen fit:", error);
+        fitReportsToSinglePage(reportPrintLayer, true);
+    }
+
+    /* TEMPORARY: shows the fit numbers so you can confirm the new code is
+       running in the app. Delete this line when the print looks right. */
+    if (window.__printDebug) alert(window.__printDebug);
 
     document.documentElement.classList.add("printing-reports");
 }
@@ -15378,7 +16209,14 @@ function restoreReportsAfterPrint() {
         reportPrintLayer.remove();
         reportPrintLayer = null;
     }
+
+    if (reportPrintStyle) {
+        reportPrintStyle.remove();
+        reportPrintStyle = null;
+    }
 }
+
+document.documentElement.classList.remove("printing-reports");
 
 window.addEventListener("beforeprint", prepareReportsForPrint);
 window.addEventListener("afterprint", restoreReportsAfterPrint);
@@ -15386,6 +16224,15 @@ window.addEventListener("afterprint", restoreReportsAfterPrint);
 /* Mobile browsers are not always consistent with afterprint. */
 window.addEventListener("focus", function () {
     if (document.documentElement.classList.contains("printing-reports")) {
+        setTimeout(restoreReportsAfterPrint, 500);
+    }
+});
+
+/* Android app: the print dialog is a separate screen, so clean up when
+   the page becomes visible again after it closes. */
+document.addEventListener("visibilitychange", function () {
+    if (!document.hidden &&
+        document.documentElement.classList.contains("printing-reports")) {
         setTimeout(restoreReportsAfterPrint, 500);
     }
 });
