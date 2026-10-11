@@ -16277,21 +16277,32 @@ function restoreReportsAfterPrint() {
 
 document.documentElement.classList.remove("printing-reports");
 
+/* Android app: the PDF is written AFTER the preview, when the person taps
+   Save in the print dialog. The old clean-up (on focus / visibilitychange /
+   afterprint) removed the app's fitted print page before that final write,
+   so the saved PDF came out small again even though the preview was right.
+   In the app the fitted page now stays in place (it is invisible on screen
+   and is rebuilt fresh the next time Print is tapped); only the website
+   cleans up on these events. */
+function cleanUpAfterPrintEvent() {
+    if (isNativeApp() && appPrintLayerReady) return;
+    restoreReportsAfterPrint();
+}
+
 window.addEventListener("beforeprint", prepareReportsForPrint);
-window.addEventListener("afterprint", restoreReportsAfterPrint);
+window.addEventListener("afterprint", cleanUpAfterPrintEvent);
 
 /* Mobile browsers are not always consistent with afterprint. */
 window.addEventListener("focus", function () {
     if (document.documentElement.classList.contains("printing-reports")) {
-        setTimeout(restoreReportsAfterPrint, 500);
+        setTimeout(cleanUpAfterPrintEvent, 500);
     }
 });
 
-/* Android app: the print dialog is a separate screen, so clean up when
-   the page becomes visible again after it closes. */
+/* Clean up when the page becomes visible again after the print dialog. */
 document.addEventListener("visibilitychange", function () {
     if (!document.hidden &&
         document.documentElement.classList.contains("printing-reports")) {
-        setTimeout(restoreReportsAfterPrint, 500);
+        setTimeout(cleanUpAfterPrintEvent, 500);
     }
 });
