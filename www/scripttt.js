@@ -8211,6 +8211,22 @@ function printReportsPage() {
             alert("\u274C Printing is not available in this version of the app. Please install the latest version.");
             return;
         }
+
+        /* Phone browsers: build the same fitted, fill-the-page print layout
+           the app uses, then open the browser's print dialog. Desktop
+           browsers keep the normal print path. */
+        const phoneBrowser = !!(window.matchMedia &&
+            (window.matchMedia("(pointer: coarse)").matches || window.innerWidth <= 820));
+
+        if (phoneBrowser) {
+            prepareReportsForPrintInApp().catch(function (error) {
+                console.error("Print preparation error:", error);
+            }).then(function () {
+                setTimeout(function () { window.print(); }, 250);
+            });
+            return;
+        }
+
         window.print();
         return;
     }
@@ -16073,13 +16089,13 @@ function buildReportPrintLayer() {
     reportPrintStyle.textContent = `
         @page {
             size: A4 portrait;
-            margin: ${isNativeApp() ? "0" : "5mm"};
+            margin: ${(isNativeApp() || printFillMode) ? "0" : "5mm"};
         }
 
         @media print {
             html,
             body {
-                width: ${isNativeApp() ? "100%" : "210mm"} !important;
+                width: ${(isNativeApp() || printFillMode) ? "100%" : "210mm"} !important;
                 min-width: 0 !important;
                 margin: 0 !important;
                 padding: 0 !important;
@@ -16146,12 +16162,28 @@ function buildReportPrintLayer() {
    app print kept coming out the same whatever was changed. This flag makes
    the website handler leave the app's layer alone. */
 let appPrintLayerReady = false;
+let printFillMode = false;          // true while the fill-the-page print flow is in use (app and mobile website)
+let appPrintLayerBuiltAt = 0;
+let appPrintLayerSignature = 0;
+
+/* True while the fitted print page built by the fill flow should be kept.
+   In the app it is kept until the next Print tap. On the mobile website it is
+   kept for 10 minutes and only while the reports on screen are unchanged, so
+   a later Print from the browser menu never prints an out-of-date page. */
+function appPrintLayerStillValid() {
+    if (!appPrintLayerReady || !reportPrintLayer) return false;
+    if (isNativeApp()) return true;
+    return (Date.now() - appPrintLayerBuiltAt < 10 * 60 * 1000) &&
+        !!reportContainer &&
+        reportContainer.innerHTML.length === appPrintLayerSignature;
+}
 
 function prepareReportsForPrint() {
-    if (appPrintLayerReady && reportPrintLayer) return;
+    if (appPrintLayerStillValid()) return;
 
     if (!reportContainer) return;
 
+    printFillMode = false;
     buildReportPrintLayer();
     fitReportsToSinglePage(reportPrintLayer);
 
@@ -16245,6 +16277,7 @@ function waitForPrintImages(layer, maxMs) {
 async function prepareReportsForPrintInApp() {
     if (!reportContainer) return;
 
+    printFillMode = true;
     buildReportPrintLayer();
 
     if (reportPrintLayer) await waitForPrintImages(reportPrintLayer, 4000);
@@ -16257,11 +16290,14 @@ async function prepareReportsForPrintInApp() {
     }
 
     appPrintLayerReady = true;
+    appPrintLayerBuiltAt = Date.now();
+    appPrintLayerSignature = reportContainer.innerHTML.length;
     document.documentElement.classList.add("printing-reports");
 }
 
 function restoreReportsAfterPrint() {
     appPrintLayerReady = false;
+    printFillMode = false;
     document.documentElement.classList.remove("printing-reports");
 
     if (reportPrintLayer) {
@@ -16285,7 +16321,7 @@ document.documentElement.classList.remove("printing-reports");
    and is rebuilt fresh the next time Print is tapped); only the website
    cleans up on these events. */
 function cleanUpAfterPrintEvent() {
-    if (isNativeApp() && appPrintLayerReady) return;
+    if (appPrintLayerStillValid()) return;
     restoreReportsAfterPrint();
 }
 
