@@ -157,6 +157,32 @@ function admLetterHtml(data) {
 
 }
 
+/* window.print() does nothing in the Android app's WebView, so inside the
+   app the native PrintPlugin opens Android's print dialog instead
+   (choose "Save as PDF" there). Browsers keep using window.print(). */
+function admPrintLetter() {
+
+    const cap = window.Capacitor;
+    const isApp = !!(cap && typeof cap.isNativePlatform === "function" && cap.isNativePlatform());
+
+    if (!isApp) {
+        window.print();
+        return;
+    }
+
+    const plugin = cap.Plugins && cap.Plugins.PrintPlugin;
+
+    if (!plugin) {
+        alert("Printing is not available in this version of the app. Please install the latest version.");
+        return;
+    }
+
+    plugin.print({ name: "Admission_Letter" }).catch(function (error) {
+        alert("Could not open the print dialog: " + (error && error.message ? error.message : error));
+    });
+
+}
+
 function admCloseLetter() {
 
     const old = document.getElementById("admLetterOverlay");
@@ -184,9 +210,7 @@ function admOpenLetter(data) {
     document.body.appendChild(overlay);
     document.body.classList.add("adm-letter-open");
 
-    document.getElementById("admLetterPrint").addEventListener("click", function () {
-        window.print();
-    });
+    document.getElementById("admLetterPrint").addEventListener("click", admPrintLetter);
 
     document.getElementById("admLetterClose").addEventListener("click", admCloseLetter);
 

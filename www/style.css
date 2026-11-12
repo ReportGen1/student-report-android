@@ -1410,3 +1410,1928 @@ select {
         border-radius: 0 !important;
     }
 }
+#appBanner{position:fixed;bottom:0;left:0;right:0;z-index:9999;display:flex;align-items:center;gap:10px;padding:10px 14px;background:#1e3a8a;color:#fff;font-size:14px}
+#appBanner span{flex:1}
+#appBanner a{background:#fff;color:#1e3a8a;padding:6px 14px;border-radius:6px;text-decoration:none;font-weight:600}
+#appBanner button{background:none;border:0;color:#fff;font-size:18px}
+@media print{#appBanner{display:none!important}}
+
+
+/* =========================================================
+   REPORT OUTLOOKS
+   Classic = the original layout (no overrides needed).
+   Modern / Elegant / Minimal are skins that reuse the same
+   report markup, so printing, A4 fitting and the watermark
+   keep working. Selectors are repeated for the print layer
+   so the outlook also applies when printing / saving PDF.
+   ========================================================= */
+
+/* ---------- MODERN ---------- */
+
+.report.tpl-modern .school-header,
+#reportPrintLayer .report.tpl-modern .school-header,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-header {
+    display:block !important;
+    position:relative !important;
+    width:auto !important;
+    min-height:0 !important;
+    overflow:visible !important;
+    margin:0 0 10px !important;
+    text-align:center !important;
+}
+
+.report.tpl-modern .school-brand,
+#reportPrintLayer .report.tpl-modern .school-brand,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-brand {
+    position:relative !important;
+    display:flex !important;
+    align-items:center !important;
+    justify-content:space-between !important;
+    gap:10px !important;
+    width:100% !important;
+    text-align:center !important;
+}
+
+.report.tpl-modern .school-logo-container,
+#reportPrintLayer .report.tpl-modern .school-logo-container,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-logo-container {
+    position:static !important;
+    transform:none !important;
+    order:1 !important;
+    flex:0 0 78px !important;
+    width:78px !important;
+    height:68px !important;
+    margin:0 !important;
+    display:flex !important;
+    justify-content:flex-start !important;
+    align-items:center !important;
+    overflow:visible !important;
+}
+
+.report.tpl-modern .school-logo,
+#reportPrintLayer .report.tpl-modern .school-logo,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-logo {
+    width:68px !important;
+    height:68px !important;
+    object-fit:contain !important;
+}
+
+.report.tpl-modern .school-heading,
+#reportPrintLayer .report.tpl-modern .school-heading,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-heading {
+    order:2 !important;
+    flex:1 1 auto !important;
+    min-width:0 !important;
+    width:auto !important;
+    max-width:none !important;
+    padding:0 !important;
+    margin:0 !important;
+    text-align:center !important;
+}
+
+.report.tpl-modern .student-passport-container,
+.report.tpl-modern .school-side-spacer,
+#reportPrintLayer .report.tpl-modern .student-passport-container,
+#reportPrintLayer .report.tpl-modern .school-side-spacer,
+body.printing-reports #reportPrintLayer .report.tpl-modern .student-passport-container,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-side-spacer {
+    position:static !important;
+    transform:none !important;
+    order:3 !important;
+    flex:0 0 78px !important;
+    width:78px !important;
+    margin:0 !important;
+    display:flex !important;
+    justify-content:flex-end !important;
+    align-items:center !important;
+}
+
+.report.tpl-modern .school-heading h1,
+#reportPrintLayer .report.tpl-modern .school-heading h1,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-heading h1 {
+    display:block !important;
+    margin:0 !important;
+    width:100% !important;
+    text-align:center !important;
+    font-size:22px !important;
+    line-height:1.15 !important;
+    font-weight:800 !important;
+    letter-spacing:.4px !important;
+    text-transform:uppercase !important;
+}
+
+.report.tpl-modern .school-heading p,
+#reportPrintLayer .report.tpl-modern .school-heading p,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-heading p {
+    display:block !important;
+    margin:4px 0 6px !important;
+    width:100% !important;
+    text-align:center !important;
+    font-size:11.5px !important;
+    font-weight:600 !important;
+    line-height:1.25 !important;
+}
+
+.report.tpl-modern .report-title,
+#reportPrintLayer .report.tpl-modern .report-title,
+body.printing-reports #reportPrintLayer .report.tpl-modern .report-title {
+    display:inline-block !important;
+    margin:2px auto 0 !important;
+    font-size:11px !important;
+    font-weight:800 !important;
+    letter-spacing:1.2px !important;
+    line-height:1.2 !important;
+    text-align:center !important;
+}
+
+.report.tpl-modern .info-label,
+#reportPrintLayer .report.tpl-modern .info-label,
+body.printing-reports #reportPrintLayer .report.tpl-modern .info-label {
+    font-size:8.5px !important;
+    margin-bottom:2px !important;
+    letter-spacing:.5px !important;
+}
+
+.report.tpl-modern .info-item strong,
+#reportPrintLayer .report.tpl-modern .info-item strong,
+body.printing-reports #reportPrintLayer .report.tpl-modern .info-item strong {
+    font-size:12.5px !important;
+}
+
+.report.tpl-modern .info-name strong,
+#reportPrintLayer .report.tpl-modern .info-name strong,
+body.printing-reports #reportPrintLayer .report.tpl-modern .info-name strong {
+    font-size:14px !important;
+}
+
+.report.tpl-modern,
+#reportPrintLayer .report.tpl-modern,
+body.printing-reports #reportPrintLayer .report.tpl-modern {
+    font-family:'Segoe UI', Roboto, Arial, Helvetica, sans-serif !important;
+    border-radius:8px !important;
+}
+
+.report.tpl-modern .report-top-accent,
+#reportPrintLayer .report.tpl-modern .report-top-accent,
+body.printing-reports #reportPrintLayer .report.tpl-modern .report-top-accent {
+    display:none !important;
+}
+
+.report.tpl-modern .school-header,
+#reportPrintLayer .report.tpl-modern .school-header,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-header {
+    padding:12px 14px !important;
+    background:linear-gradient(120deg,#17324d 0%,#1f6f68 100%) !important;
+    color:#ffffff !important;
+    border:0 !important;
+    border-radius:8px !important;
+}
+
+.report.tpl-modern .school-logo-container,
+#reportPrintLayer .report.tpl-modern .school-logo-container,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-logo-container {
+    justify-content:center !important;
+    background:#ffffff !important;
+    border-radius:8px !important;
+    padding:4px !important;
+    flex:0 0 76px !important;
+    width:76px !important;
+    height:76px !important;
+}
+
+.report.tpl-modern .school-logo,
+#reportPrintLayer .report.tpl-modern .school-logo,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-logo {
+    width:66px !important;
+    height:66px !important;
+}
+
+.report.tpl-modern .school-logo-container.school-logo-placeholder span,
+#reportPrintLayer .report.tpl-modern .school-logo-container.school-logo-placeholder span,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-logo-container.school-logo-placeholder span {
+    color:#17324d !important;
+    font-weight:800 !important;
+    font-size:20px !important;
+}
+
+.report.tpl-modern .school-heading h1,
+#reportPrintLayer .report.tpl-modern .school-heading h1,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-heading h1 {
+    color:#ffffff !important;
+    background:transparent !important;
+}
+
+.report.tpl-modern .school-heading p,
+#reportPrintLayer .report.tpl-modern .school-heading p,
+body.printing-reports #reportPrintLayer .report.tpl-modern .school-heading p {
+    color:#d8ece9 !important;
+    opacity:1 !important;
+}
+
+.report.tpl-modern .report-title,
+#reportPrintLayer .report.tpl-modern .report-title,
+body.printing-reports #reportPrintLayer .report.tpl-modern .report-title {
+    background:#b28a3b !important;
+    color:#ffffff !important;
+    border-radius:20px !important;
+    padding:4px 16px !important;
+}
+
+.report.tpl-modern .student-passport-container .student-passport-photo,
+#reportPrintLayer .report.tpl-modern .student-passport-container .student-passport-photo,
+body.printing-reports #reportPrintLayer .report.tpl-modern .student-passport-container .student-passport-photo {
+    border:2px solid #ffffff !important;
+    border-radius:6px !important;
+}
+
+.report.tpl-modern .section-heading,
+#reportPrintLayer .report.tpl-modern .section-heading,
+body.printing-reports #reportPrintLayer .report.tpl-modern .section-heading {
+    justify-content:flex-start !important;
+    text-align:left !important;
+    gap:8px !important;
+    margin:11px 0 7px !important;
+    padding-bottom:4px !important;
+    border-bottom:2px solid #e1e9ec !important;
+}
+
+.report.tpl-modern .section-heading > div,
+.report.tpl-modern .section-heading h2,
+.report.tpl-modern .section-heading p,
+#reportPrintLayer .report.tpl-modern .section-heading > div,
+#reportPrintLayer .report.tpl-modern .section-heading h2,
+#reportPrintLayer .report.tpl-modern .section-heading p,
+body.printing-reports #reportPrintLayer .report.tpl-modern .section-heading > div,
+body.printing-reports #reportPrintLayer .report.tpl-modern .section-heading h2,
+body.printing-reports #reportPrintLayer .report.tpl-modern .section-heading p {
+    text-align:left !important;
+}
+
+.report.tpl-modern .section-heading h2,
+#reportPrintLayer .report.tpl-modern .section-heading h2,
+body.printing-reports #reportPrintLayer .report.tpl-modern .section-heading h2 {
+    color:#1f6f68 !important;
+    letter-spacing:.6px !important;
+}
+
+.report.tpl-modern .section-number,
+#reportPrintLayer .report.tpl-modern .section-number,
+body.printing-reports #reportPrintLayer .report.tpl-modern .section-number {
+    background:#1f6f68 !important;
+    border-radius:50% !important;
+    width:23px !important;
+    height:23px !important;
+}
+
+.report.tpl-modern .info-item,
+#reportPrintLayer .report.tpl-modern .info-item,
+body.printing-reports #reportPrintLayer .report.tpl-modern .info-item {
+    background:#ffffff !important;
+    border:1px solid #dbe5e8 !important;
+    border-left:3px solid #17324d !important;
+    border-radius:4px !important;
+    text-align:left !important;
+}
+
+.report.tpl-modern .info-name,
+#reportPrintLayer .report.tpl-modern .info-name,
+body.printing-reports #reportPrintLayer .report.tpl-modern .info-name {
+    background:#e9f5f3 !important;
+    border-left-color:#1f6f68 !important;
+}
+
+.report.tpl-modern .student-info,
+.report.tpl-modern .info-item,
+.report.tpl-modern .info-label,
+.report.tpl-modern .info-item strong,
+#reportPrintLayer .report.tpl-modern .student-info,
+#reportPrintLayer .report.tpl-modern .info-item,
+#reportPrintLayer .report.tpl-modern .info-label,
+#reportPrintLayer .report.tpl-modern .info-item strong,
+body.printing-reports #reportPrintLayer .report.tpl-modern .student-info,
+body.printing-reports #reportPrintLayer .report.tpl-modern .info-item,
+body.printing-reports #reportPrintLayer .report.tpl-modern .info-label,
+body.printing-reports #reportPrintLayer .report.tpl-modern .info-item strong {
+    text-align:left !important;
+}
+
+.report.tpl-modern .result-table th,
+.report.tpl-modern .result-table td,
+#reportPrintLayer .report.tpl-modern .result-table th,
+#reportPrintLayer .report.tpl-modern .result-table td,
+body.printing-reports #reportPrintLayer .report.tpl-modern .result-table th,
+body.printing-reports #reportPrintLayer .report.tpl-modern .result-table td {
+    border:0 !important;
+    border-bottom:1px solid #e1e9ec !important;
+    padding:5px 4px !important;
+}
+
+.report.tpl-modern .result-table thead th,
+#reportPrintLayer .report.tpl-modern .result-table thead th,
+body.printing-reports #reportPrintLayer .report.tpl-modern .result-table thead th {
+    background:#17324d !important;
+    color:#ffffff !important;
+    border:0 !important;
+}
+
+.report.tpl-modern .result-table thead th:nth-child(2),
+.report.tpl-modern .result-table .subject-name,
+#reportPrintLayer .report.tpl-modern .result-table thead th:nth-child(2),
+#reportPrintLayer .report.tpl-modern .result-table .subject-name,
+body.printing-reports #reportPrintLayer .report.tpl-modern .result-table thead th:nth-child(2),
+body.printing-reports #reportPrintLayer .report.tpl-modern .result-table .subject-name {
+    text-align:left !important;
+}
+
+.report.tpl-modern .result-table tbody tr:nth-child(even),
+#reportPrintLayer .report.tpl-modern .result-table tbody tr:nth-child(even),
+body.printing-reports #reportPrintLayer .report.tpl-modern .result-table tbody tr:nth-child(even) {
+    background:#f3f8f8 !important;
+}
+
+.report.tpl-modern .result-table tfoot th,
+#reportPrintLayer .report.tpl-modern .result-table tfoot th,
+body.printing-reports #reportPrintLayer .report.tpl-modern .result-table tfoot th {
+    background:#17324d !important;
+    color:#ffffff !important;
+    border:0 !important;
+    font-size:10px !important;
+}
+
+.report.tpl-modern .summary-card,
+#reportPrintLayer .report.tpl-modern .summary-card,
+body.printing-reports #reportPrintLayer .report.tpl-modern .summary-card {
+    background:#ffffff !important;
+    border:1px solid #dbe5e8 !important;
+    border-top:3px solid #1f6f68 !important;
+    border-radius:6px !important;
+    box-shadow:0 1px 3px rgba(23,50,77,.12) !important;
+}
+
+.report.tpl-modern .summary-card:nth-child(2),
+.report.tpl-modern .summary-card:nth-child(3),
+#reportPrintLayer .report.tpl-modern .summary-card:nth-child(2),
+#reportPrintLayer .report.tpl-modern .summary-card:nth-child(3),
+body.printing-reports #reportPrintLayer .report.tpl-modern .summary-card:nth-child(2),
+body.printing-reports #reportPrintLayer .report.tpl-modern .summary-card:nth-child(3) {
+    background:#ffffff !important;
+    border-top-color:#1f6f68 !important;
+}
+
+.report.tpl-modern .highlight-grade,
+#reportPrintLayer .report.tpl-modern .highlight-grade,
+body.printing-reports #reportPrintLayer .report.tpl-modern .highlight-grade {
+    background:#fff8e6 !important;
+    border-top-color:#b28a3b !important;
+}
+
+.report.tpl-modern .behavior-table th,
+#reportPrintLayer .report.tpl-modern .behavior-table th,
+body.printing-reports #reportPrintLayer .report.tpl-modern .behavior-table th {
+    background:#e9f5f3 !important;
+    color:#17324d !important;
+    border-color:#cfe0e0 !important;
+}
+
+.report.tpl-modern .behavior-table td,
+#reportPrintLayer .report.tpl-modern .behavior-table td,
+body.printing-reports #reportPrintLayer .report.tpl-modern .behavior-table td {
+    border-color:#cfe0e0 !important;
+}
+
+.report.tpl-modern .comment-card,
+#reportPrintLayer .report.tpl-modern .comment-card,
+body.printing-reports #reportPrintLayer .report.tpl-modern .comment-card {
+    background:#ffffff !important;
+    border:1px solid #dbe5e8 !important;
+    border-left:4px solid #1f6f68 !important;
+    border-radius:6px !important;
+}
+
+.report.tpl-modern .comment-label,
+.report.tpl-modern .comment-box,
+#reportPrintLayer .report.tpl-modern .comment-label,
+#reportPrintLayer .report.tpl-modern .comment-box,
+body.printing-reports #reportPrintLayer .report.tpl-modern .comment-label,
+body.printing-reports #reportPrintLayer .report.tpl-modern .comment-box {
+    text-align:left !important;
+}
+
+.report.tpl-modern .comment-label,
+#reportPrintLayer .report.tpl-modern .comment-label,
+body.printing-reports #reportPrintLayer .report.tpl-modern .comment-label {
+    color:#1f6f68 !important;
+}
+
+.report.tpl-modern .comment-box,
+#reportPrintLayer .report.tpl-modern .comment-box,
+body.printing-reports #reportPrintLayer .report.tpl-modern .comment-box {
+    background:#f8fbfb !important;
+    border-radius:4px !important;
+}
+
+.report.tpl-modern .report-footer,
+#reportPrintLayer .report.tpl-modern .report-footer,
+body.printing-reports #reportPrintLayer .report.tpl-modern .report-footer {
+    border-top:2px solid #e1e9ec !important;
+    color:#68747e !important;
+}
+
+/* ---------- ELEGANT ----------
+   Certificate layout: centred crest on top, ornamental rules,
+   form-style student details, borderless ruled tables, big serif
+   summary band and stacked comment lines. */
+
+.report.tpl-elegant,
+#reportPrintLayer .report.tpl-elegant,
+body.printing-reports #reportPrintLayer .report.tpl-elegant {
+    font-family:Georgia,'Times New Roman',Times,serif !important;
+    background:#fffdf8 !important;
+    padding:7mm 11mm 5mm !important;
+    border-radius:2px !important;
+    color:#3b1620 !important;
+}
+
+.report.tpl-elegant::before,
+#reportPrintLayer .report.tpl-elegant::before,
+body.printing-reports #reportPrintLayer .report.tpl-elegant::before {
+    content:'' !important;
+    position:absolute !important;
+    top:3.6mm !important;
+    right:3.6mm !important;
+    bottom:3.6mm !important;
+    left:3.6mm !important;
+    border:1px solid #6b1e2e !important;
+    pointer-events:none !important;
+    z-index:1 !important;
+}
+
+.report.tpl-elegant::after,
+#reportPrintLayer .report.tpl-elegant::after,
+body.printing-reports #reportPrintLayer .report.tpl-elegant::after {
+    content:'' !important;
+    position:absolute !important;
+    top:1.5mm !important;
+    right:1.5mm !important;
+    bottom:1.5mm !important;
+    left:1.5mm !important;
+    border:3px double #b28a3b !important;
+    pointer-events:none !important;
+    z-index:1 !important;
+}
+
+.report.tpl-elegant .report-top-accent,
+#reportPrintLayer .report.tpl-elegant .report-top-accent,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .report-top-accent {
+    display:none !important;
+}
+
+.report.tpl-elegant .report-watermark,
+#reportPrintLayer .report.tpl-elegant .report-watermark,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .report-watermark {
+    opacity:.07 !important;
+    filter:sepia(.6) !important;
+}
+
+.report.tpl-elegant .school-header,
+#reportPrintLayer .report.tpl-elegant .school-header,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .school-header {
+    display:block !important;
+    position:relative !important;
+    width:auto !important;
+    min-height:0 !important;
+    overflow:visible !important;
+    margin:0 0 12px !important;
+    padding:2px 0 12px !important;
+    background:transparent !important;
+    color:#3b1620 !important;
+    border:0 !important;
+    border-bottom:1px solid #b28a3b !important;
+    text-align:center !important;
+}
+
+.report.tpl-elegant .school-header::after,
+#reportPrintLayer .report.tpl-elegant .school-header::after,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .school-header::after {
+    content:'\25C6' !important;
+    position:absolute !important;
+    left:50% !important;
+    bottom:-8px !important;
+    transform:translateX(-50%) !important;
+    display:block !important;
+    width:auto !important;
+    height:auto !important;
+    top:auto !important;
+    right:auto !important;
+    border-radius:0 !important;
+    padding:0 10px !important;
+    background:#fffdf8 !important;
+    color:#b28a3b !important;
+    font-size:11px !important;
+    line-height:14px !important;
+}
+
+.report.tpl-elegant .school-brand,
+#reportPrintLayer .report.tpl-elegant .school-brand,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .school-brand {
+    position:relative !important;
+    display:block !important;
+    width:100% !important;
+    text-align:center !important;
+}
+
+.report.tpl-elegant .school-logo-container,
+#reportPrintLayer .report.tpl-elegant .school-logo-container,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .school-logo-container {
+    position:static !important;
+    transform:none !important;
+    display:flex !important;
+    justify-content:center !important;
+    align-items:center !important;
+    width:56px !important;
+    height:56px !important;
+    margin:0 auto 4px !important;
+    padding:0 !important;
+    background:transparent !important;
+    border:0 !important;
+    overflow:visible !important;
+    order:0 !important;
+    flex:none !important;
+}
+
+.report.tpl-elegant .school-logo,
+#reportPrintLayer .report.tpl-elegant .school-logo,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .school-logo {
+    width:54px !important;
+    height:54px !important;
+    object-fit:contain !important;
+}
+
+.report.tpl-elegant .school-logo-container.school-logo-placeholder span,
+#reportPrintLayer .report.tpl-elegant .school-logo-container.school-logo-placeholder span,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .school-logo-container.school-logo-placeholder span {
+    color:#6b1e2e !important;
+    font-size:18px !important;
+    font-weight:700 !important;
+    border:1px solid #b28a3b !important;
+    border-radius:50% !important;
+    width:52px !important;
+    height:52px !important;
+    display:flex !important;
+    align-items:center !important;
+    justify-content:center !important;
+}
+
+.report.tpl-elegant .student-passport-container,
+#reportPrintLayer .report.tpl-elegant .student-passport-container,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .student-passport-container {
+    position:absolute !important;
+    top:4px !important;
+    right:4px !important;
+    transform:none !important;
+    width:auto !important;
+    margin:0 !important;
+    display:block !important;
+    order:0 !important;
+    flex:none !important;
+}
+
+.report.tpl-elegant .student-passport-photo,
+#reportPrintLayer .report.tpl-elegant .student-passport-photo,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .student-passport-photo {
+    display:block !important;
+    width:56px !important;
+    height:70px !important;
+    object-fit:cover !important;
+    padding:2px !important;
+    background:#fff !important;
+    border:1px solid #b28a3b !important;
+    border-radius:0 !important;
+}
+
+.report.tpl-elegant .school-side-spacer,
+#reportPrintLayer .report.tpl-elegant .school-side-spacer,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .school-side-spacer {
+    display:none !important;
+}
+
+.report.tpl-elegant .school-heading,
+#reportPrintLayer .report.tpl-elegant .school-heading,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .school-heading {
+    display:block !important;
+    order:0 !important;
+    flex:none !important;
+    width:auto !important;
+    max-width:none !important;
+    margin:0 !important;
+    padding:0 78px !important;
+    text-align:center !important;
+}
+
+.report.tpl-elegant .school-heading h1,
+#reportPrintLayer .report.tpl-elegant .school-heading h1,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .school-heading h1 {
+    display:block !important;
+    width:100% !important;
+    margin:0 !important;
+    color:#6b1e2e !important;
+    background:transparent !important;
+    font-size:23px !important;
+    line-height:1.15 !important;
+    font-weight:700 !important;
+    letter-spacing:2.5px !important;
+    text-transform:uppercase !important;
+    text-align:center !important;
+}
+
+.report.tpl-elegant .school-heading p,
+#reportPrintLayer .report.tpl-elegant .school-heading p,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .school-heading p {
+    display:block !important;
+    width:100% !important;
+    margin:4px 0 6px !important;
+    color:#6f5d48 !important;
+    font-size:11px !important;
+    font-style:italic !important;
+    font-weight:400 !important;
+    letter-spacing:.4px !important;
+    line-height:1.25 !important;
+    text-align:center !important;
+    opacity:1 !important;
+}
+
+.report.tpl-elegant .report-title,
+#reportPrintLayer .report.tpl-elegant .report-title,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .report-title {
+    display:inline-block !important;
+    margin:3px auto 0 !important;
+    padding:3px 24px !important;
+    background:transparent !important;
+    color:#6b1e2e !important;
+    border-top:1px solid #b28a3b !important;
+    border-bottom:1px solid #b28a3b !important;
+    border-radius:0 !important;
+    font-size:10.5px !important;
+    font-weight:700 !important;
+    letter-spacing:4px !important;
+    line-height:1.3 !important;
+    text-align:center !important;
+}
+
+.report.tpl-elegant .student-info,
+#reportPrintLayer .report.tpl-elegant .student-info,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .student-info {
+    display:grid !important;
+    grid-template-columns:1fr 1fr !important;
+    gap:0 26px !important;
+    margin:0 0 6px !important;
+}
+
+.report.tpl-elegant .info-item,
+#reportPrintLayer .report.tpl-elegant .info-item,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .info-item {
+    display:flex !important;
+    justify-content:space-between !important;
+    align-items:baseline !important;
+    gap:10px !important;
+    min-height:0 !important;
+    padding:3px 2px !important;
+    background:transparent !important;
+    border:0 !important;
+    border-bottom:1px dotted #bda978 !important;
+    border-radius:0 !important;
+    text-align:left !important;
+}
+
+.report.tpl-elegant .info-name,
+#reportPrintLayer .report.tpl-elegant .info-name,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .info-name {
+    grid-column:span 2 !important;
+    border-bottom:1px solid #b28a3b !important;
+    padding-bottom:4px !important;
+    margin-bottom:2px !important;
+}
+
+.report.tpl-elegant .info-label,
+#reportPrintLayer .report.tpl-elegant .info-label,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .info-label {
+    display:inline !important;
+    margin:0 !important;
+    color:#7a6a55 !important;
+    font-size:9.5px !important;
+    font-style:italic !important;
+    font-weight:400 !important;
+    letter-spacing:.4px !important;
+    text-transform:none !important;
+    text-align:left !important;
+    white-space:nowrap !important;
+}
+
+.report.tpl-elegant .info-item strong,
+#reportPrintLayer .report.tpl-elegant .info-item strong,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .info-item strong {
+    display:inline !important;
+    color:#3b1620 !important;
+    font-size:12px !important;
+    font-weight:700 !important;
+    text-align:right !important;
+}
+
+.report.tpl-elegant .info-name strong,
+#reportPrintLayer .report.tpl-elegant .info-name strong,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .info-name strong {
+    color:#6b1e2e !important;
+    font-size:15px !important;
+    letter-spacing:.5px !important;
+}
+
+.report.tpl-elegant .section-heading,
+#reportPrintLayer .report.tpl-elegant .section-heading,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .section-heading {
+    display:flex !important;
+    align-items:center !important;
+    justify-content:center !important;
+    gap:10px !important;
+    margin:10px 0 6px !important;
+    padding:0 !important;
+    border:0 !important;
+    text-align:center !important;
+}
+
+.report.tpl-elegant .section-heading::before,
+#reportPrintLayer .report.tpl-elegant .section-heading::before,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .section-heading::before {
+    content:'' !important;
+    flex:1 !important;
+    height:1px !important;
+    background:linear-gradient(to right,transparent,#b28a3b) !important;
+}
+
+.report.tpl-elegant .section-heading::after,
+#reportPrintLayer .report.tpl-elegant .section-heading::after,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .section-heading::after {
+    content:'' !important;
+    flex:1 !important;
+    height:1px !important;
+    background:linear-gradient(to left,transparent,#b28a3b) !important;
+}
+
+.report.tpl-elegant .section-number,
+#reportPrintLayer .report.tpl-elegant .section-number,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .section-number {
+    display:none !important;
+}
+
+.report.tpl-elegant .section-heading > div,
+#reportPrintLayer .report.tpl-elegant .section-heading > div,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .section-heading > div {
+    text-align:center !important;
+}
+
+.report.tpl-elegant .section-heading h2,
+#reportPrintLayer .report.tpl-elegant .section-heading h2,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .section-heading h2 {
+    margin:0 !important;
+    color:#6b1e2e !important;
+    font-size:12px !important;
+    font-weight:700 !important;
+    letter-spacing:3px !important;
+    text-transform:uppercase !important;
+    text-align:center !important;
+}
+
+.report.tpl-elegant .section-heading p,
+#reportPrintLayer .report.tpl-elegant .section-heading p,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .section-heading p {
+    margin:1px 0 0 !important;
+    color:#8a7a62 !important;
+    font-size:8.5px !important;
+    font-style:italic !important;
+    text-align:center !important;
+}
+
+.report.tpl-elegant .result-table,
+#reportPrintLayer .report.tpl-elegant .result-table,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table {
+    border-collapse:collapse !important;
+    background:transparent !important;
+}
+
+.report.tpl-elegant .result-table th,
+.report.tpl-elegant .result-table td,
+#reportPrintLayer .report.tpl-elegant .result-table th,
+#reportPrintLayer .report.tpl-elegant .result-table td,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table th,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table td {
+    border:0 !important;
+    border-bottom:1px solid #e3d6b8 !important;
+    padding:3px 4px !important;
+    font-weight:400 !important;
+    font-size:11px !important;
+}
+
+.report.tpl-elegant .result-table thead th,
+#reportPrintLayer .report.tpl-elegant .result-table thead th,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table thead th {
+    background:transparent !important;
+    color:#6b1e2e !important;
+    border-top:1.5px solid #6b1e2e !important;
+    border-bottom:1.5px solid #6b1e2e !important;
+    font-size:8.5px !important;
+    font-style:italic !important;
+    font-weight:700 !important;
+    letter-spacing:.8px !important;
+    text-transform:uppercase !important;
+}
+
+.report.tpl-elegant .result-table tbody tr:nth-child(even),
+#reportPrintLayer .report.tpl-elegant .result-table tbody tr:nth-child(even),
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table tbody tr:nth-child(even) {
+    background:#fbf6ea !important;
+}
+
+.report.tpl-elegant .result-table td,
+#reportPrintLayer .report.tpl-elegant .result-table td,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table td {
+    color:#3b1620 !important;
+}
+
+.report.tpl-elegant .result-table .subject-name,
+#reportPrintLayer .report.tpl-elegant .result-table .subject-name,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table .subject-name {
+    text-align:left !important;
+    padding-left:8px !important;
+    color:#3b1620 !important;
+    font-weight:700 !important;
+    font-style:italic !important;
+}
+
+.report.tpl-elegant .result-table .serial-cell,
+#reportPrintLayer .report.tpl-elegant .result-table .serial-cell,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table .serial-cell {
+    color:#a8977a !important;
+    font-size:8.5px !important;
+}
+
+.report.tpl-elegant .result-table .total-cell,
+#reportPrintLayer .report.tpl-elegant .result-table .total-cell,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table .total-cell {
+    color:#6b1e2e !important;
+    font-weight:700 !important;
+}
+
+.report.tpl-elegant .result-table tfoot th,
+#reportPrintLayer .report.tpl-elegant .result-table tfoot th,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table tfoot th {
+    background:transparent !important;
+    color:#6b1e2e !important;
+    border:0 !important;
+    border-top:1.5px solid #6b1e2e !important;
+    border-bottom:3px double #b28a3b !important;
+    font-size:9.5px !important;
+    letter-spacing:2px !important;
+    padding:4px !important;
+}
+
+.report.tpl-elegant .result-table tfoot th:first-child,
+#reportPrintLayer .report.tpl-elegant .result-table tfoot th:first-child,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table tfoot th:first-child {
+    text-align:right !important;
+    padding-right:12px !important;
+}
+
+.report.tpl-elegant .result-table tfoot th:last-child,
+#reportPrintLayer .report.tpl-elegant .result-table tfoot th:last-child,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .result-table tfoot th:last-child {
+    font-size:12.5px !important;
+    letter-spacing:.5px !important;
+}
+
+.report.tpl-elegant .summary,
+#reportPrintLayer .report.tpl-elegant .summary,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .summary {
+    display:grid !important;
+    grid-template-columns:repeat(4,1fr) !important;
+    gap:0 !important;
+    padding:4px 0 !important;
+    background:#fbf6ea !important;
+    border-top:3px double #b28a3b !important;
+    border-bottom:3px double #b28a3b !important;
+}
+
+.report.tpl-elegant .summary-card,
+#reportPrintLayer .report.tpl-elegant .summary-card,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .summary-card {
+    min-height:0 !important;
+    padding:2px 6px !important;
+    background:transparent !important;
+    border:0 !important;
+    border-right:1px solid #e3d6b8 !important;
+    border-radius:0 !important;
+    text-align:center !important;
+}
+
+.report.tpl-elegant .summary-card:last-child,
+#reportPrintLayer .report.tpl-elegant .summary-card:last-child,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .summary-card:last-child {
+    border-right:0 !important;
+}
+
+.report.tpl-elegant .summary-card span,
+#reportPrintLayer .report.tpl-elegant .summary-card span,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .summary-card span {
+    color:#7a6a55 !important;
+    font-size:7.5px !important;
+    font-style:italic !important;
+    font-weight:400 !important;
+    letter-spacing:1.5px !important;
+    text-transform:uppercase !important;
+}
+
+.report.tpl-elegant .summary-card strong,
+#reportPrintLayer .report.tpl-elegant .summary-card strong,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .summary-card strong {
+    margin-top:1px !important;
+    color:#6b1e2e !important;
+    font-size:19px !important;
+    font-weight:400 !important;
+}
+
+.report.tpl-elegant .highlight-grade strong,
+#reportPrintLayer .report.tpl-elegant .highlight-grade strong,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .highlight-grade strong {
+    color:#8a6a22 !important;
+    font-size:21px !important;
+    font-weight:700 !important;
+}
+
+.report.tpl-elegant .behavior-table,
+#reportPrintLayer .report.tpl-elegant .behavior-table,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .behavior-table {
+    border-collapse:collapse !important;
+    background:transparent !important;
+}
+
+.report.tpl-elegant .behavior-table th,
+.report.tpl-elegant .behavior-table td,
+#reportPrintLayer .report.tpl-elegant .behavior-table th,
+#reportPrintLayer .report.tpl-elegant .behavior-table td,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .behavior-table th,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .behavior-table td {
+    border:0 !important;
+    border-bottom:1px solid #e3d6b8 !important;
+    padding:4px 3px !important;
+    background:transparent !important;
+}
+
+.report.tpl-elegant .behavior-table th,
+#reportPrintLayer .report.tpl-elegant .behavior-table th,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .behavior-table th {
+    color:#6b1e2e !important;
+    font-size:9.5px !important;
+    font-style:italic !important;
+    font-weight:700 !important;
+    border-top:1.5px solid #6b1e2e !important;
+    border-bottom:1px solid #6b1e2e !important;
+}
+
+.report.tpl-elegant .behavior-table .trait-title,
+#reportPrintLayer .report.tpl-elegant .behavior-table .trait-title,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .behavior-table .trait-title {
+    color:#6b1e2e !important;
+}
+
+.report.tpl-elegant .behavior-table .trait-rating,
+#reportPrintLayer .report.tpl-elegant .behavior-table .trait-rating,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .behavior-table .trait-rating {
+    color:#3b1620 !important;
+    background:transparent !important;
+    font-size:12px !important;
+    font-weight:700 !important;
+}
+
+.report.tpl-elegant .comment-grid,
+#reportPrintLayer .report.tpl-elegant .comment-grid,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .comment-grid {
+    display:grid !important;
+    grid-template-columns:1fr !important;
+    gap:6px !important;
+}
+
+.report.tpl-elegant .comment-card,
+#reportPrintLayer .report.tpl-elegant .comment-card,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .comment-card {
+    display:grid !important;
+    grid-template-columns:100px 1fr !important;
+    column-gap:10px !important;
+    align-items:end !important;
+    padding:0 0 2px !important;
+    background:transparent !important;
+    border:0 !important;
+    border-radius:0 !important;
+}
+
+.report.tpl-elegant .comment-label,
+#reportPrintLayer .report.tpl-elegant .comment-label,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .comment-label {
+    grid-column:1 !important;
+    grid-row:1 / span 2 !important;
+    align-self:center !important;
+    margin:0 !important;
+    color:#6b1e2e !important;
+    font-size:8px !important;
+    font-weight:700 !important;
+    letter-spacing:1.2px !important;
+    line-height:1.4 !important;
+    text-align:left !important;
+}
+
+.report.tpl-elegant .comment-box,
+#reportPrintLayer .report.tpl-elegant .comment-box,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .comment-box {
+    grid-column:2 !important;
+    min-height:26px !important;
+    padding:3px 2px !important;
+    background:transparent !important;
+    color:#3b1620 !important;
+    border:0 !important;
+    border-bottom:1px solid #b28a3b !important;
+    border-radius:0 !important;
+    font-size:10.5px !important;
+    font-style:italic !important;
+    text-align:left !important;
+}
+
+.report.tpl-elegant .signature-line,
+#reportPrintLayer .report.tpl-elegant .signature-line,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .signature-line {
+    grid-column:2 !important;
+    display:flex !important;
+    justify-content:flex-end !important;
+    gap:34px !important;
+    margin-top:12px !important;
+    padding:0 !important;
+    border:0 !important;
+    color:#8a7a62 !important;
+    font-size:7.5px !important;
+    font-style:italic !important;
+}
+
+.report.tpl-elegant .signature-line span,
+#reportPrintLayer .report.tpl-elegant .signature-line span,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .signature-line span {
+    min-width:90px !important;
+    padding-top:2px !important;
+    border-top:1px solid #b28a3b !important;
+    text-align:center !important;
+}
+
+.report.tpl-elegant .report-footer,
+#reportPrintLayer .report.tpl-elegant .report-footer,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .report-footer {
+    justify-content:center !important;
+    align-items:center !important;
+    gap:12px !important;
+    margin-top:7px !important;
+    padding-top:4px !important;
+    border-top:1px solid #b28a3b !important;
+    color:#8a7a62 !important;
+    font-size:7.5px !important;
+    font-style:italic !important;
+    letter-spacing:.6px !important;
+}
+
+.report.tpl-elegant .report-footer span + span::before,
+#reportPrintLayer .report.tpl-elegant .report-footer span + span::before,
+body.printing-reports #reportPrintLayer .report.tpl-elegant .report-footer span + span::before {
+    content:'\25C6' !important;
+    margin-right:12px !important;
+    color:#b28a3b !important;
+    font-size:6px !important;
+    font-style:normal !important;
+}
+
+
+/* ---------- MINIMAL ----------
+   Same layout as Elegant, black and white; certificate layout: centred crest on top, ornamental rules,
+   form-style student details, borderless ruled tables, big serif
+   summary band and stacked comment lines. */
+
+.report.tpl-minimal,
+#reportPrintLayer .report.tpl-minimal,
+body.printing-reports #reportPrintLayer .report.tpl-minimal {
+    font-family:Georgia,'Times New Roman',Times,serif !important;
+    background:#ffffff !important;
+    padding:7mm 11mm 5mm !important;
+    border-radius:2px !important;
+    color:#000000 !important;
+}
+
+.report.tpl-minimal::before,
+#reportPrintLayer .report.tpl-minimal::before,
+body.printing-reports #reportPrintLayer .report.tpl-minimal::before {
+    content:'' !important;
+    position:absolute !important;
+    top:3.6mm !important;
+    right:3.6mm !important;
+    bottom:3.6mm !important;
+    left:3.6mm !important;
+    border:1px solid #000000 !important;
+    pointer-events:none !important;
+    z-index:1 !important;
+}
+
+.report.tpl-minimal::after,
+#reportPrintLayer .report.tpl-minimal::after,
+body.printing-reports #reportPrintLayer .report.tpl-minimal::after {
+    content:'' !important;
+    position:absolute !important;
+    top:1.5mm !important;
+    right:1.5mm !important;
+    bottom:1.5mm !important;
+    left:1.5mm !important;
+    border:3px double #000000 !important;
+    pointer-events:none !important;
+    z-index:1 !important;
+}
+
+.report.tpl-minimal .report-top-accent,
+#reportPrintLayer .report.tpl-minimal .report-top-accent,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .report-top-accent {
+    display:none !important;
+}
+
+.report.tpl-minimal .report-watermark,
+#reportPrintLayer .report.tpl-minimal .report-watermark,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .report-watermark {
+    opacity:.05 !important;
+    filter:grayscale(1) !important;
+}
+
+.report.tpl-minimal .school-header,
+#reportPrintLayer .report.tpl-minimal .school-header,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .school-header {
+    display:block !important;
+    position:relative !important;
+    width:auto !important;
+    min-height:0 !important;
+    overflow:visible !important;
+    margin:0 0 12px !important;
+    padding:2px 0 12px !important;
+    background:transparent !important;
+    color:#000000 !important;
+    border:0 !important;
+    border-bottom:1px solid #000000 !important;
+    text-align:center !important;
+}
+
+.report.tpl-minimal .school-header::after,
+#reportPrintLayer .report.tpl-minimal .school-header::after,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .school-header::after {
+    content:'\25C6' !important;
+    position:absolute !important;
+    left:50% !important;
+    bottom:-8px !important;
+    transform:translateX(-50%) !important;
+    display:block !important;
+    width:auto !important;
+    height:auto !important;
+    top:auto !important;
+    right:auto !important;
+    border-radius:0 !important;
+    padding:0 10px !important;
+    background:#ffffff !important;
+    color:#000000 !important;
+    font-size:11px !important;
+    line-height:14px !important;
+}
+
+.report.tpl-minimal .school-brand,
+#reportPrintLayer .report.tpl-minimal .school-brand,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .school-brand {
+    position:relative !important;
+    display:block !important;
+    width:100% !important;
+    text-align:center !important;
+}
+
+.report.tpl-minimal .school-logo-container,
+#reportPrintLayer .report.tpl-minimal .school-logo-container,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .school-logo-container {
+    position:static !important;
+    transform:none !important;
+    display:flex !important;
+    justify-content:center !important;
+    align-items:center !important;
+    width:56px !important;
+    height:56px !important;
+    margin:0 auto 4px !important;
+    padding:0 !important;
+    background:transparent !important;
+    border:0 !important;
+    overflow:visible !important;
+    order:0 !important;
+    flex:none !important;
+}
+
+.report.tpl-minimal .school-logo,
+#reportPrintLayer .report.tpl-minimal .school-logo,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .school-logo {
+    width:54px !important;
+    height:54px !important;
+    object-fit:contain !important;
+}
+
+.report.tpl-minimal .school-logo-container.school-logo-placeholder span,
+#reportPrintLayer .report.tpl-minimal .school-logo-container.school-logo-placeholder span,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .school-logo-container.school-logo-placeholder span {
+    color:#000000 !important;
+    font-size:18px !important;
+    font-weight:700 !important;
+    border:1px solid #000000 !important;
+    border-radius:50% !important;
+    width:52px !important;
+    height:52px !important;
+    display:flex !important;
+    align-items:center !important;
+    justify-content:center !important;
+}
+
+.report.tpl-minimal .student-passport-container,
+#reportPrintLayer .report.tpl-minimal .student-passport-container,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .student-passport-container {
+    position:absolute !important;
+    top:4px !important;
+    right:4px !important;
+    transform:none !important;
+    width:auto !important;
+    margin:0 !important;
+    display:block !important;
+    order:0 !important;
+    flex:none !important;
+}
+
+.report.tpl-minimal .student-passport-photo,
+#reportPrintLayer .report.tpl-minimal .student-passport-photo,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .student-passport-photo {
+    display:block !important;
+    width:56px !important;
+    height:70px !important;
+    object-fit:cover !important;
+    padding:2px !important;
+    background:#fff !important;
+    border:1px solid #000000 !important;
+    border-radius:0 !important;
+}
+
+.report.tpl-minimal .school-side-spacer,
+#reportPrintLayer .report.tpl-minimal .school-side-spacer,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .school-side-spacer {
+    display:none !important;
+}
+
+.report.tpl-minimal .school-heading,
+#reportPrintLayer .report.tpl-minimal .school-heading,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .school-heading {
+    display:block !important;
+    order:0 !important;
+    flex:none !important;
+    width:auto !important;
+    max-width:none !important;
+    margin:0 !important;
+    padding:0 78px !important;
+    text-align:center !important;
+}
+
+.report.tpl-minimal .school-heading h1,
+#reportPrintLayer .report.tpl-minimal .school-heading h1,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .school-heading h1 {
+    display:block !important;
+    width:100% !important;
+    margin:0 !important;
+    color:#000000 !important;
+    background:transparent !important;
+    font-size:23px !important;
+    line-height:1.15 !important;
+    font-weight:700 !important;
+    letter-spacing:2.5px !important;
+    text-transform:uppercase !important;
+    text-align:center !important;
+}
+
+.report.tpl-minimal .school-heading p,
+#reportPrintLayer .report.tpl-minimal .school-heading p,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .school-heading p {
+    display:block !important;
+    width:100% !important;
+    margin:4px 0 6px !important;
+    color:#555555 !important;
+    font-size:11px !important;
+    font-style:italic !important;
+    font-weight:400 !important;
+    letter-spacing:.4px !important;
+    line-height:1.25 !important;
+    text-align:center !important;
+    opacity:1 !important;
+}
+
+.report.tpl-minimal .report-title,
+#reportPrintLayer .report.tpl-minimal .report-title,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .report-title {
+    display:inline-block !important;
+    margin:3px auto 0 !important;
+    padding:3px 24px !important;
+    background:transparent !important;
+    color:#000000 !important;
+    border-top:1px solid #000000 !important;
+    border-bottom:1px solid #000000 !important;
+    border-radius:0 !important;
+    font-size:10.5px !important;
+    font-weight:700 !important;
+    letter-spacing:4px !important;
+    line-height:1.3 !important;
+    text-align:center !important;
+}
+
+.report.tpl-minimal .student-info,
+#reportPrintLayer .report.tpl-minimal .student-info,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .student-info {
+    display:grid !important;
+    grid-template-columns:1fr 1fr !important;
+    gap:0 26px !important;
+    margin:0 0 6px !important;
+}
+
+.report.tpl-minimal .info-item,
+#reportPrintLayer .report.tpl-minimal .info-item,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .info-item {
+    display:flex !important;
+    justify-content:space-between !important;
+    align-items:baseline !important;
+    gap:10px !important;
+    min-height:0 !important;
+    padding:3px 2px !important;
+    background:transparent !important;
+    border:0 !important;
+    border-bottom:1px dotted #999999 !important;
+    border-radius:0 !important;
+    text-align:left !important;
+}
+
+.report.tpl-minimal .info-name,
+#reportPrintLayer .report.tpl-minimal .info-name,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .info-name {
+    grid-column:span 2 !important;
+    border-bottom:1px solid #000000 !important;
+    padding-bottom:4px !important;
+    margin-bottom:2px !important;
+}
+
+.report.tpl-minimal .info-label,
+#reportPrintLayer .report.tpl-minimal .info-label,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .info-label {
+    display:inline !important;
+    margin:0 !important;
+    color:#666666 !important;
+    font-size:9.5px !important;
+    font-style:italic !important;
+    font-weight:400 !important;
+    letter-spacing:.4px !important;
+    text-transform:none !important;
+    text-align:left !important;
+    white-space:nowrap !important;
+}
+
+.report.tpl-minimal .info-item strong,
+#reportPrintLayer .report.tpl-minimal .info-item strong,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .info-item strong {
+    display:inline !important;
+    color:#000000 !important;
+    font-size:12px !important;
+    font-weight:700 !important;
+    text-align:right !important;
+}
+
+.report.tpl-minimal .info-name strong,
+#reportPrintLayer .report.tpl-minimal .info-name strong,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .info-name strong {
+    color:#000000 !important;
+    font-size:15px !important;
+    letter-spacing:.5px !important;
+}
+
+.report.tpl-minimal .section-heading,
+#reportPrintLayer .report.tpl-minimal .section-heading,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .section-heading {
+    display:flex !important;
+    align-items:center !important;
+    justify-content:center !important;
+    gap:10px !important;
+    margin:10px 0 6px !important;
+    padding:0 !important;
+    border:0 !important;
+    text-align:center !important;
+}
+
+.report.tpl-minimal .section-heading::before,
+#reportPrintLayer .report.tpl-minimal .section-heading::before,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .section-heading::before {
+    content:'' !important;
+    flex:1 !important;
+    height:1px !important;
+    background:linear-gradient(to right,transparent,#000000) !important;
+}
+
+.report.tpl-minimal .section-heading::after,
+#reportPrintLayer .report.tpl-minimal .section-heading::after,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .section-heading::after {
+    content:'' !important;
+    flex:1 !important;
+    height:1px !important;
+    background:linear-gradient(to left,transparent,#000000) !important;
+}
+
+.report.tpl-minimal .section-number,
+#reportPrintLayer .report.tpl-minimal .section-number,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .section-number {
+    display:none !important;
+}
+
+.report.tpl-minimal .section-heading > div,
+#reportPrintLayer .report.tpl-minimal .section-heading > div,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .section-heading > div {
+    text-align:center !important;
+}
+
+.report.tpl-minimal .section-heading h2,
+#reportPrintLayer .report.tpl-minimal .section-heading h2,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .section-heading h2 {
+    margin:0 !important;
+    color:#000000 !important;
+    font-size:12px !important;
+    font-weight:700 !important;
+    letter-spacing:3px !important;
+    text-transform:uppercase !important;
+    text-align:center !important;
+}
+
+.report.tpl-minimal .section-heading p,
+#reportPrintLayer .report.tpl-minimal .section-heading p,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .section-heading p {
+    margin:1px 0 0 !important;
+    color:#666666 !important;
+    font-size:8.5px !important;
+    font-style:italic !important;
+    text-align:center !important;
+}
+
+.report.tpl-minimal .result-table,
+#reportPrintLayer .report.tpl-minimal .result-table,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table {
+    border-collapse:collapse !important;
+    background:transparent !important;
+}
+
+.report.tpl-minimal .result-table th,
+.report.tpl-minimal .result-table td,
+#reportPrintLayer .report.tpl-minimal .result-table th,
+#reportPrintLayer .report.tpl-minimal .result-table td,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table th,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table td {
+    border:0 !important;
+    border-bottom:1px solid #d0d0d0 !important;
+    padding:3px 4px !important;
+    font-weight:400 !important;
+    font-size:11px !important;
+}
+
+.report.tpl-minimal .result-table thead th,
+#reportPrintLayer .report.tpl-minimal .result-table thead th,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table thead th {
+    background:transparent !important;
+    color:#000000 !important;
+    border-top:1.5px solid #000000 !important;
+    border-bottom:1.5px solid #000000 !important;
+    font-size:8.5px !important;
+    font-style:italic !important;
+    font-weight:700 !important;
+    letter-spacing:.8px !important;
+    text-transform:uppercase !important;
+}
+
+.report.tpl-minimal .result-table tbody tr:nth-child(even),
+#reportPrintLayer .report.tpl-minimal .result-table tbody tr:nth-child(even),
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table tbody tr:nth-child(even) {
+    background:#f5f5f5 !important;
+}
+
+.report.tpl-minimal .result-table td,
+#reportPrintLayer .report.tpl-minimal .result-table td,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table td {
+    color:#000000 !important;
+}
+
+.report.tpl-minimal .result-table .subject-name,
+#reportPrintLayer .report.tpl-minimal .result-table .subject-name,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table .subject-name {
+    text-align:left !important;
+    padding-left:8px !important;
+    color:#000000 !important;
+    font-weight:700 !important;
+    font-style:italic !important;
+}
+
+.report.tpl-minimal .result-table .serial-cell,
+#reportPrintLayer .report.tpl-minimal .result-table .serial-cell,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table .serial-cell {
+    color:#999999 !important;
+    font-size:8.5px !important;
+}
+
+.report.tpl-minimal .result-table .total-cell,
+#reportPrintLayer .report.tpl-minimal .result-table .total-cell,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table .total-cell {
+    color:#000000 !important;
+    font-weight:700 !important;
+}
+
+.report.tpl-minimal .result-table tfoot th,
+#reportPrintLayer .report.tpl-minimal .result-table tfoot th,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table tfoot th {
+    background:transparent !important;
+    color:#000000 !important;
+    border:0 !important;
+    border-top:1.5px solid #000000 !important;
+    border-bottom:3px double #000000 !important;
+    font-size:9.5px !important;
+    letter-spacing:2px !important;
+    padding:4px !important;
+}
+
+.report.tpl-minimal .result-table tfoot th:first-child,
+#reportPrintLayer .report.tpl-minimal .result-table tfoot th:first-child,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table tfoot th:first-child {
+    text-align:right !important;
+    padding-right:12px !important;
+}
+
+.report.tpl-minimal .result-table tfoot th:last-child,
+#reportPrintLayer .report.tpl-minimal .result-table tfoot th:last-child,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table tfoot th:last-child {
+    font-size:12.5px !important;
+    letter-spacing:.5px !important;
+}
+
+.report.tpl-minimal .summary,
+#reportPrintLayer .report.tpl-minimal .summary,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .summary {
+    display:grid !important;
+    grid-template-columns:repeat(4,1fr) !important;
+    gap:0 !important;
+    padding:4px 0 !important;
+    background:#f5f5f5 !important;
+    border-top:3px double #000000 !important;
+    border-bottom:3px double #000000 !important;
+}
+
+.report.tpl-minimal .summary-card,
+#reportPrintLayer .report.tpl-minimal .summary-card,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .summary-card {
+    min-height:0 !important;
+    padding:2px 6px !important;
+    background:transparent !important;
+    border:0 !important;
+    border-right:1px solid #d0d0d0 !important;
+    border-radius:0 !important;
+    text-align:center !important;
+}
+
+.report.tpl-minimal .summary-card:last-child,
+#reportPrintLayer .report.tpl-minimal .summary-card:last-child,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .summary-card:last-child {
+    border-right:0 !important;
+}
+
+.report.tpl-minimal .summary-card span,
+#reportPrintLayer .report.tpl-minimal .summary-card span,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .summary-card span {
+    color:#666666 !important;
+    font-size:7.5px !important;
+    font-style:italic !important;
+    font-weight:400 !important;
+    letter-spacing:1.5px !important;
+    text-transform:uppercase !important;
+}
+
+.report.tpl-minimal .summary-card strong,
+#reportPrintLayer .report.tpl-minimal .summary-card strong,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .summary-card strong {
+    margin-top:1px !important;
+    color:#000000 !important;
+    font-size:19px !important;
+    font-weight:400 !important;
+}
+
+.report.tpl-minimal .highlight-grade strong,
+#reportPrintLayer .report.tpl-minimal .highlight-grade strong,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .highlight-grade strong {
+    color:#000000 !important;
+    font-size:21px !important;
+    font-weight:700 !important;
+}
+
+.report.tpl-minimal .behavior-table,
+#reportPrintLayer .report.tpl-minimal .behavior-table,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .behavior-table {
+    border-collapse:collapse !important;
+    background:transparent !important;
+}
+
+.report.tpl-minimal .behavior-table th,
+.report.tpl-minimal .behavior-table td,
+#reportPrintLayer .report.tpl-minimal .behavior-table th,
+#reportPrintLayer .report.tpl-minimal .behavior-table td,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .behavior-table th,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .behavior-table td {
+    border:0 !important;
+    border-bottom:1px solid #d0d0d0 !important;
+    padding:4px 3px !important;
+    background:transparent !important;
+}
+
+.report.tpl-minimal .behavior-table th,
+#reportPrintLayer .report.tpl-minimal .behavior-table th,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .behavior-table th {
+    color:#000000 !important;
+    font-size:9.5px !important;
+    font-style:italic !important;
+    font-weight:700 !important;
+    border-top:1.5px solid #000000 !important;
+    border-bottom:1px solid #000000 !important;
+}
+
+.report.tpl-minimal .behavior-table .trait-title,
+#reportPrintLayer .report.tpl-minimal .behavior-table .trait-title,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .behavior-table .trait-title {
+    color:#000000 !important;
+}
+
+.report.tpl-minimal .behavior-table .trait-rating,
+#reportPrintLayer .report.tpl-minimal .behavior-table .trait-rating,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .behavior-table .trait-rating {
+    color:#000000 !important;
+    background:transparent !important;
+    font-size:12px !important;
+    font-weight:700 !important;
+}
+
+.report.tpl-minimal .comment-grid,
+#reportPrintLayer .report.tpl-minimal .comment-grid,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .comment-grid {
+    display:grid !important;
+    grid-template-columns:1fr !important;
+    gap:6px !important;
+}
+
+.report.tpl-minimal .comment-card,
+#reportPrintLayer .report.tpl-minimal .comment-card,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .comment-card {
+    display:grid !important;
+    grid-template-columns:100px 1fr !important;
+    column-gap:10px !important;
+    align-items:end !important;
+    padding:0 0 2px !important;
+    background:transparent !important;
+    border:0 !important;
+    border-radius:0 !important;
+}
+
+.report.tpl-minimal .comment-label,
+#reportPrintLayer .report.tpl-minimal .comment-label,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .comment-label {
+    grid-column:1 !important;
+    grid-row:1 / span 2 !important;
+    align-self:center !important;
+    margin:0 !important;
+    color:#000000 !important;
+    font-size:8px !important;
+    font-weight:700 !important;
+    letter-spacing:1.2px !important;
+    line-height:1.4 !important;
+    text-align:left !important;
+}
+
+.report.tpl-minimal .comment-box,
+#reportPrintLayer .report.tpl-minimal .comment-box,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .comment-box {
+    grid-column:2 !important;
+    min-height:26px !important;
+    padding:3px 2px !important;
+    background:transparent !important;
+    color:#000000 !important;
+    border:0 !important;
+    border-bottom:1px solid #000000 !important;
+    border-radius:0 !important;
+    font-size:10.5px !important;
+    font-style:italic !important;
+    text-align:left !important;
+}
+
+.report.tpl-minimal .signature-line,
+#reportPrintLayer .report.tpl-minimal .signature-line,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .signature-line {
+    grid-column:2 !important;
+    display:flex !important;
+    justify-content:flex-end !important;
+    gap:34px !important;
+    margin-top:12px !important;
+    padding:0 !important;
+    border:0 !important;
+    color:#666666 !important;
+    font-size:7.5px !important;
+    font-style:italic !important;
+}
+
+.report.tpl-minimal .signature-line span,
+#reportPrintLayer .report.tpl-minimal .signature-line span,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .signature-line span {
+    min-width:90px !important;
+    padding-top:2px !important;
+    border-top:1px solid #000000 !important;
+    text-align:center !important;
+}
+
+.report.tpl-minimal .report-footer,
+#reportPrintLayer .report.tpl-minimal .report-footer,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .report-footer {
+    justify-content:center !important;
+    align-items:center !important;
+    gap:12px !important;
+    margin-top:7px !important;
+    padding-top:4px !important;
+    border-top:1px solid #000000 !important;
+    color:#666666 !important;
+    font-size:7.5px !important;
+    font-style:italic !important;
+    letter-spacing:.6px !important;
+}
+
+.report.tpl-minimal .report-footer span + span::before,
+#reportPrintLayer .report.tpl-minimal .report-footer span + span::before,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .report-footer span + span::before {
+    content:'\25C6' !important;
+    margin-right:12px !important;
+    color:#000000 !important;
+    font-size:6px !important;
+    font-style:normal !important;
+}
+
+.report.tpl-minimal .school-logo,
+.report.tpl-minimal .student-passport-photo,
+#reportPrintLayer .report.tpl-minimal .school-logo,
+#reportPrintLayer .report.tpl-minimal .student-passport-photo,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .school-logo,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .student-passport-photo {
+    filter:grayscale(1) !important;
+}
+
+.report.tpl-minimal .result-table .grade-cell,
+#reportPrintLayer .report.tpl-minimal .result-table .grade-cell,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table .grade-cell {
+    color:#000000 !important;
+}
+
+.report.tpl-minimal .result-table .grade-F,
+.report.tpl-minimal .result-table .grade-E,
+#reportPrintLayer .report.tpl-minimal .result-table .grade-F,
+#reportPrintLayer .report.tpl-minimal .result-table .grade-E,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table .grade-F,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table .grade-E {
+    text-decoration:underline !important;
+}
+
+.report.tpl-minimal .result-table .grade-cell,
+#reportPrintLayer .report.tpl-minimal .result-table .grade-cell,
+body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table .grade-cell {
+    font-weight:700 !important;
+}
+
+
+
+/* Narrow phones: keep the non-classic header from squeezing */
+@media screen and (max-width: 700px) {
+    .report.tpl-modern .school-heading h1,
+    .report.tpl-elegant .school-heading h1,
+    .report.tpl-minimal .school-heading h1 {
+        font-size: 15px !important;
+        letter-spacing: .2px !important;
+    }
+    .report.tpl-modern .school-logo-container,
+    .report.tpl-elegant .school-logo-container,
+    .report.tpl-minimal .school-logo-container,
+    .report.tpl-modern .student-passport-container,
+    .report.tpl-elegant .student-passport-container,
+    .report.tpl-minimal .student-passport-container,
+    .report.tpl-modern .school-side-spacer,
+    .report.tpl-elegant .school-side-spacer,
+    .report.tpl-minimal .school-side-spacer {
+        flex-basis: 50px !important;
+        width: 50px !important;
+    }
+    .report.tpl-modern .school-logo,
+    .report.tpl-elegant .school-logo,
+    .report.tpl-minimal .school-logo {
+        width: 44px !important;
+        height: 44px !important;
+    }
+    .report.tpl-modern .student-passport-photo,
+    .report.tpl-elegant .student-passport-photo,
+    .report.tpl-minimal .student-passport-photo {
+        width: 44px !important;
+        height: 56px !important;
+    }
+}
+
+/* =========================================================
+   REPORT OUTLOOK PICKER (School Information section)
+   ========================================================= */
+
+.outlook-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin-top: 8px;
+}
+
+.outlook-card {
+    display: block;
+    position: relative;
+    padding: 10px 12px;
+    border: 2px solid var(--line);
+    border-radius: 10px;
+    background: #ffffff;
+    cursor: pointer;
+    text-align: left;
+}
+
+.outlook-card input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.outlook-card.selected {
+    border-color: var(--teal);
+    background: var(--teal-light);
+}
+
+.outlook-card strong {
+    display: block;
+    color: var(--navy);
+    font-size: 15px;
+}
+
+.outlook-card small {
+    display: block;
+    margin-top: 2px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.3;
+}
+
+.outlook-swatches {
+    display: flex;
+    gap: 5px;
+    margin-top: 7px;
+}
+
+.outlook-swatches i {
+    display: block;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 1px solid rgba(0, 0, 0, .18);
+}
+
+#reportOutlookPreview {
+    position: relative;
+    margin-top: 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow: hidden;
+    background: #eef2f5;
+}
+
+#reportOutlookPreview iframe {
+    display: block;
+    border: 0;
+    width: 794px;
+    transform-origin: top left;
+    background: #ffffff;
+}
+
+@media screen and (max-width: 400px) {
+    .outlook-grid {
+        grid-template-columns: 1fr;
+    }
+}

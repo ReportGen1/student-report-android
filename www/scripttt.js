@@ -269,6 +269,8 @@ function studentForFingerprint(student) {
 function reportSettingsForFingerprint() {
     const copy = Object.assign({}, reportSettings);
     delete copy.commentBank;
+    /* Changing the report outlook must not make reports count as new. */
+    delete copy.reportTemplate;
     return copy;
 }
 
@@ -744,7 +746,10 @@ let reportSettings = {
         40,
 
     gradeF:
-        0
+        0,
+
+    reportTemplate:
+        "classic"
 
 };
 
@@ -844,6 +849,607 @@ let schoolInformationStatus;
 
 
 /* =========================================================
+   COLLAPSIBLE SECTIONS  (minimize / expand arrow)
+   A small arrow button is added to the title of a section.
+   Click the arrow (or the title) to minimize the section down to
+   its title, and click again to open it. Only the display is
+   changed - no data, buttons or saved settings are touched.
+   ========================================================= */
+
+const SRG_COLLAPSE_CARDS = "section, .card, fieldset, details, .step-card, .panel";
+const SRG_COLLAPSE_HEADINGS = "h1, h2, h3, h4, h5, h6";
+const SRG_COLLAPSE_BUSY = "button, input, select, textarea, table, #studentPreviewContainer";
+
+function srgInjectCollapseStyle() {
+
+    if (document.getElementById("srgCollapseStyle")) return;
+
+    const style = document.createElement("style");
+    style.id = "srgCollapseStyle";
+    style.textContent =
+        ".srg-collapse-title{position:relative;padding-right:44px;cursor:pointer;-webkit-user-select:none;user-select:none;}" +
+        ".srg-collapse-btn{position:absolute;right:0;top:50%;transform:translateY(-50%);" +
+        "width:32px !important;height:32px !important;min-width:0 !important;padding:0 !important;margin:0 !important;" +
+        "display:inline-flex !important;align-items:center;justify-content:center;" +
+        "background:transparent !important;box-shadow:none !important;color:inherit !important;" +
+        "border:1px solid rgba(128,128,128,0.55) !important;border-radius:50% !important;cursor:pointer;line-height:1;}" +
+        ".srg-collapse-btn:hover{background:rgba(128,128,128,0.18) !important;}" +
+        ".srg-collapse-btn svg{width:18px;height:18px;display:block;transition:transform 0.2s ease;transform:rotate(180deg);}" +
+        ".srg-collapse-btn[aria-expanded=\"false\"] svg{transform:rotate(0deg);}" +
+        ".srg-collapsed-item{display:none !important;}" +
+        ".srg-has-lock{padding-right:84px;}" +
+        ".srg-lock-btn{position:absolute;right:38px;top:50%;transform:translateY(-50%);width:32px !important;height:32px !important;min-width:0 !important;padding:0 !important;margin:0 !important;display:inline-flex !important;align-items:center;justify-content:center;background:transparent !important;box-shadow:none !important;border:1px solid rgba(128,128,128,0.55) !important;border-radius:50% !important;cursor:pointer;font-size:15px;line-height:1;}" +
+        ".srg-lock-btn:hover{background:rgba(128,128,128,0.18) !important;}" +
+        ".srg-modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.55);z-index:100000;display:flex;align-items:center;justify-content:center;padding:16px;}" +
+        ".srg-modal{background:#fff;color:#222;border-radius:12px;width:100%;max-width:360px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,0.35);font-family:inherit;}" +
+        ".srg-modal h3{margin:0 0 8px;font-size:18px;color:#222;}" +
+        ".srg-modal p{margin:0 0 12px;font-size:14px;line-height:1.4;color:#444;}" +
+        ".srg-modal input{display:block;width:100%;box-sizing:border-box;margin:0 0 10px;padding:10px;font-size:16px;border:1px solid #bbb;border-radius:8px;background:#fff;color:#222;}" +
+        ".srg-modal-error{min-height:18px;margin:0 0 8px;font-size:13px;color:#c62828;}" +
+        ".srg-modal-row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;}" +
+        ".srg-modal-btn{padding:9px 14px;border-radius:8px;border:1px solid #bbb;font-size:14px;cursor:pointer;width:auto !important;margin:0 !important;}" +
+        ".srg-modal-cancel{background:#f1f1f1;color:#222;}" +
+        ".srg-modal-danger{background:#fff;color:#c62828;border-color:#c62828;}" +
+        ".srg-modal-ok{background:#1565c0;color:#fff;border-color:#1565c0;}" +
+        ".srg-modal-ok:disabled{opacity:0.6;}" +
+        "@media print{.srg-collapse-btn,.srg-lock-btn,.srg-modal-overlay{display:none !important;}}";
+    document.head.appendChild(style);
+
+}
+
+/* =========================================================
+   SECTION PASSWORD
+   The school owner can set one password. Sections marked
+   `protect` (School Subjects, Staff Access, Manage Classes,
+   School Information) then ask for it before they open.
+   Student Photos is never protected.
+   Only a salted SHA-256 hash is stored (inside the school
+   settings, so it follows the school login on every device).
+   Once the right password is typed the sections stay open for
+   this session; logging out or refreshing locks them again.
+   ========================================================= */
+
+const SRG_PROTECTED = { protect: true };
+const SRG_PROTECTED_WITH_LOCK = { protect: true, passwordControl: true };
+
+let srgSectionsUnlocked = false;
+let srgProtectedClosers = [];
+let srgPasswordDialogOpen = false;
+
+function srgPasswordRecord() {
+    const record = typeof reportSettings !== "undefined" && reportSettings ? reportSettings.sectionPassword : null;
+    return record && record.hash && record.salt ? record : null;
+}
+
+function srgSectionsAreLocked() {
+    return !!srgPasswordRecord() && !srgSectionsUnlocked;
+}
+
+/* Closes every protected section and asks for the password again. */
+function srgLockAllSections() {
+    srgSectionsUnlocked = false;
+    srgProtectedClosers.forEach(function (close) {
+        try { close(); } catch (error) { console.error(error); }
+    });
+}
+
+async function srgHashPassword(password, salt) {
+
+    if (!window.crypto || !window.crypto.subtle) {
+        throw new Error("This browser cannot check passwords (a secure https connection is needed).");
+    }
+
+    const data = new TextEncoder().encode(String(salt) + "|" + WEBSITE_ID + "|" + password);
+    const digest = await window.crypto.subtle.digest("SHA-256", data);
+
+    return Array.from(new Uint8Array(digest)).map(function (b) {
+        return b.toString(16).padStart(2, "0");
+    }).join("");
+
+}
+
+function srgRandomSalt() {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+}
+
+/* Password pop-up. Resolves {action:"ok", value}, {action:"secondary"} or null (cancelled).
+   config: title, message, confirmText, confirmField, secondaryText, verify(value, confirm) -> error text or "" */
+function srgPasswordDialog(config) {
+
+    if (srgPasswordDialogOpen) return Promise.resolve(null);
+
+    srgPasswordDialogOpen = true;
+    srgInjectCollapseStyle();
+
+    return new Promise(function (resolve) {
+
+        const overlay = document.createElement("div");
+        overlay.className = "srg-modal-overlay";
+
+        const box = document.createElement("div");
+        box.className = "srg-modal";
+        box.setAttribute("role", "dialog");
+        box.setAttribute("aria-modal", "true");
+
+        const title = document.createElement("h3");
+        title.textContent = config.title || "Password";
+        box.appendChild(title);
+
+        if (config.message) {
+            const message = document.createElement("p");
+            message.textContent = config.message;
+            box.appendChild(message);
+        }
+
+        function makeInput(placeholder) {
+            const input = document.createElement("input");
+            input.type = "password";
+            input.placeholder = placeholder;
+            input.autocomplete = "new-password";
+            input.setAttribute("autocapitalize", "off");
+            input.setAttribute("autocorrect", "off");
+            box.appendChild(input);
+            return input;
+        }
+
+        const input = makeInput("Password");
+        const confirmInput = config.confirmField ? makeInput("Confirm password") : null;
+
+        const error = document.createElement("div");
+        error.className = "srg-modal-error";
+        box.appendChild(error);
+
+        const row = document.createElement("div");
+        row.className = "srg-modal-row";
+        box.appendChild(row);
+
+        function makeButton(text, className) {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.textContent = text;
+            b.className = className;
+            row.appendChild(b);
+            return b;
+        }
+
+        const cancelButton = makeButton("Cancel", "srg-modal-btn srg-modal-cancel");
+        const secondaryButton = config.secondaryText ? makeButton(config.secondaryText, "srg-modal-btn srg-modal-danger") : null;
+        const okButton = makeButton(config.confirmText || "OK", "srg-modal-btn srg-modal-ok");
+
+        overlay.appendChild(box);
+        document.body.appendChild(overlay);
+
+        let busy = false;
+
+        function close(result) {
+            document.removeEventListener("keydown", onKey, true);
+            overlay.remove();
+            srgPasswordDialogOpen = false;
+            resolve(result);
+        }
+
+        async function submit() {
+
+            if (busy) return;
+            busy = true;
+            okButton.disabled = true;
+            error.textContent = "";
+
+            let problem = "";
+
+            try {
+                problem = config.verify ? await config.verify(input.value, confirmInput ? confirmInput.value : "") : "";
+            } catch (err) {
+                problem = (err && err.message) ? err.message : "Something went wrong.";
+            }
+
+            busy = false;
+            okButton.disabled = false;
+
+            if (problem) {
+                error.textContent = problem;
+                input.focus();
+                input.select();
+                return;
+            }
+
+            close({ action: "ok", value: input.value });
+
+        }
+
+        function onKey(event) {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                close(null);
+            } else if (event.key === "Enter" && overlay.contains(document.activeElement)) {
+                event.preventDefault();
+                submit();
+            }
+        }
+
+        document.addEventListener("keydown", onKey, true);
+        okButton.addEventListener("click", submit);
+        cancelButton.addEventListener("click", function () { close(null); });
+        if (secondaryButton) secondaryButton.addEventListener("click", function () { close({ action: "secondary" }); });
+
+        setTimeout(function () { input.focus(); }, 50);
+
+    });
+
+}
+
+/* Asks for the password so a protected section can open. Resolves true when allowed. */
+async function srgRequestUnlock() {
+
+    const record = srgPasswordRecord();
+
+    if (!record || srgSectionsUnlocked) return true;
+
+    const result = await srgPasswordDialog({
+        title: "🔒 Protected section",
+        message: "Enter the password to open this section.",
+        confirmText: "Open",
+        verify: async function (value) {
+            if (!value) return "Enter the password.";
+            const hash = await srgHashPassword(value, record.salt);
+            return hash === record.hash ? "" : "Wrong password. Try again.";
+        }
+    });
+
+    if (result && result.action === "ok") {
+        srgSectionsUnlocked = true;
+        return true;
+    }
+
+    return false;
+
+}
+
+/* The 🔒 button next to School Information: set, change or remove the password. */
+async function srgManagePassword() {
+
+    if (typeof staffContext !== "undefined" && staffContext) {
+        alert("Only the school owner can set or change the section password.");
+        return;
+    }
+
+    const record = srgPasswordRecord();
+
+    if (record && !srgSectionsUnlocked) {
+
+        const current = await srgPasswordDialog({
+            title: "🔒 Section password",
+            message: "Enter the current password to continue.",
+            confirmText: "Continue",
+            verify: async function (value) {
+                if (!value) return "Enter the current password.";
+                const hash = await srgHashPassword(value, record.salt);
+                return hash === record.hash ? "" : "Wrong password. Try again.";
+            }
+        });
+
+        if (!current || current.action !== "ok") return;
+
+        srgSectionsUnlocked = true;
+
+    }
+
+    const result = await srgPasswordDialog({
+        title: record ? "Change section password" : "Set section password",
+        message: "School Subjects, Staff Access, Manage Classes and School Information will ask for this password before they open. Student Photos stays open.",
+        confirmText: "Save password",
+        confirmField: true,
+        secondaryText: record ? "Remove password" : "",
+        verify: function (value, confirm) {
+            if (value.length < 4) return "Use at least 4 characters.";
+            if (value !== confirm) return "The two passwords do not match.";
+            return "";
+        }
+    });
+
+    if (!result) return;
+
+    if (result.action === "secondary") {
+        delete reportSettings.sectionPassword;
+        srgSectionsUnlocked = false;
+        saveAppData();
+        alert("✅ Section password removed. The sections now open freely.");
+        return;
+    }
+
+    const salt = srgRandomSalt();
+    const hash = await srgHashPassword(result.value, salt);
+
+    reportSettings.sectionPassword = { salt: salt, hash: hash };
+    srgSectionsUnlocked = true;
+    saveAppData();
+
+    alert("✅ Section password saved. Staff will need it to open the protected sections.");
+
+}
+
+/* Puts the arrow in `heading`. getItems() returns the elements that
+   are hidden while the section is minimized. */
+function srgMakeCollapsible(heading, getItems, options) {
+
+    options = options || {};
+
+    if (!heading || heading.getAttribute("data-srg-collapsible") === "1") return null;
+
+    srgInjectCollapseStyle();
+
+    heading.setAttribute("data-srg-collapsible", "1");
+    heading.classList.add("srg-collapse-title");
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "srg-collapse-btn";
+    button.innerHTML =
+        "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" " +
+        "stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">" +
+        "<polyline points=\"6 9 12 15 18 9\"></polyline></svg>";
+    heading.appendChild(button);
+
+    if (options.passwordControl) {
+
+        const lock = document.createElement("button");
+        lock.type = "button";
+        lock.className = "srg-lock-btn";
+        lock.textContent = "🔒";
+        lock.title = "Set or change the section password";
+        lock.setAttribute("aria-label", "Set or change the section password");
+
+        heading.classList.add("srg-has-lock");
+        heading.appendChild(lock);
+
+        lock.addEventListener("click", function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            srgManagePassword();
+        });
+
+    }
+
+    /* Sections start closed. */
+    let collapsed = true;
+    let hiddenItems = [];
+
+    function apply() {
+
+        if (collapsed) {
+            hiddenItems = getItems();
+            hiddenItems.forEach(function (el) { el.classList.add("srg-collapsed-item"); });
+        } else {
+            hiddenItems.concat(getItems()).forEach(function (el) { el.classList.remove("srg-collapsed-item"); });
+            hiddenItems = [];
+        }
+
+        const label = collapsed ? "Expand section" : "Minimize section";
+        button.setAttribute("aria-expanded", collapsed ? "false" : "true");
+        button.setAttribute("aria-label", label);
+        button.title = label;
+
+    }
+
+    function toggle(event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+        if (collapsed && options.protect && srgSectionsAreLocked()) {
+            srgRequestUnlock().then(function (allowed) {
+                if (!allowed) return;
+                collapsed = false;
+                apply();
+            });
+            return;
+        }
+
+        collapsed = !collapsed;
+        apply();
+    }
+
+    if (options.protect) {
+        srgProtectedClosers.push(function () {
+            if (!collapsed) {
+                collapsed = true;
+                apply();
+            }
+        });
+    }
+
+    button.addEventListener("click", toggle);
+
+    heading.addEventListener("click", function (event) {
+        if (event.target.closest(".srg-collapse-btn")) return;
+        if (event.target.closest("a, input, select, textarea")) return;
+        toggle(event);
+    });
+
+    apply();
+
+    return { toggle: toggle, heading: heading };
+
+}
+
+function srgFollowingSiblings(head) {
+
+    const items = [];
+    let node = head.nextElementSibling;
+
+    while (node) {
+        if (node.tagName !== "STYLE" && node.tagName !== "SCRIPT") items.push(node);
+        node = node.nextElementSibling;
+    }
+
+    return items;
+
+}
+
+/* Whole card: arrow on the card's first title, hides everything under it. */
+function srgCollapsibleCard(card, options) {
+
+    if (!card) return null;
+
+    const heading = card.querySelector(SRG_COLLAPSE_HEADINGS);
+
+    if (!heading || heading.getAttribute("data-srg-collapsible") === "1") return null;
+
+    let head = heading;
+    while (head.parentElement && head.parentElement !== card) head = head.parentElement;
+
+    if (head.parentElement !== card) return null;
+
+    return srgMakeCollapsible(heading, function () { return srgFollowingSiblings(head); }, options);
+
+}
+
+function srgSafeCard(el) {
+
+    const card = el ? el.closest(SRG_COLLAPSE_CARDS) : null;
+
+    if (!card || card.id === "appSection" || card.id === "authSection" || card.matches("main, body")) return null;
+
+    return card;
+
+}
+
+/* A part of a page: arrow on the title just above `anchorList`, hides only
+   what lies between that title and the last anchor. If no suitable title
+   exists (or hiding would also hide other buttons/inputs), a new title
+   called `title` is added above the anchors and only the anchors are hidden. */
+function srgCollapsibleBlock(anchorList, title, options) {
+
+    const anchors = anchorList.filter(Boolean);
+
+    if (!anchors.length) return null;
+
+    anchors.sort(function (a, b) {
+        if (a === b) return 0;
+        return (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1;
+    });
+
+    const primary = anchors[0];
+
+    function insideAnchor(el) {
+        return anchors.some(function (a) { return a.contains(el); });
+    }
+
+    const card = srgSafeCard(primary);
+    let heading = null;
+
+    if (card) {
+        const all = Array.from(card.querySelectorAll(SRG_COLLAPSE_HEADINGS));
+        for (let i = all.length - 1; i >= 0; i--) {
+            if (!all[i].contains(primary) && (all[i].compareDocumentPosition(primary) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+                heading = all[i];
+                break;
+            }
+        }
+    }
+
+    if (heading && heading.getAttribute("data-srg-collapsible") === "1") return null;
+
+    let items = null;
+
+    if (heading) {
+
+        let host = heading.parentElement;
+        while (host && !anchors.every(function (a) { return host.contains(a); })) host = host.parentElement;
+
+        if (host) {
+
+            const childOf = function (el) {
+                let n = el;
+                while (n && n.parentElement !== host) n = n.parentElement;
+                return n;
+            };
+
+            const kids = Array.from(host.children);
+            const startIndex = kids.indexOf(childOf(heading));
+            const endIndex = Math.max.apply(null, anchors.map(function (a) { return kids.indexOf(childOf(a)); }));
+
+            if (startIndex >= 0 && endIndex > startIndex) {
+
+                const between = kids.slice(startIndex + 1, endIndex + 1).filter(function (el) {
+                    return el.tagName !== "STYLE" && el.tagName !== "SCRIPT";
+                });
+
+                const clean = between.every(function (el) {
+                    const busy = Array.from(el.querySelectorAll(SRG_COLLAPSE_BUSY));
+                    if (el.matches(SRG_COLLAPSE_BUSY)) busy.push(el);
+                    return busy.every(insideAnchor);
+                });
+
+                if (clean) items = between;
+
+            }
+
+        }
+
+    }
+
+    if (!items) {
+        heading = document.createElement("h3");
+        heading.textContent = title;
+        primary.parentNode.insertBefore(heading, primary);
+        items = anchors;
+    }
+
+    return srgMakeCollapsible(heading, function () { return items; }, options);
+
+}
+
+function initializeCollapsibleSections() {
+
+    function byId(id) { return document.getElementById(id); }
+
+    function safely(fn) {
+        try { fn(); } catch (error) { console.error("Collapsible section error:", error); }
+    }
+
+    /* School Subjects */
+    safely(function () { srgCollapsibleCard(byId("subjectManager"), SRG_PROTECTED); });
+
+    /* Staff Access */
+    safely(function () { srgCollapsibleCard(byId("staffManagementSection"), SRG_PROTECTED); });
+
+    /* Manage Classes */
+    safely(function () {
+        srgCollapsibleBlock(
+            ["newClassNameInput", "addClassButton", "classManagerStatus", "classListContainer"].map(byId),
+            "Manage Classes",
+            SRG_PROTECTED
+        );
+    });
+
+    /* Student Photos */
+    safely(function () {
+        srgCollapsibleBlock(
+            ["studentPhotoManager", "studentPhotoStatus"].map(byId),
+            "Student Photos"
+        );
+    });
+
+    /* School Information */
+    safely(function () {
+        srgCollapsibleBlock(
+            [
+                "schoolNameInput", "schoolAddressInput", "schoolLogoInput",
+                "schoolLogoPreview", "removeSchoolLogo",
+                "saveSchoolInformation", "schoolInformationStatus"
+            ].map(byId),
+            "School Information",
+            SRG_PROTECTED_WITH_LOCK
+        );
+    });
+
+}
+
+
+/* =========================================================
    INITIALIZE
    ========================================================= */
 
@@ -865,6 +1471,8 @@ document.addEventListener(
         restoreAppData();
 
         createAutoCommentManager();
+
+        initializeCollapsibleSections();
 
         loadSchoolInformation();
 
@@ -1881,6 +2489,70 @@ async function forgotPassword() {
    UPDATE PASSWORD
    ========================================================= */
 
+/* After the owner finishes the "Forgot password" email reset, the section
+   password (the lock on the collapse-arrow sections) is cleared too, so the
+   owner is never locked out of their own school. Staff logins are skipped on
+   purpose - they must not be able to unlock the sections by resetting their
+   own login password. Any doubt or error means nothing is cleared. */
+async function srgClearSectionPasswordAfterReset(user) {
+
+    try {
+
+        if (!user || !user.id) return false;
+
+        const staffCheck = await supabaseClient
+            .from("school_staff")
+            .select("id")
+            .eq("staff_user_id", user.id)
+            .eq("website_id", WEBSITE_ID)
+            .limit(1);
+
+        if (staffCheck.error || (staffCheck.data && staffCheck.data.length > 0)) return false;
+
+        const profile = await supabaseClient
+            .from(SCHOOL_PROFILE_TABLE)
+            .select("report_settings")
+            .eq("owner_user_id", user.id)
+            .eq("website_id", WEBSITE_ID)
+            .maybeSingle();
+
+        if (profile.error || !profile.data) return false;
+
+        const settings = Object.assign({}, profile.data.report_settings || {});
+
+        if (!settings.sectionPassword) return false;
+
+        delete settings.sectionPassword;
+
+        const result = await supabaseClient
+            .from(SCHOOL_PROFILE_TABLE)
+            .update({ report_settings: settings, updated_at: new Date().toISOString() })
+            .eq("owner_user_id", user.id)
+            .eq("website_id", WEBSITE_ID);
+
+        if (result.error) {
+            console.error("Section password reset error:", result.error);
+            return false;
+        }
+
+        delete reportSettings.sectionPassword;
+        srgSectionsUnlocked = false;
+
+        try {
+            localStorage.setItem(REPORT_SETTINGS_STORAGE_KEY, JSON.stringify(reportSettings));
+        } catch (error) { /* storage unavailable */ }
+
+        return true;
+
+    } catch (error) {
+
+        console.error("Section password reset error:", error);
+        return false;
+
+    }
+
+}
+
 async function updatePassword() {
 
     const newPasswordElement =
@@ -1956,6 +2628,7 @@ async function updatePassword() {
     try {
 
         const {
+            data,
             error
         } =
             await supabaseClient.auth
@@ -1983,8 +2656,13 @@ async function updatePassword() {
         }
 
 
+        const sectionLockCleared = await srgClearSectionPasswordAfterReset(data && data.user);
+
         alert(
-            "✅ Password changed successfully."
+            "✅ Password changed successfully." +
+            (sectionLockCleared
+                ? "\n\n🔓 The section password was also cleared. Sign in, then tap 🔒 on School Information to set a new one."
+                : "")
         );
 
 
@@ -2251,9 +2929,17 @@ function applySchoolProfile(row) {
         }
     );
 
+    /* The server copy decides: a password removed or reset elsewhere must
+       not survive in this browser's cached settings. */
+    if (!row.report_settings || !row.report_settings.sectionPassword) {
+        delete reportSettings.sectionPassword;
+    }
+
 }
 
 function resetSchoolProfileState() {
+
+    srgLockAllSections();
 
     resetStudentPhotoState();
 
@@ -4229,6 +4915,8 @@ function loadSchoolInformation() {
 
     displaySchoolLogoPreview();
 
+    renderReportOutlookPicker();
+
 }
 
 
@@ -4290,6 +4978,247 @@ function saveSchoolInformation() {
 
 }
 
+
+
+/* =========================================================
+   REPORT OUTLOOK (TEMPLATES)
+
+   Classic is the original layout. The others are skins of the
+   same report markup (see "REPORT OUTLOOKS" in style.css).
+   The choice is saved inside reportSettings.reportTemplate, so it
+   is stored with the rest of the school profile and follows the
+   school to every device and staff login.
+   ========================================================= */
+
+const REPORT_TEMPLATES = [
+    {
+        id: "classic",
+        name: "Classic",
+        desc: "Your current navy and teal layout.",
+        swatches: ["#17324d", "#1f6f68", "#b28a3b"]
+    },
+    {
+        id: "modern",
+        name: "Modern",
+        desc: "Colour header band, rounded cards, clean headings.",
+        swatches: ["#17324d", "#1f6f68", "#e9f5f3"]
+    },
+    {
+        id: "elegant",
+        name: "Elegant",
+        desc: "Certificate style: centred crest, gold frame, ornamental dividers, ruled comment lines.",
+        swatches: ["#6b1e2e", "#b28a3b", "#fbf6ea"]
+    },
+    {
+        id: "minimal",
+        name: "Minimal",
+        desc: "Editorial layout: left-aligned header, big light numerals, hairline tables. Black and white, saves ink.",
+        swatches: ["#000000", "#999999", "#ffffff"]
+    }
+];
+
+function getReportTemplateId() {
+
+    const id = reportSettings && reportSettings.reportTemplate;
+
+    return REPORT_TEMPLATES.some(function (t) { return t.id === id; })
+        ? id
+        : "classic";
+
+}
+
+function renderReportOutlookPicker() {
+
+    const holder = document.getElementById("reportOutlookPicker");
+
+    if (!holder) return;
+
+    const current = getReportTemplateId();
+
+    holder.innerHTML =
+        '<div class="outlook-grid">' +
+        REPORT_TEMPLATES.map(function (t) {
+            return (
+                '<label class="outlook-card' + (t.id === current ? " selected" : "") + '">' +
+                    '<input type="radio" name="reportOutlook" value="' + t.id + '"' +
+                        (t.id === current ? " checked" : "") + '>' +
+                    '<strong>' + t.name + '</strong>' +
+                    '<small>' + t.desc + '</small>' +
+                    '<span class="outlook-swatches">' +
+                        t.swatches.map(function (c) {
+                            return '<i style="background:' + c + ';"></i>';
+                        }).join("") +
+                    '</span>' +
+                '</label>'
+            );
+        }).join("") +
+        '</div>';
+
+    holder.querySelectorAll('input[name="reportOutlook"]').forEach(function (input) {
+        input.addEventListener("change", function () {
+            selectReportTemplate(input.value);
+        });
+    });
+
+    renderReportOutlookPreview();
+
+}
+
+function selectReportTemplate(id) {
+
+    if (!REPORT_TEMPLATES.some(function (t) { return t.id === id; })) return;
+
+    /* Only the school owner can change the outlook (staff logins use it). */
+    if (typeof staffContext !== "undefined" && staffContext) {
+
+        renderReportOutlookPicker();
+
+        const note = document.getElementById("reportOutlookStatus");
+
+        if (note) note.textContent = "Only the school owner can change the report outlook.";
+
+        return;
+
+    }
+
+    reportSettings.reportTemplate = id;
+
+    saveAppData();
+
+    document.querySelectorAll("#reportOutlookPicker .outlook-card").forEach(function (card) {
+        const input = card.querySelector("input");
+        card.classList.toggle("selected", !!input && input.value === id);
+    });
+
+    renderReportOutlookPreview();
+
+    const status = document.getElementById("reportOutlookStatus");
+
+    if (status) {
+        status.textContent =
+            "✓ Outlook saved. Reports you generate from now on will use it. " +
+            "To change reports already generated, generate them again.";
+    }
+
+}
+
+function buildSampleStudentForPreview() {
+
+    const names = (Array.isArray(schoolSubjects) && schoolSubjects.length
+        ? schoolSubjects
+        : ["English Language", "Mathematics", "Basic Science", "Social Studies", "Civic Education"]
+    ).slice(0, 8);
+
+    const sample = {
+        "Student Name": "SAMPLE STUDENT",
+        "Admission No": "0001",
+        "Gender": "Female",
+        "Class": "JSS 1",
+        "Term": "First Term",
+        "Session": "2025/2026",
+        "House": "Blue",
+        "Position": 3
+    };
+
+    const firstCAMax = Number(reportSettings.firstCAMaximum) || 20;
+    const secondCAMax = Number(reportSettings.secondCAMaximum) || 20;
+    const examsMax = Number(reportSettings.examsMaximum) || 60;
+
+    names.forEach(function (name, i) {
+        sample[name + " 1st CA"] = Math.round(firstCAMax * (0.65 + (i % 4) * 0.08));
+        sample[name + " 2nd CA"] = Math.round(secondCAMax * (0.6 + (i % 3) * 0.1));
+        sample[name + " Exams"] = Math.round(examsMax * (0.55 + (i % 5) * 0.07));
+    });
+
+    const behavior = {
+        "Class Teacher's Comment": "A hardworking and well-behaved student. Keep it up.",
+        "Principal's Comment": "An impressive result. Maintain the good work."
+    };
+
+    (Array.isArray(behavioralTraits) ? behavioralTraits : []).forEach(function (trait, i) {
+        behavior[trait] = 4 + (i % 2);
+    });
+
+    sample.__behavior = behavior;
+
+    return sample;
+
+}
+
+let outlookPreviewTimer = null;
+
+function renderReportOutlookPreview() {
+
+    const box = document.getElementById("reportOutlookPreview");
+
+    if (!box) return;
+
+    clearTimeout(outlookPreviewTimer);
+
+    outlookPreviewTimer = setTimeout(function () {
+
+        let reportHtml = "";
+
+        try {
+            reportHtml = createReport(buildSampleStudentForPreview());
+        } catch (error) {
+            console.error("Outlook preview error:", error);
+            box.innerHTML = '<p style="padding:12px;">Preview is not available right now.</p>';
+            return;
+        }
+
+        /* The preview lives in an iframe so it gets a real A4-width viewport
+           (phone media queries do not squeeze it) and uses the page's own CSS. */
+        const styles = Array.from(
+            document.querySelectorAll('style, link[rel="stylesheet"]')
+        ).map(function (el) { return el.outerHTML; }).join("");
+
+        const doc =
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" +
+            "<base href=\"" + document.baseURI + "\">" + styles +
+            "<style>html,body{margin:0;padding:0;background:#fff;}" +
+            ".report{margin:0 !important;box-shadow:none !important;}</style>" +
+            "</head><body>" + reportHtml + "</body></html>";
+
+        let frame = box.querySelector("iframe");
+
+        if (!frame) {
+            box.innerHTML = "";
+            frame = document.createElement("iframe");
+            frame.setAttribute("title", "Report outlook preview");
+            frame.setAttribute("scrolling", "no");
+            box.appendChild(frame);
+        }
+
+        frame.style.height = "1123px";
+        frame.srcdoc = doc;
+
+        const fit = function () {
+            const scale = Math.min(1, box.clientWidth / 794);
+            frame.style.transform = "scale(" + scale + ")";
+            box.style.height = Math.round(1123 * scale) + "px";
+        };
+
+        fit();
+
+        frame.onload = fit;
+
+    }, 120);
+
+}
+
+window.addEventListener("resize", function () {
+
+    const box = document.getElementById("reportOutlookPreview");
+    const frame = box && box.querySelector("iframe");
+
+    if (!frame) return;
+
+    const scale = Math.min(1, box.clientWidth / 794);
+    frame.style.transform = "scale(" + scale + ")";
+    box.style.height = Math.round(1123 * scale) + "px";
+
+});
 
 /* =========================================================
    SCHOOL LOGO UPLOAD
@@ -10367,7 +11296,7 @@ async function downloadSubjectTemplate() {
         const workbook = XLSX.utils.book_new();
 
         const subjectData = [
-            ["Adm No", "Student Name", "1st CA", "2nd CA", "Exams", "Match Key"]
+            ["Adm No", "Student Name", "1st CA", "2nd CA", "Exams", "Match Key", "Total"]
         ];
 
         const rowCount = Math.max(TEMPLATE_STUDENT_ROWS, savedRows.length);
@@ -10383,12 +11312,13 @@ async function downloadSubjectTemplate() {
                     saved.first_ca ?? "",
                     saved.second_ca ?? "",
                     saved.exams ?? "",
+                    "",
                     ""
                 ]);
             } else if (i === 0 && savedRows.length === 0) {
-                subjectData.push(["001", "Example Student", "", "", "", ""]);
+                subjectData.push(["001", "Example Student", "", "", "", "", ""]);
             } else {
-                subjectData.push(["", "", "", "", "", ""]);
+                subjectData.push(["", "", "", "", "", "", ""]);
             }
 
         }
@@ -10402,13 +11332,28 @@ async function downloadSubjectTemplate() {
             };
         }
 
+        /* Visible "Total" column (G): 1st CA + 2nd CA + Exams, so
+           teachers can see each student's total. The hidden Match Key
+           stays in column F so the Scores sheet lookups are unchanged. */
+        for (let row = 2; row <= rowCount + 1; row++) {
+            subjectSheet["G" + row] = {
+                t: "n",
+                f: `IF(COUNT(C${row}:E${row})=0,"",SUM(C${row}:E${row}))`
+            };
+        }
+        subjectSheet["!ref"] = XLSX.utils.encode_range({
+            s: { r: 0, c: 0 },
+            e: { r: rowCount, c: 6 }
+        });
+
         subjectSheet["!cols"] = [
             { wch: 7 },
             { wch: 14 },
             { wch: 6 },
             { wch: 6 },
             { wch: 6 },
-            { wch: 10, hidden: true }
+            { wch: 10, hidden: true },
+            { wch: 8 }
         ];
 
         subjectSheet["!freeze"] = { xSplit: 3, ySplit: 1 };
@@ -11039,7 +11984,8 @@ async function downloadExcelTemplate() {
                         "1st CA",
                         "2nd CA",
                         "Exams",
-                        "Match Key"
+                        "Match Key",
+                        "Total"
                     ]
 
                 ];
@@ -11072,7 +12018,8 @@ async function downloadExcelTemplate() {
                             saved.first_ca ?? "",
                             saved.second_ca ?? "",
                             saved.exams ?? "",
-                            ""
+                            "",
+                    ""
                         ]);
 
                     } else {
@@ -11090,7 +12037,8 @@ async function downloadExcelTemplate() {
                             "",
                             "",
                             "",
-                            ""
+                            "",
+                        ""
 
                         ]);
 
@@ -11139,7 +12087,8 @@ async function downloadExcelTemplate() {
                     { wch: 6 },
                     { wch: 6 },
                     { wch: 6 },
-                    { wch: 10, hidden: true }
+                    { wch: 10, hidden: true },
+                { wch: 8 }
 
                 ];
 
@@ -11151,6 +12100,20 @@ async function downloadExcelTemplate() {
                     ySplit: 1
 
                 };
+        /* Visible "Total" column (G): 1st CA + 2nd CA + Exams, so
+           teachers can see each student's total. The hidden Match Key
+           stays in column F so the Scores sheet lookups are unchanged. */
+        for (let row = 2; row <= TEMPLATE_STUDENT_ROWS + 1; row++) {
+            subjectSheet["G" + row] = {
+                t: "n",
+                f: `IF(COUNT(C${row}:E${row})=0,"",SUM(C${row}:E${row}))`
+            };
+        }
+        subjectSheet["!ref"] = XLSX.utils.encode_range({
+            s: { r: 0, c: 0 },
+            e: { r: TEMPLATE_STUDENT_ROWS, c: 6 }
+        });
+
 
 
                 XLSX.utils.book_append_sheet(
@@ -11253,7 +12216,7 @@ async function downloadExcelTemplate() {
                         t: "n",
 
                         f:
-                            `IF($B${row}="","",IFERROR(INDEX('${safeSheetName}'!$C:$C,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0)),""))`
+                            `IF($B${row}="","",IFERROR(IF(INDEX('${safeSheetName}'!$C:$C,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))="","",INDEX('${safeSheetName}'!$C:$C,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))),""))`
 
                     };
 
@@ -11266,7 +12229,7 @@ async function downloadExcelTemplate() {
                         t: "n",
 
                         f:
-                            `IF($B${row}="","",IFERROR(INDEX('${safeSheetName}'!$D:$D,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0)),""))`
+                            `IF($B${row}="","",IFERROR(IF(INDEX('${safeSheetName}'!$D:$D,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))="","",INDEX('${safeSheetName}'!$D:$D,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))),""))`
 
                     };
 
@@ -11279,7 +12242,7 @@ async function downloadExcelTemplate() {
                         t: "n",
 
                         f:
-                            `IF($B${row}="","",IFERROR(INDEX('${safeSheetName}'!$E:$E,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0)),""))`
+                            `IF($B${row}="","",IFERROR(IF(INDEX('${safeSheetName}'!$E:$E,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))="","",INDEX('${safeSheetName}'!$E:$E,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))),""))`
 
                     };
 
@@ -11421,21 +12384,12 @@ async function downloadExcelTemplate() {
             };
 
 
-            /* Count only the subjects this student actually offers —
-               i.e. subjects whose sheet contains this student's Adm No —
-               so subjects not offered are excluded from the average's
-               denominator instead of dividing by the school's total
-               subject count. */
-            const subjectsOfferedFormula =
-                subjectSheetSafeNames
-                    .map(
-                        function (safeSheetName) {
-
-                            return `COUNTIF('${safeSheetName}'!$F:$F,TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))))`;
-
-                        }
-                    )
-                    .join("+");
+            /* Count only the subjects this student actually has a score
+               in. A subject's Total cell is blank when its 1st CA, 2nd CA
+               and Exams are all blank (not offered), and a number
+               otherwise, so COUNT() skips the subjects not offered
+               instead of dividing by every subject the school has. */
+            const subjectsOfferedFormula = "COUNT(" + overallTotalFormula + ")";
 
 
             scoresSheet[
@@ -11446,7 +12400,7 @@ async function downloadExcelTemplate() {
                 t: "n",
 
                 f:
-                    `IF($B${row}="","",IFERROR(${overallTotalLetter}${row}/(${subjectsOfferedFormula}),0))`
+                    `IF($B${row}="","",IFERROR(${overallTotalLetter}${row}/${subjectsOfferedFormula},0))`
 
             };
 
@@ -14728,22 +15682,31 @@ function createReport(student) {
     const session = student["Session"] || "";
     const studentPhoto = getStudentPhoto(student);
 
+    /* Report outlook (Classic / Modern / Elegant / Minimal) */
+    const reportTemplateId = getReportTemplateId();
+
+    /* Classic keeps its original inline header styling. The other outlooks
+       are styled from style.css, so they get no inline styles. */
+    const classicInline = function (css) {
+        return reportTemplateId === "classic" ? ' style="' + css + '"' : "";
+    };
+
     /* =====================================================
        PROFESSIONAL REPORT
        ===================================================== */
 
     return `
-        <article class="report" style="position:relative;" data-report-fingerprint="${escapeHTML(getReportGenerationFingerprint(student))}">
+        <article class="report tpl-${reportTemplateId}" data-report-template="${reportTemplateId}" style="position:relative;" data-report-fingerprint="${escapeHTML(getReportGenerationFingerprint(student))}">
             ${reportWatermarkHtml()}
 
             <div class="report-top-accent"></div>
 
-           <header class="school-header" style="position:relative;width:100%;display:block;text-align:center!important;">
-    <div class="school-brand" style="position:relative;width:100%!important;display:block!important;text-align:center!important;">
+           <header class="school-header"${classicInline("position:relative;width:100%;display:block;text-align:center!important;")}>
+    <div class="school-brand"${classicInline("position:relative;width:100%!important;display:block!important;text-align:center!important;")}>
         ${
             reportSettings.schoolLogo
                 ? `
-                    <div class="school-logo-container" style="position:absolute!important;left:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;">
+                    <div class="school-logo-container"${classicInline("position:absolute!important;left:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;")}>
                         <img
                             src="${reportSettings.schoolLogo}"
                             alt="School Logo"
@@ -14752,7 +15715,7 @@ function createReport(student) {
                     </div>
                   `
                 : `
-                    <div class="school-logo-container school-logo-placeholder" style="position:absolute!important;left:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;">
+                    <div class="school-logo-container school-logo-placeholder"${classicInline("position:absolute!important;left:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;")}>
                         <span>SR</span>
                     </div>
                   `
@@ -14761,7 +15724,7 @@ function createReport(student) {
         ${
             studentPhoto
                 ? `
-                    <div class="student-passport-container" style="position:absolute!important;right:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;">
+                    <div class="student-passport-container"${classicInline("position:absolute!important;right:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;")}>
                         <img
                             src="${escapeHTML(studentPhoto)}"
                             alt="Student passport photograph"
@@ -14769,13 +15732,13 @@ function createReport(student) {
                         >
                     </div>
                   `
-                : ""
+                : (reportTemplateId === "classic" ? "" : '<div class="school-side-spacer"></div>')
         }
 
-        <div class="school-heading" style="width:100%!important;max-width:none!important;text-align:center!important;margin:0 auto!important;display:block!important;padding:0 100px!important;">
-            <h1 style="display:block!important;width:100%!important;text-align:center!important;margin:0 auto!important;font-size:26px!important;font-weight:800!important;line-height:1.15!important;letter-spacing:0.5px!important;">${escapeHTML(reportSettings.schoolName)}</h1>
-            <p style="display:block!important;width:100%!important;text-align:center!important;margin:5px auto 0!important;font-size:14px!important;font-weight:600!important;line-height:1.25!important;letter-spacing:0.3px!important;">${escapeHTML(reportSettings.schoolAddress)}</p>
-            <div class="report-title" style="display:block!important;width:100%!important;text-align:center!important;margin:8px auto 0!important;font-size:16px!important;font-weight:800!important;line-height:1.2!important;letter-spacing:1.2px!important;">STUDENT ACADEMIC REPORT</div>
+        <div class="school-heading"${classicInline("width:100%!important;max-width:none!important;text-align:center!important;margin:0 auto!important;display:block!important;padding:0 100px!important;")}>
+            <h1${classicInline("display:block!important;width:100%!important;text-align:center!important;margin:0 auto!important;font-size:26px!important;font-weight:800!important;line-height:1.15!important;letter-spacing:0.5px!important;")}>${escapeHTML(reportSettings.schoolName)}</h1>
+            <p${classicInline("display:block!important;width:100%!important;text-align:center!important;margin:5px auto 0!important;font-size:14px!important;font-weight:600!important;line-height:1.25!important;letter-spacing:0.3px!important;")}>${escapeHTML(reportSettings.schoolAddress)}</p>
+            <div class="report-title"${classicInline("display:block!important;width:100%!important;text-align:center!important;margin:8px auto 0!important;font-size:16px!important;font-weight:800!important;line-height:1.2!important;letter-spacing:1.2px!important;")}>STUDENT ACADEMIC REPORT</div>
         </div>
     </div>
 
@@ -16342,3 +17305,4 @@ document.addEventListener("visibilitychange", function () {
         setTimeout(cleanUpAfterPrintEvent, 500);
     }
 });
+

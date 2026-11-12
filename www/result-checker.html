@@ -17,6 +17,37 @@
             color: #222;
         }
 
+        /* Back button to the landing page (not printed) */
+        .back-bar {
+            margin-bottom: 14px;
+        }
+
+        .back-button {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 16px;
+            background: #ffffff;
+            color: #123b5d;
+            border: 1px solid #c9d8dc;
+            border-radius: 10px;
+            font-size: 15px;
+            font-weight: 700;
+            text-decoration: none;
+            box-shadow: 0 2px 8px rgba(18, 59, 93, 0.10);
+        }
+
+        .back-button:hover,
+        .back-button:focus-visible {
+            background: #eef5f7;
+        }
+
+        @media print {
+            .back-bar {
+                display: none !important;
+            }
+        }
+
         .container {
             width: 94%;
             max-width: 900px;
@@ -589,6 +620,11 @@
 
 <div class="container">
 
+    <!-- BACK TO LANDING PAGE -->
+    <div class="back-bar">
+        <a href="./" class="back-button">← Back to home</a>
+    </div>
+
     <!-- =====================================================
          PUBLIC RESULT CHECKER
          ===================================================== -->
@@ -940,7 +976,7 @@
     type="button"
     class="print-button"
     id="printResultButton"
-    onclick="window.print()"
+    onclick="printResultPage()"
 >
     🖨️ Print Result
 </button>
@@ -1054,6 +1090,33 @@ const resultArea =
     document.getElementById(
         "resultArea"
     );
+
+
+/* window.print() does nothing in the Android app's WebView, so inside the
+   app the native PrintPlugin opens Android's print dialog instead
+   (choose "Save as PDF" there). Browsers keep using window.print(). */
+function printResultPage() {
+
+    const cap = window.Capacitor;
+    const isApp = !!(cap && typeof cap.isNativePlatform === "function" && cap.isNativePlatform());
+
+    if (!isApp) {
+        window.print();
+        return;
+    }
+
+    const plugin = cap.Plugins && cap.Plugins.PrintPlugin;
+
+    if (!plugin) {
+        alert("Printing is not available in this version of the app. Please install the latest version.");
+        return;
+    }
+
+    plugin.print({ name: "Student_Result" }).catch(function (error) {
+        alert("Could not open the print dialog: " + (error && error.message ? error.message : error));
+    });
+
+}
 
 
 const printResultButton =

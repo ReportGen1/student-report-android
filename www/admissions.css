@@ -404,7 +404,7 @@ body.adm-body {
     .adm-stats { grid-template-columns: repeat(2, 1fr); }
 }
 
-@page { size: A4; margin: 6mm; }
+@page { size: A4; margin: 4mm; }
 
 @media print {
     body.adm-letter-open > *:not(#admLetterOverlay) { display: none !important; }
