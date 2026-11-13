@@ -65,6 +65,54 @@ const supabaseClient =
             : undefined
     );
 
+
+/* =========================================================
+   OFFLINE START HELPERS
+   Remember the signed-in user, subscription and staff role on
+   this phone so the app can open without internet.
+   ========================================================= */
+
+const SM_USER_KEY = "sm_offline_user";
+const SM_SUB_KEY = "sm_offline_subscription";
+const SM_STAFF_KEY = "sm_offline_staff";
+
+function smIsOffline() {
+    return !navigator.onLine;
+}
+
+function smReadJson(key) {
+    try {
+        return JSON.parse(localStorage.getItem(key) || "null");
+    } catch (e) {
+        return null;
+    }
+}
+
+function smSaveOfflineUser(user) {
+    localStorage.setItem(SM_USER_KEY, JSON.stringify({ id: user.id, email: user.email || "" }));
+}
+
+/* Returns the saved user only while the phone is offline. */
+function smOfflineUser() {
+    if (!smIsOffline()) return null;
+    const cached = smReadJson(SM_USER_KEY);
+    return cached && cached.id ? cached : null;
+}
+
+function smClearOfflineUser() {
+    [SM_USER_KEY, SM_SUB_KEY, SM_STAFF_KEY].forEach(function (k) {
+        localStorage.removeItem(k);
+    });
+}
+
+async function smBlockLogoutIfUnsynced() {
+    if ((await Offline.pending()) > 0) {
+        alert("Some changes have not synced yet. Connect to the internet and wait for sync to finish before logging out.");
+        return true;
+    }
+    return false;
+}
+
 /* Android app only: show uncaught errors on screen so a silent failure
    (e.g. a button that does nothing) can be diagnosed. */
 if (IS_ANDROID_APP) {
@@ -1478,6 +1526,8 @@ document.addEventListener(
 
         restoreGeneratedReports();
 
+        Offline.init(supabaseClient);
+
         checkLogin();
 
     }
@@ -2297,6 +2347,7 @@ function attachAuthenticationEvents() {
             async function () {
 
                 try {
+                    if (await smBlockLogoutIfUnsynced()) return;
 
                     const {
                         error
@@ -2330,6 +2381,8 @@ function attachAuthenticationEvents() {
 
                     resetSchoolProfileState();
                     localStorage.removeItem(SCHOOL_PROFILE_OWNER_KEY);
+                    smClearOfflineUser();
+                    await Offline.clearAll();
 
                     /* =========================
                        CLEAR LOCAL APP DATA
@@ -3241,6 +3294,26 @@ function resetStaffMode() {
    Returns { state: "owner" | "approved" | "pending" | "blocked", ... } */
 async function loadStaffMembership(user) {
 
+    if (smIsOffline()) {
+        const cachedStaff = smReadJson(SM_STAFF_KEY);
+        if (cachedStaff && cachedStaff.userId === user.id) return cachedStaff.membership;
+        return { state: "owner" };
+    }
+
+    const membership = await loadStaffMembershipOnline(user);
+
+    if (membership.state === "approved") {
+        localStorage.setItem(SM_STAFF_KEY, JSON.stringify({ userId: user.id, membership: membership }));
+    } else if (membership.state !== "owner") {
+        localStorage.removeItem(SM_STAFF_KEY);
+    }
+
+    return membership;
+
+}
+
+async function loadStaffMembershipOnline(user) {
+
     const { data, error } = await supabaseClient
         .from("school_staff")
         .select("owner_user_id, status, full_name")
@@ -4034,12 +4107,15 @@ function attachStaffEvents() {
 
     if (signOut) {
         signOut.addEventListener("click", async function () {
+            if (await smBlockLogoutIfUnsynced()) return;
             try {
                 await supabaseClient.auth.signOut();
                 localStorage.removeItem(STUDENT_DATA_STORAGE_KEY);
                 localStorage.removeItem(STUDENT_SUBJECTS_STORAGE_KEY);
                 localStorage.removeItem(REPORT_SETTINGS_STORAGE_KEY);
                 localStorage.removeItem(SCHOOL_PROFILE_OWNER_KEY);
+                smClearOfflineUser();
+                await Offline.clearAll();
             } catch (error) {
                 console.error(error);
             }
@@ -4064,12 +4140,14 @@ async function checkLogin() {
 
     try {
 
+        const offlineUser = smOfflineUser();
+
         const {
             data,
             error
-        } =
-            await supabaseClient.auth
-                .getSession();
+        } = offlineUser
+            ? { data: { session: { user: offlineUser } }, error: null }
+            : await supabaseClient.auth.getSession();
 
 
         if (error) {
@@ -4113,6 +4191,8 @@ async function checkLogin() {
 
         const user =
             data.session.user;
+
+        if (!offlineUser) smSaveOfflineUser(user);
 
 
         /* Is this login an approved staff member (or waiting to be approved)? */
@@ -4181,7 +4261,7 @@ async function checkSubscription(user) {
             website_id: WEBSITE_ID
         });
 
-        const { data: subscription, error } = await supabaseClient
+        let { data: subscription, error } = await supabaseClient
             .from("subscriptions")
             .select("*")
             .eq("user_id", user.id)
@@ -4189,6 +4269,17 @@ async function checkSubscription(user) {
             .order("created_at", { ascending: false })
             .limit(1)
             .maybeSingle();
+
+        /* Offline (or server unreachable): use the copy saved on this phone. */
+        if (error || (!subscription && smIsOffline())) {
+            const cachedSub = smReadJson(SM_SUB_KEY);
+            if (cachedSub && cachedSub.userId === user.id && cachedSub.subscription) {
+                subscription = cachedSub.subscription;
+                error = null;
+            }
+        } else if (subscription) {
+            localStorage.setItem(SM_SUB_KEY, JSON.stringify({ userId: user.id, subscription: subscription }));
+        }
 
         if (error) {
             console.error("Subscription database error:", error);
@@ -6252,12 +6343,22 @@ async function fetchSchoolClasses() {
         .eq("website_id", WEBSITE_ID)
         .order("class_name", { ascending: true });
 
+    let classRows = data;
+
     if (error) {
         console.error("Fetch school classes error:", error);
-        return;
+
+        /* Offline (or server unreachable): use the copy saved on this phone. */
+        classRows = (await Offline.list(SCHOOL_CLASSES_TABLE, function (r) {
+            return r.user_id === currentUserId && r.website_id === WEBSITE_ID;
+        })).sort(function (a, b) {
+            return String(a.class_name).localeCompare(String(b.class_name));
+        });
+
+        if (!classRows.length) return;
     }
 
-    schoolClasses = data || [];
+    schoolClasses = classRows || [];
 
     renderClassList();
     populateClassNameSelect();
@@ -7555,6 +7656,29 @@ async function fetchAttendanceRows(className, session, term) {
 
     if (!currentUserId || !className || !session || !term) return [];
 
+    /* Read the copy saved on this phone first (works offline). */
+    const localAttendance = await Offline.list(ATTENDANCE_TABLE, function (r) {
+        return r.owner_user_id === currentUserId &&
+            r.website_id === WEBSITE_ID &&
+            r.class_name === className &&
+            r.session === session &&
+            r.term === term;
+    });
+
+    if (localAttendance.length || smIsOffline()) {
+        return localAttendance.map(function (row) {
+            return {
+                admission_no: String(row.admission_no || "").trim(),
+                student_name: cleanStudentName(row.student_name),
+                match_key: row.match_key,
+                days_present: Number(row.days_present),
+                days_opened: Number(row.days_opened),
+                updated_at: row.updated_at,
+                marks: cleanAttendanceMarks(row.marks)
+            };
+        });
+    }
+
     const baseColumns = "admission_no, student_name, match_key, days_present, days_opened, updated_at";
 
     function run(columns) {
@@ -8622,58 +8746,27 @@ async function uploadAttendanceToDatabase(file) {
             };
         });
 
-        const withoutMarks = function (rows) {
-            return rows.map(function (row) {
-                const copy = Object.assign({}, row);
-                delete copy.marks;
-                return copy;
-            });
-        };
+        /* Saved on this phone first; it syncs to Supabase when online. */
+        const marksSaved = true;
 
-        const upsertOptions = {
-            onConflict: "owner_user_id,website_id,class_name,session,term,match_key"
-        };
-
-        let marksSaved = !attendanceMarksColumnMissing;
-
-        let saveResult = await supabaseClient
-            .from(ATTENDANCE_TABLE)
-            .upsert(marksSaved ? payload : withoutMarks(payload), upsertOptions);
-
-        /* The table has no "marks" column yet: still save the totals. */
-        if (saveResult.error && marksSaved && isMissingAttendanceMarksColumn(saveResult.error)) {
-            attendanceMarksColumnMissing = true;
-            marksSaved = false;
-            saveResult = await supabaseClient
-                .from(ATTENDANCE_TABLE)
-                .upsert(withoutMarks(payload), upsertOptions);
-        }
-
-        const saveError = saveResult.error;
-
-        if (saveError) {
-            throw new Error((saveError.message || "Could not save the attendance.") + attendanceDatabaseHint(saveError));
-        }
+        await Offline.upsertManyByKey(
+            ATTENDANCE_TABLE,
+            ["owner_user_id", "website_id", "class_name", "session", "term", "match_key"],
+            payload
+        );
 
         const removedKeys = removed.map(function (row) {
             return computeMatchKey(row.admission_no, row.student_name);
         });
 
-        for (let i = 0; i < removedKeys.length; i += 100) {
-
-            const { error: deleteError } = await supabaseClient
-                .from(ATTENDANCE_TABLE)
-                .delete()
-                .eq("owner_user_id", currentUserId)
-                .eq("website_id", WEBSITE_ID)
-                .eq("class_name", context.className)
-                .eq("session", context.session)
-                .eq("term", context.term)
-                .in("match_key", removedKeys.slice(i, i + 100));
-
-            if (deleteError) throw new Error(deleteError.message || "Could not remove old attendance rows.");
-
-        }
+        await Offline.removeWhere(ATTENDANCE_TABLE, function (r) {
+            return r.owner_user_id === currentUserId &&
+                r.website_id === WEBSITE_ID &&
+                r.class_name === context.className &&
+                r.session === context.session &&
+                r.term === context.term &&
+                removedKeys.indexOf(r.match_key) !== -1;
+        });
 
         attendanceCache.clear();
 
@@ -8910,6 +9003,27 @@ async function fetchClassRoster(className, session) {
     rosterFetchFailed = false;
 
     if (!currentUserId || !className || !session) return [];
+
+    /* Read the copy saved on this phone first (works offline). */
+    const localRoster = (await Offline.list(CLASS_ROSTER_TABLE, function (r) {
+        return r.owner_user_id === currentUserId &&
+            r.website_id === WEBSITE_ID &&
+            r.class_name === className &&
+            r.session === session;
+    })).sort(function (a, b) {
+        return (a.sort_order || 0) - (b.sort_order || 0);
+    });
+
+    if (localRoster.length || smIsOffline()) {
+        return localRoster.map(function (row) {
+            return {
+                admission_no: String(row.admission_no || "").trim(),
+                student_name: cleanStudentName(row.student_name),
+                gender: String(row.gender || "").trim(),
+                house: String(row.house || "").trim()
+            };
+        });
+    }
 
     const { data, error } = await supabaseClient
         .from(CLASS_ROSTER_TABLE)
@@ -9545,30 +9659,22 @@ async function uploadClassListToDatabase(file) {
             };
         });
 
-        const { error: saveError } = await supabaseClient
-            .from(CLASS_ROSTER_TABLE)
-            .upsert(payload, {
-                onConflict: "owner_user_id,website_id,class_name,session,match_key"
-            });
-
-        if (saveError) throw new Error(saveError.message || "Could not save the class list.");
+        /* Saved on this phone first; it syncs to Supabase when online. */
+        await Offline.upsertManyByKey(
+            CLASS_ROSTER_TABLE,
+            ["owner_user_id", "website_id", "class_name", "session", "match_key"],
+            payload
+        );
 
         const removedKeys = removed.map(function (s) { return rosterKey(s.admission_no, s.student_name); });
 
-        for (let i = 0; i < removedKeys.length; i += 100) {
-
-            const { error: deleteError } = await supabaseClient
-                .from(CLASS_ROSTER_TABLE)
-                .delete()
-                .eq("owner_user_id", currentUserId)
-                .eq("website_id", WEBSITE_ID)
-                .eq("class_name", context.className)
-                .eq("session", context.session)
-                .in("match_key", removedKeys.slice(i, i + 100));
-
-            if (deleteError) throw new Error(deleteError.message || "Could not remove old names.");
-
-        }
+        await Offline.removeWhere(CLASS_ROSTER_TABLE, function (r) {
+            return r.owner_user_id === currentUserId &&
+                r.website_id === WEBSITE_ID &&
+                r.class_name === context.className &&
+                r.session === context.session &&
+                removedKeys.indexOf(r.match_key) !== -1;
+        });
 
         classRoster = await fetchClassRoster(context.className, context.session);
         renderStudentPreview();
@@ -10053,15 +10159,29 @@ function resetCumulativeView() {
 
 async function buildCumulativeModel(context) {
 
-    const { data, error } = await supabaseClient
-        .from(SUBJECT_SCORES_TABLE)
-        .select("subject, term, admission_no, student_name, first_ca, second_ca, exams")
-        .eq("user_id", currentUserId)
-        .eq("website_id", WEBSITE_ID)
-        .eq("class_name", context.className)
-        .eq("session", context.session);
+    /* Read the copy saved on this phone first (works offline). */
+    let data = await Offline.list(SUBJECT_SCORES_TABLE, function (r) {
+        return r.user_id === currentUserId &&
+            r.website_id === WEBSITE_ID &&
+            r.class_name === context.className &&
+            r.session === context.session;
+    });
 
-    if (error) throw new Error(error.message || "Could not load the saved scores.");
+    if (!data.length && !smIsOffline()) {
+
+        const scoresResult = await supabaseClient
+            .from(SUBJECT_SCORES_TABLE)
+            .select("subject, term, admission_no, student_name, first_ca, second_ca, exams")
+            .eq("user_id", currentUserId)
+            .eq("website_id", WEBSITE_ID)
+            .eq("class_name", context.className)
+            .eq("session", context.session);
+
+        if (scoresResult.error) throw new Error(scoresResult.error.message || "Could not load the saved scores.");
+
+        data = scoresResult.data || [];
+
+    }
 
     const roster = await fetchClassRoster(context.className, context.session);
 
@@ -11194,16 +11314,12 @@ async function saveSubjectScoresToDatabase(className, subject, rows, session, te
         throw new Error("No student rows were found in that subject sheet.");
     }
 
-    const { error } = await supabaseClient
-        .from(SUBJECT_SCORES_TABLE)
-        .upsert(payloadRows, {
-            onConflict: "user_id,website_id,class_name,session,term,subject,match_key"
-        });
-
-    if (error) {
-        console.error("Subject score upload error:", error);
-        throw new Error(error.message || "Could not save subject scores.");
-    }
+    /* Saved on this phone first; it syncs to Supabase when online. */
+    await Offline.upsertManyByKey(
+        SUBJECT_SCORES_TABLE,
+        ["user_id", "website_id", "class_name", "session", "term", "subject", "match_key"],
+        payloadRows
+    );
 
     return payloadRows.length;
 
@@ -11220,6 +11336,23 @@ async function fetchAllSavedSubjectScoresForClass(className, subjects, session, 
     subjects.forEach(function (subject) { result[subject] = []; });
 
     if (!currentUserId || !className) return result;
+
+    /* Read the copy saved on this phone first (works offline). */
+    const localScores = await Offline.list(SUBJECT_SCORES_TABLE, function (r) {
+        return r.user_id === currentUserId &&
+            r.website_id === WEBSITE_ID &&
+            r.class_name === className &&
+            (r.session || "") === (session || "") &&
+            (r.term || "") === (term || "");
+    });
+
+    if (localScores.length || smIsOffline()) {
+        localScores.forEach(function (row) {
+            if (!result[row.subject]) result[row.subject] = [];
+            result[row.subject].push(row);
+        });
+        return result;
+    }
 
     const { data, error } = await supabaseClient
         .from(SUBJECT_SCORES_TABLE)
