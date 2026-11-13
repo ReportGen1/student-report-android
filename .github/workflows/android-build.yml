@@ -25,6 +25,11 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Download offline libraries
+        run: |
+          mkdir -p www/vendor
+          curl -L -o www/vendor/xlsx.full.min.js https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js
+          curl -L -o www/vendor/supabase.js https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js
       - name: Sync Capacitor
         run: npx cap sync android
 
