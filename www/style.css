@@ -3335,3 +3335,101 @@ body.printing-reports #reportPrintLayer .report.tpl-minimal .result-table .grade
         grid-template-columns: 1fr;
     }
 }
+
+
+/* =========================================================
+   REMARK COLUMN + GRADING KEY
+   The result table now has a Remark column after Grade (8 columns),
+   so the column widths are re-balanced. The same widths suit the
+   cumulative report table.
+   ========================================================= */
+
+.report .result-table thead th:nth-child(1) { width: 5%; }
+.report .result-table thead th:nth-child(2) { width: 25%; }
+.report .result-table thead th:nth-child(3),
+.report .result-table thead th:nth-child(4),
+.report .result-table thead th:nth-child(5) { width: 10%; }
+.report .result-table thead th:nth-child(6) { width: 12%; }
+.report .result-table thead th:nth-child(7) { width: 8%; }
+.report .result-table thead th:nth-child(8) { width: 20%; }
+
+.report .result-table .remark-cell {
+    font-size: 9.5px;
+    font-weight: 700;
+    line-height: 1.15;
+}
+
+/* Grading key: which marks earn which grade */
+.report .grade-key {
+    margin-top: 6px;
+    padding: 5px 6px 6px;
+    border: 1px solid #9ca9b1;
+    border-radius: 4px;
+    background: #f6f8f9;
+    break-inside: avoid;
+    page-break-inside: avoid;
+}
+
+.report .grade-key-title {
+    margin-bottom: 4px;
+    color: var(--navy, #17324d);
+    font-size: 8px;
+    font-weight: 800;
+    letter-spacing: .4px;
+    text-transform: uppercase;
+    text-align: center;
+}
+
+.report .grade-key-grid {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 4px;
+}
+
+.report .grade-key-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 3px 2px;
+    border: 1px solid #c3ccd1;
+    border-radius: 3px;
+    background: #ffffff;
+    color: #26323a;
+    line-height: 1.2;
+    text-align: center;
+}
+
+.report .grade-key-item strong {
+    font-size: 11px;
+    font-weight: 800;
+}
+
+.report .grade-key-item span {
+    font-size: 7.5px;
+    font-weight: 700;
+}
+
+.report .grade-key-item em {
+    font-size: 7.5px;
+    font-style: normal;
+    opacity: .85;
+}
+
+/* The student's own overall grade is highlighted */
+.report .grade-key-item.is-current {
+    background: var(--teal, #1f6f68);
+    border-color: var(--teal, #1f6f68);
+    color: #ffffff;
+    box-shadow: 0 0 0 1px var(--teal, #1f6f68);
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+}
+
+@media (max-width: 600px) {
+    .report .grade-key-grid {
+        grid-template-columns: repeat(3, 1fr);
+    }
+    .report .result-table .remark-cell {
+        font-size: 7px;
+    }
+}
