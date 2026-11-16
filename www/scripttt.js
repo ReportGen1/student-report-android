@@ -929,99 +929,15 @@ function staffClassLevelSubjects(className) {
    way it was otherwise. */
 function applySubjectEntryAccess() {
 
-    /* Put back anything an earlier call changed. */
-    document.querySelectorAll("[" + SRG_FORCED_ATTR + "]").forEach(function (el) {
-        const original = el.getAttribute(SRG_FORCED_ATTR);
-        el.style.removeProperty("display");
-        if (original) el.style.display = original;
-        el.removeAttribute(SRG_FORCED_ATTR);
-    });
+    /* Only a body class is switched. The page's own CSS (Index.html) then lets
+       Step 1B appear, and the page system keeps it on its own page. Forcing
+       the section visible from here would make it show on every page. */
+    const show =
+        typeof staffContext !== "undefined" &&
+        !!staffContext &&
+        staffIsFormMasterOfBasicClass();
 
-    document.body.classList.remove("srg-subject-entry");
-
-    if (typeof staffContext === "undefined" || !staffContext) return;
-    if (!staffCanEnterAllSubjects(getActiveClassName(false))) return;
-
-    const controls = [
-        "subjectTemplateSelect",
-        "downloadSubjectTemplate",
-        "subjectTemplateFile",
-        "subjectTemplateStatus"
-    ].map(function (id) {
-        return document.getElementById(id);
-    }).filter(Boolean);
-
-    if (controls.length === 0) return;
-
-    const force = function (el, value) {
-        if (el.hasAttribute(SRG_FORCED_ATTR)) return;
-        el.setAttribute(SRG_FORCED_ATTR, el.style.display || "");
-        el.style.setProperty("display", value, "important");
-    };
-
-    /* Step 1B's own card: the smallest block that holds all its controls. */
-    let card = controls[0];
-
-    while (card && card !== document.body && !controls.every(function (c) { return card.contains(c); })) {
-        card = card.parentElement;
-    }
-
-    if (!card || card === document.body || card.id === "appSection") {
-        card = controls[0].closest("section, fieldset, .card, .step-card, .panel, details") || controls[0].parentElement;
-    }
-
-    if (!card) return;
-
-    document.body.classList.add("srg-subject-entry");
-
-    /* Show the card, and any wrapper around it that hides it. */
-    const path = [];
-    let highestHidden = -1;
-    let node = card;
-
-    while (node && node !== document.body && node.id !== "appSection") {
-
-        path.push(node);
-
-        if (window.getComputedStyle(node).display === "none") {
-            force(node, "block");
-            highestHidden = path.length - 1;
-        }
-
-        node = node.parentElement;
-
-    }
-
-    /* A wrapper that was hidden also held the OTHER sections. They must stay
-       hidden: only Step 1B is meant to appear. */
-    for (let i = 1; i <= highestHidden; i++) {
-
-        Array.prototype.forEach.call(path[i].children, function (child) {
-
-            if (child === path[i - 1]) return;
-            if (/^(SCRIPT|STYLE|TEMPLATE|LINK)$/.test(child.tagName)) return;
-            if (window.getComputedStyle(child).display === "none") return;
-
-            force(child, "none");
-
-        });
-
-    }
-
-    /* Anything inside the card that is hidden on its own. */
-    controls.forEach(function (control) {
-
-        let el = control;
-
-        while (el && el !== card) {
-
-            if (window.getComputedStyle(el).display === "none") force(el, "block");
-
-            el = el.parentElement;
-
-        }
-
-    });
+    document.body.classList.toggle("srg-subject-entry", show);
 
 }
 
