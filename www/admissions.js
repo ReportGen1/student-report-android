@@ -125,7 +125,7 @@
         $("settingsCard").style.display = isOwner ? "" : "none";
         $("staffCard").style.display = isOwner ? "" : "none";
 
-        const link = new URL("apply.html", window.location.href);
+        const link = new URL("apply.html", ADM_PUBLIC_BASE);
         link.search = "";
         link.hash = "";
         link.searchParams.set("apply", ownerId);
