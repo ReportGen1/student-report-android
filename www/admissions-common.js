@@ -10,6 +10,11 @@
    school owner's login is shared automatically. */
 const ADM_SITE = "reportgen1";
 
+
+/* Public address of this site. Needed because inside the Android app
+   window.location is https://localhost, which parents can't open. */
+const ADM_PUBLIC_BASE = "https://reportgen1.github.io/ReportSheet/"; // keep the trailing slash
+
 const ADM_SUPABASE_URL = "https://nzeddvcmabfodmvmgsyg.supabase.co";
 const ADM_SUPABASE_KEY = "sb_publishable_Iaro_sV4r31wPbLycRB4Eg_OCDBy2u3";
 
