@@ -1066,8 +1066,15 @@ let reportSettings = {
     /* Class levels: { "JSS 1": "Basic" }. A class with no entry uses
        every subject, exactly as before levels existed. */
     classLevels:
-        {}
+        {},
 
+    /* Next term fees per class: { "JSS 1": 45000 }, and the next term's
+       resumption date (YYYY-MM-DD). Both are shown on the generated reports. */
+    nextTermFees:
+        {},
+
+    nextTermResumption:
+        ""
 };
 
 
@@ -1759,6 +1766,7 @@ function initializeCollapsibleSections() {
             [
                 "schoolNameInput", "schoolAddressInput", "schoolLogoInput",
                 "schoolLogoPreview", "removeSchoolLogo", "markingSettingsBlock",
+                "nextTermBlock",
                 "saveSchoolInformation", "schoolInformationStatus"
             ].map(byId),
             "School Information",
@@ -1797,6 +1805,10 @@ document.addEventListener(
         initializeOnlineScoreEntry();
         initializeOnlineClassList();
         initializeMarkingSettingsBlock();
+
+        /* Built before the collapse arrows are added, so the School
+           Information arrow opens and closes it with everything else. */
+        renderNextTermBlock();
 
         initializeCollapsibleSections();
 
@@ -5412,6 +5424,8 @@ function loadSchoolInformation() {
 
     fillMarkingSettingsForm();
 
+    renderNextTermBlock();
+
 }
 
 
@@ -5423,6 +5437,9 @@ function saveSchoolInformation() {
 
     /* Marking & Grading: stop here when the form has a problem. */
     if (!applyMarkingSettingsFromForm()) return;
+
+    /* Next term fees & resumption date: stop here when the form has a problem. */
+    if (!applyNextTermFromForm()) return;
 
     const schoolName =
         schoolNameInput
@@ -7024,6 +7041,8 @@ async function deleteSchoolClass(id, className) {
 }
 
 function renderClassList() {
+
+    try { renderNextTermBlock(); } catch (e) { /* never block the class list */ }
 
     if (!elementExists(classListContainer)) return;
 
@@ -11665,6 +11684,8 @@ function createCumulativeReport(student, model) {
                 </div>
             </section>
 
+            ${feesNoticeHtml({ className: context.className, session: context.session, term: ACADEMIC_TERMS[ACADEMIC_TERMS.length - 1], admissionNo: student.admission_no, name: student.student_name })}
+
             <footer class="report-footer">
                 <span>Cumulative (Annual) Report</span>
                 <span>${escapeHTML(context.session)}</span>
@@ -12134,6 +12155,12 @@ async function generateCumulativeReports(mode) {
             });
 
         }
+
+        /* Outstanding balances come from the Fees area before the reports are built. */
+        await preloadFeeBalancesForCumulative(
+            toRender.map(function (item) { return item.student; }),
+            model.context
+        );
 
         /* Build first, charge second - nothing is shown until the server confirms. */
         const html = toRender.map(function (item) {
@@ -17010,6 +17037,84 @@ function loadPublishStudents() {
 }
 
 
+/* Extra report-sheet details (house, photo, totals, grade key, behaviour
+   ratings, fees) so the online sheet matches the generated report. */
+function buildPublishExtra(student, subjects, overallTotal, average, behavior) {
+
+    const firstCAMax = Number(reportSettings.firstCAMaximum) || 20;
+    const secondCAMax = Number(reportSettings.secondCAMaximum) || 20;
+    const examsMax = Number(reportSettings.examsMaximum) || 60;
+
+    const domains = (behavioralDomains || []).map(function (domain) {
+        return {
+            name: domain.name,
+            traits: domain.traits.map(function (trait) {
+                return {
+                    name: trait,
+                    rating: behavior[trait] !== undefined ? String(behavior[trait]) : ""
+                };
+            })
+        };
+    });
+
+    /* Fees & next term, same rules as feesNoticeHtml. */
+    const fees = reportSettings.nextTermFees || {};
+    const classKey = normalizeClassKey(student["Class"]);
+    let nextFee = null;
+
+    Object.keys(fees).forEach(function (name) {
+        if (normalizeClassKey(name) === classKey && Number(fees[name]) > 0) {
+            nextFee = Number(fees[name]);
+        }
+    });
+
+    let balanceInfo = null;
+    try {
+        const cached = feeBalanceCache.get(
+            feeCacheKey(
+                student["Session"],
+                student["Term"],
+                computeMatchKey(student["Admission No"], student["Student Name"])
+            )
+        );
+        if (cached) balanceInfo = cached;
+    } catch (e) { /* fees are optional */ }
+
+    const outstanding =
+        balanceInfo && Number(balanceInfo.balance) > 0
+            ? Number(balanceInfo.balance)
+            : 0;
+
+    let photo = "";
+    try {
+        photo = getStudentPhoto(student) || "";
+    } catch (e) { photo = ""; }
+
+    return {
+        house: student["House"] || "",
+        student_photo: photo,
+        overall_total: Number(overallTotal.toFixed(2)),
+        overall_grade: getGrade(average),
+        marks: {
+            ca1_max: firstCAMax,
+            ca2_max: secondCAMax,
+            exam_max: examsMax,
+            total_max: firstCAMax + secondCAMax + examsMax
+        },
+        grade_key: getGradeKeyRows(),
+        behaviour: domains,
+        fees: {
+            outstanding_balance: outstanding,
+            fully_paid: !!balanceInfo && outstanding === 0,
+            has_balance_record: !!balanceInfo,
+            next_term_begins: reportSettings.nextTermResumption || "",
+            next_term_fee: nextFee,
+            total_at_resumption:
+                outstanding > 0 && nextFee !== null ? outstanding + nextFee : null
+        }
+    };
+}
+
 function getPublishResultData(student) {
 
     const subjects = [];
@@ -17064,10 +17169,11 @@ function getPublishResultData(student) {
         const total =
             firstCA + secondCA + exams;
 
-        const subjectPosition =
-            student[subjectName + " Position"] ??
-            student[subjectName + " position"] ??
-            "";
+        /* Same class statistics the printed report uses. */
+        const subjectStats =
+            getSubjectClassStatistics(student, subjectName);
+
+        const subjectGrade = getGrade(total);
 
         subjects.push({
             subject_name: subjectName,
@@ -17075,8 +17181,16 @@ function getPublishResultData(student) {
             ca2: secondCA,
             exam: exams,
             total: total,
-            grade: getGrade(total),
-            subject_position: subjectPosition
+            grade: subjectGrade,
+            remark: getGradeRemark(subjectGrade),
+            subject_average:
+                subjectStats.average === null
+                    ? ""
+                    : Number(subjectStats.average.toFixed(2)),
+            subject_position:
+                subjectStats.position === null
+                    ? ""
+                    : subjectStats.position
         });
 
         overallTotal += total;
@@ -17146,7 +17260,12 @@ function getPublishResultData(student) {
                 behavior["Principal's Comment"] || ""
         },
 
-        subjects: subjects
+        subjects: subjects,
+
+        /* Everything else the printed report shows. */
+        extra: buildPublishExtra(
+            student, subjects, overallTotal, average, behavior
+        )
 
     };
 
@@ -17280,46 +17399,65 @@ async function publishOneStudentResult(student) {
 
     try {
 
-        const { data, error } =
+        const publishParams = {
+            p_website_id: WEBSITE_ID,
+            p_school_name: resultData.school.name || null,
+            p_school_address: resultData.school.address || null,
+            p_school_logo_url: resultData.school.logo_url || null,
+            p_admission_no:
+                String(resultData.student.admission_no || "").trim(),
+            p_student_name: studentName,
+            p_gender: resultData.student.gender || null,
+            p_class_name: resultData.student.class_name || null,
+            p_session: session,
+            p_term: term,
+            p_average: Number(resultData.result.average) || 0,
+            p_position:
+                String(resultData.result.position ?? "").trim() === ""
+                    ? null
+                    : (isNaN(Number(resultData.result.position))
+                        ? null
+                        : Number(resultData.result.position)),
+            p_class_size:
+                Number(resultData.result.class_size) || null,
+            p_attendance: resultData.result.attendance || null,
+            p_teacher_comment: resultData.result.teacher_comment || null,
+            p_principal_comment: resultData.result.principal_comment || null,
+            p_subjects: (resultData.subjects || []).map(function (subject) {
+                return {
+                    subject_name: subject.subject_name || "",
+                    ca1: subject.ca1 ?? "",
+                    ca2: subject.ca2 ?? "",
+                    exam: subject.exam ?? "",
+                    total: subject.total ?? "",
+                    grade: subject.grade || "",
+                    remark: subject.remark || "",
+                    subject_average: subject.subject_average ?? "",
+                    subject_position: subject.subject_position ?? ""
+                };
+            })
+        };
+
+        /* Full report-sheet details. Needs the p_extra parameter added by
+           the SQL migration; if the server does not have it yet, fall
+           back to the original call so publishing never breaks. */
+        let usedFallbackWithoutExtras = false;
+        let { data, error } =
             await supabaseClient.rpc(
                 "publish_student_result",
-                {
-                    p_website_id: WEBSITE_ID,
-                    p_school_name: resultData.school.name || null,
-                    p_school_address: resultData.school.address || null,
-                    p_school_logo_url: resultData.school.logo_url || null,
-                    p_admission_no:
-                        String(resultData.student.admission_no || "").trim(),
-                    p_student_name: studentName,
-                    p_gender: resultData.student.gender || null,
-                    p_class_name: resultData.student.class_name || null,
-                    p_session: session,
-                    p_term: term,
-                    p_average: Number(resultData.result.average) || 0,
-                    p_position:
-                        String(resultData.result.position ?? "").trim() === ""
-                            ? null
-                            : (isNaN(Number(resultData.result.position))
-                                ? null
-                                : Number(resultData.result.position)),
-                    p_class_size:
-                        Number(resultData.result.class_size) || null,
-                    p_attendance: resultData.result.attendance || null,
-                    p_teacher_comment: resultData.result.teacher_comment || null,
-                    p_principal_comment: resultData.result.principal_comment || null,
-                    p_subjects: (resultData.subjects || []).map(function (subject) {
-                        return {
-                            subject_name: subject.subject_name || "",
-                            ca1: subject.ca1 ?? "",
-                            ca2: subject.ca2 ?? "",
-                            exam: subject.exam ?? "",
-                            total: subject.total ?? "",
-                            grade: subject.grade || "",
-                            subject_position: subject.position ?? ""
-                        };
-                    })
-                }
+                Object.assign({}, publishParams, { p_extra: resultData.extra })
             );
+
+        if (
+            error &&
+            (error.code === "PGRST202" ||
+             /p_extra|could not find the function/i.test(error.message || ""))
+        ) {
+            console.warn("Server has no p_extra yet; publishing without extras.");
+            usedFallbackWithoutExtras = true;
+            ({ data, error } =
+                await supabaseClient.rpc("publish_student_result", publishParams));
+        }
 
         if (error) {
             console.error(
@@ -17371,8 +17509,11 @@ async function publishOneStudentResult(student) {
                     : 5,
             studentName: studentName,
             message:
-                response.message ||
-                "Result published successfully."
+                (response.message ||
+                "Result published successfully.") +
+                (usedFallbackWithoutExtras
+                    ? " WARNING: the full report-sheet details were NOT saved because the database migration has not been applied. Run migration_full_report_online.sql in Supabase, then publish again."
+                    : "")
         };
 
     } catch (error) {
@@ -17834,6 +17975,7 @@ async function publishAllResults() {
 async function generateSingleReport() {
 
     await preloadAttendanceForStudents(students);
+    await preloadFeeBalancesForStudents(students);
 
     if (!elementExists(studentSelect)) return;
 
@@ -17912,6 +18054,7 @@ async function generateSingleReport() {
 async function generateAllReports() {
 
     await preloadAttendanceForStudents(students);
+    await preloadFeeBalancesForStudents(students);
 
     if (!students || students.length === 0) {
         alert("❌ Please upload an Excel file containing student records first.");
@@ -18612,6 +18755,8 @@ function createReport(student) {
                     </div>
                 </div>
             </section>
+
+            ${feesNoticeHtml({ className: studentClass, session: session, term: term, admissionNo: admissionNo, name: studentName })}
 
             <footer class="report-footer">
                 <span>Student Academic Report</span>
@@ -20980,4 +21125,311 @@ function initializeWhatsNewBadge() {
     if (toggle) {
         toggle.addEventListener("click", refresh);
     }
+}
+
+
+/* =========================================================
+   NEXT TERM FEES & RESUMPTION DATE  (School Information)
+   Stored in reportSettings (school_profile.report_settings), so no
+   new table is needed. Shown on every generated report together with
+   the student's outstanding balance from the Fees area.
+   ========================================================= */
+
+function nextTermEl(id) {
+    return document.getElementById(id);
+}
+
+function renderNextTermBlock() {
+
+    if (!elementExists(saveSchoolInformationButton)) return;
+
+    let block = nextTermEl("nextTermBlock");
+
+    if (!block) {
+        block = document.createElement("div");
+        block.id = "nextTermBlock";
+        block.style.cssText = "margin:16px 0;";
+        saveSchoolInformationButton.insertAdjacentElement("beforebegin", block);
+    }
+
+    /* Keep what the owner has typed but not saved yet when this redraws. */
+    const typed = {};
+    block.querySelectorAll("input[data-next-term-class]").forEach(function (input) {
+        typed[input.getAttribute("data-next-term-class")] = input.value;
+    });
+    const dateInput = nextTermEl("nextTermResumption");
+    const typedDate = dateInput ? dateInput.value : null;
+
+    const saved = reportSettings.nextTermFees || {};
+    const names = (typeof schoolClasses !== "undefined" ? schoolClasses : [])
+        .map(function (c) { return c.class_name; })
+        .filter(Boolean)
+        .sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+
+    const inputStyle = "width:100%;box-sizing:border-box;padding:6px;";
+
+    let rows = "";
+
+    names.forEach(function (name) {
+
+        const key = normalizeClassKey(name);
+        let value = typed[name];
+
+        if (value === undefined) {
+            value = "";
+            Object.keys(saved).forEach(function (savedName) {
+                if (normalizeClassKey(savedName) === key && Number(saved[savedName]) > 0) {
+                    value = String(saved[savedName]);
+                }
+            });
+        }
+
+        rows +=
+            "<tr>" +
+            '<td style="padding:4px;border-bottom:1px solid #ddd;">' + escapeHTML(name) + "</td>" +
+            '<td style="padding:4px;border-bottom:1px solid #ddd;width:50%;">' +
+            '<input type="number" inputmode="decimal" min="0" step="any" ' +
+            'data-next-term-class="' + escapeHTML(name) + '" ' +
+            'value="' + escapeHTML(value) + '" placeholder="₦ amount" style="' + inputStyle + '">' +
+            "</td></tr>";
+    });
+
+    block.innerHTML =
+        '<div style="font-weight:bold;margin-bottom:4px;">Next Term Information</div>' +
+        '<p style="margin:0 0 8px;font-size:13px;">' +
+        "These appear on every generated report, so parents know when school resumes and what to pay." +
+        "</p>" +
+
+        '<label for="nextTermResumption" style="display:block;font-size:13px;margin-bottom:4px;">Next term resumption date</label>' +
+        '<input type="date" id="nextTermResumption" style="' + inputStyle + 'max-width:260px;">' +
+
+        '<div style="font-size:13px;margin:12px 0 4px;">Next term school fees per class</div>' +
+        (names.length
+            ? '<table style="border-collapse:collapse;width:100%;font-size:14px;">' +
+              "<thead><tr>" +
+              '<th style="text-align:left;padding:4px;border-bottom:2px solid #999;">Class</th>' +
+              '<th style="text-align:left;padding:4px;border-bottom:2px solid #999;">Fees (₦)</th>' +
+              "</tr></thead><tbody>" + rows + "</tbody></table>"
+            : '<p style="font-size:13px;opacity:.75;">Add your classes in Step 0 first, then enter their fees here.</p>') +
+
+        '<div id="nextTermMessage" style="font-size:13px;min-height:18px;margin-top:6px;"></div>' +
+        '<div style="font-size:12px;opacity:.75;margin-top:2px;">' +
+        "Leave a class empty to hide its fee. Press Save School Information to apply." +
+        "</div>";
+
+    const dateNow = nextTermEl("nextTermResumption");
+    if (dateNow) {
+        dateNow.value = typedDate !== null ? typedDate : (reportSettings.nextTermResumption || "");
+    }
+}
+
+/* Returns false (and shows why) when the form has a problem. */
+function applyNextTermFromForm() {
+
+    const block = nextTermEl("nextTermBlock");
+
+    /* The block is not on the page: leave the saved values alone. */
+    if (!block) return true;
+
+    const message = nextTermEl("nextTermMessage");
+    const fees = {};
+    let problem = "";
+
+    block.querySelectorAll("input[data-next-term-class]").forEach(function (input) {
+
+        const raw = input.value.trim();
+        if (!raw) return;
+
+        const amount = Number(raw);
+
+        if (!isFinite(amount) || amount < 0) {
+            problem = "Fees for " + input.getAttribute("data-next-term-class") + " must be a positive amount.";
+            return;
+        }
+
+        if (amount > 0) fees[input.getAttribute("data-next-term-class")] = Math.round(amount * 100) / 100;
+    });
+
+    if (problem) {
+        if (message) message.textContent = "❌ " + problem;
+        if (schoolInformationStatus) schoolInformationStatus.textContent = "❌ Not saved: " + problem;
+        return false;
+    }
+
+    const dateInput = nextTermEl("nextTermResumption");
+    const date = dateInput ? dateInput.value : "";
+
+    /* Keep fees of classes that are not listed now (e.g. a class not loaded yet). */
+    const previous = reportSettings.nextTermFees || {};
+    const listed = {};
+    block.querySelectorAll("input[data-next-term-class]").forEach(function (input) {
+        listed[normalizeClassKey(input.getAttribute("data-next-term-class"))] = true;
+    });
+    Object.keys(previous).forEach(function (name) {
+        if (!listed[normalizeClassKey(name)] && Number(previous[name]) > 0 && schoolClasses.length === 0) {
+            fees[name] = previous[name];
+        }
+    });
+
+    reportSettings.nextTermFees = fees;
+    reportSettings.nextTermResumption = date;
+
+    if (message) message.textContent = "";
+    return true;
+}
+
+
+/* =========================================================
+   FEES & NEXT TERM BLOCK ON THE REPORT
+   ========================================================= */
+
+/* "session|term|matchKey" -> { carry, due, paid, balance } */
+const feeBalanceCache = new Map();
+
+function feeCacheKey(session, term, matchKey) {
+    return String(session || "") + "|" + String(term || "") + "|" + String(matchKey || "");
+}
+
+/* entries: [{ className, session, term, admissionNo, name }] */
+async function preloadFeeBalances(entries) {
+
+    try {
+
+        if (!window.SRG_FEES || !Array.isArray(entries)) return;
+
+        const groups = new Map();
+
+        entries.forEach(function (entry) {
+            if (!entry.className || !entry.session || !entry.term) return;
+            const groupKey = entry.className + "|" + entry.session + "|" + entry.term;
+            if (!groups.has(groupKey)) groups.set(groupKey, { entry: entry, keys: new Set() });
+            groups.get(groupKey).keys.add(computeMatchKey(entry.admissionNo, entry.name));
+        });
+
+        for (const group of groups.values()) {
+
+            const e = group.entry;
+            const keys = Array.from(group.keys);
+            const result = await window.SRG_FEES.balancesForReports(e.className, e.session, e.term, keys);
+
+            keys.forEach(function (key) {
+                const cacheKey = feeCacheKey(e.session, e.term, key);
+                if (result && result[key]) feeBalanceCache.set(cacheKey, result[key]);
+                else feeBalanceCache.delete(cacheKey);
+            });
+        }
+
+    } catch (error) {
+        console.warn("Fee balances not loaded:", error);
+    }
+}
+
+function preloadFeeBalancesForStudents(list) {
+
+    return preloadFeeBalances((list || []).map(function (student) {
+        return {
+            className: String(student["Class"] || "").trim(),
+            session: String(student["Session"] || "").trim(),
+            term: String(student["Term"] || "").trim(),
+            admissionNo: student["Admission No"],
+            name: student["Student Name"]
+        };
+    }));
+}
+
+/* The cumulative (annual) report shows the balance at the end of the session. */
+function preloadFeeBalancesForCumulative(list, context) {
+
+    const term = ACADEMIC_TERMS[ACADEMIC_TERMS.length - 1];
+
+    return preloadFeeBalances((list || []).map(function (student) {
+        return {
+            className: String((context && context.className) || "").trim(),
+            session: String((context && context.session) || "").trim(),
+            term: term,
+            admissionNo: student.admission_no,
+            name: student.student_name
+        };
+    }));
+}
+
+function formatNairaForReport(amount) {
+    try {
+        return new Intl.NumberFormat("en-NG", { style: "currency", currency: "NGN", maximumFractionDigits: 2 }).format(Number(amount) || 0);
+    } catch (e) {
+        return "₦" + (Number(amount) || 0).toFixed(2);
+    }
+}
+
+function formatResumptionDate(iso) {
+    if (!iso) return "";
+    const d = new Date(iso + "T00:00:00");
+    return isNaN(d) ? iso : d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+}
+
+/* info: { className, session, term, admissionNo, name } */
+function feesNoticeHtml(info) {
+
+    const fees = reportSettings.nextTermFees || {};
+    const classKey = normalizeClassKey(info.className);
+
+    let nextFee = null;
+
+    Object.keys(fees).forEach(function (name) {
+        if (normalizeClassKey(name) === classKey && Number(fees[name]) > 0) nextFee = Number(fees[name]);
+    });
+
+    const resumption = formatResumptionDate(reportSettings.nextTermResumption);
+
+    const balance = feeBalanceCache.get(
+        feeCacheKey(info.session, info.term, computeMatchKey(info.admissionNo, info.name))
+    );
+
+    const cards = [];
+    const cardStyle = "border:1px solid #999;border-radius:6px;padding:8px 10px;break-inside:avoid;";
+    const labelStyle = "font-size:11px;text-transform:uppercase;letter-spacing:.4px;opacity:.75;";
+
+    function card(label, value, color) {
+        cards.push(
+            '<div style="' + cardStyle + '">' +
+            '<div style="' + labelStyle + '">' + escapeHTML(label) + "</div>" +
+            '<strong style="font-size:16px;' + (color ? "color:" + color + ";" : "") + '">' + escapeHTML(value) + "</strong>" +
+            "</div>"
+        );
+    }
+
+    let outstanding = 0;
+
+    if (balance) {
+        if (balance.balance > 0) {
+            outstanding = balance.balance;
+            card("Outstanding balance", formatNairaForReport(balance.balance), "#b91c1c");
+        } else {
+            card("School fees", "Fully paid ✓", "#15803d");
+        }
+    }
+
+    if (resumption) card("Next term begins", resumption);
+    if (nextFee !== null) card("Next term fees", formatNairaForReport(nextFee));
+
+    if (outstanding > 0 && nextFee !== null) {
+        card("Total to pay at resumption", formatNairaForReport(outstanding + nextFee), "#1d4ed8");
+    }
+
+    if (!cards.length) return "";
+
+    return `
+            <section class="fees-notice-section" style="margin-top:12px;break-inside:avoid;page-break-inside:avoid;">
+                <div class="section-heading">
+                    <span class="section-number">06</span>
+                    <div>
+                        <h2>Fees &amp; Next Term</h2>
+                    </div>
+                </div>
+
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;">
+                    ${cards.join("")}
+                </div>
+            </section>
+    `;
 }
