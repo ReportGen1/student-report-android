@@ -106,29 +106,27 @@ function smClearOfflineUser() {
 }
 
 async function smBlockLogoutIfUnsynced() {
-    if ((await Offline.pending()) > 0) {
+    try {
+        const pending = await Offline.pending();
+        if (pending === 0) return false;
+
+        if (typeof Offline.failures === "function" && typeof Offline.discardFailed === "function") {
+            const f = await Offline.failures();
+            if (f.length && f.length === pending) {
+                if (window.confirm("The server rejected these changes, so they cannot sync:\n\n" +
+                                   f.join("\n") + "\n\nDiscard them and log out?")) {
+                    await Offline.discardFailed();
+                    return false;
+                }
+                return true;
+            }
+        }
         alert("Some changes have not synced yet. Connect to the internet and wait for sync to finish before logging out.");
         return true;
+    } catch (e) {
+        console.error(e);
+        return false; // if the check itself breaks, don't trap the user
     }
-    return false;
-}
-
-/* Android app only: show uncaught errors on screen so a silent failure
-   (e.g. a button that does nothing) can be diagnosed. */
-if (IS_ANDROID_APP) {
-    let shownErrors = 0;
-    const showAppError = function (label, message) {
-        if (shownErrors >= 3) return;
-        shownErrors++;
-        try { alert("\u26A0 " + label + ": " + message); } catch (e) { /* ignore */ }
-    };
-    window.addEventListener("error", function (event) {
-        showAppError("Script error", (event && event.message) + (event && event.lineno ? " (line " + event.lineno + ")" : ""));
-    });
-    window.addEventListener("unhandledrejection", function (event) {
-        const reason = event && event.reason;
-        showAppError("Unhandled error", reason && reason.message ? reason.message : String(reason));
-    });
 }
 
 

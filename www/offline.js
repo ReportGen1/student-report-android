@@ -313,5 +313,21 @@
     sync();
   }
 
-  window.Offline = { init, list, save, remove, upsertManyByKey, removeWhere, sync, clearAll, onStatus: fn => listeners.push(fn), pending: pendingCount };
+async function failures() {
+  return (await getAll('outbox'))
+    .filter(o => o.error)
+    .map(o => o.table + ': ' + o.error);
+}
+
+async function discardFailed() {
+  const bad = (await getAll('outbox')).filter(o => o.error);
+  for (const o of bad) {
+    if (o.action === 'upsert') await del(o.table, o.client_id); // remove the local copy too
+    await del('outbox', o.key);
+  }
+  emit('idle');
+  return bad.length;
+}
+  
+  window.Offline = { init, list, save, remove, upsertManyByKey, removeWhere, sync, clearAll, onStatus: fn => listeners.push(fn), pending: pendingCount, failures, discardFailed };
 })();
