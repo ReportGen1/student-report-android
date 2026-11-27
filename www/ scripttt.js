@@ -1,0 +1,21963 @@
+/* =========================================================
+   RENEWAL / CARRY-OVER CONTRACT
+   =========================================================
+
+   Before payment, the client calculates the unused balance from the
+   current subscription and sends it to the paystack-verification1 Edge
+   Function as previous_remaining_reports.
+
+   The server-side renewal must store that value in the NEW row as
+   carried_over_reports and reset reports_generated to 0.
+
+   Example: old limit 100, old usage 35 -> 65 carried over; new
+   Standard limit 500 -> 565 total available.
+   ========================================================= */
+
+/* =========================================================
+   STUDENT REPORT GENERATOR
+   COMPLETE CLEANED script.js
+   ========================================================= */
+/* =========================================================
+   WEBSITE IDENTIFICATION
+   ========================================================= */
+
+const WEBSITE_ID = "reportgen1";
+
+const WEBSITE_NAME = "ReportSheet";
+
+const WEBSITE_URL =
+    "https://reportgen1.github.io/ReportSheet/";
+/* =========================================================
+   STUDENT REPORT GENERATOR
+   COMPLETE CLEANED script.js
+   ========================================================= */
+
+/* =========================================================
+   SUPABASE
+   ========================================================= */
+
+const SUPABASE_URL =
+    "https://nzeddvcmabfodmvmgsyg.supabase.co";
+
+const SUPABASE_KEY =
+    "sb_publishable_Iaro_sV4r31wPbLycRB4Eg_OCDBy2u3";
+
+/* In the Android app (WebView) the browser Web Locks API can leave the
+   sign-in request waiting forever, so the app skips the lock. The app
+   runs a single page, so no lock is needed. Browsers are unchanged. */
+const IS_ANDROID_APP =
+    !!(window.Capacitor &&
+        typeof window.Capacitor.isNativePlatform === "function" &&
+        window.Capacitor.isNativePlatform());
+
+const supabaseClient =
+    supabase.createClient(
+        SUPABASE_URL,
+        SUPABASE_KEY,
+        IS_ANDROID_APP
+            ? {
+                auth: {
+                    lock: async function (name, acquireTimeout, fn) {
+                        return await fn();
+                    }
+                }
+            }
+            : undefined
+    );
+
+/* =========================================================
+   OFFLINE START HELPERS
+   Remember the signed-in user, subscription and staff role on
+   this phone so the app can open without internet.
+   ========================================================= */
+
+const SM_USER_KEY = "sm_offline_user";
+const SM_SUB_KEY = "sm_offline_subscription";
+const SM_STAFF_KEY = "sm_offline_staff";
+const SM_STAFF_SUBJECTS_KEY = "sm_offline_staff_subjects";
+
+function smIsOffline() {
+    return !navigator.onLine;
+}
+
+function smReadJson(key) {
+    try {
+        return JSON.parse(localStorage.getItem(key) || "null");
+    } catch (e) {
+        return null;
+    }
+}
+
+function smSaveOfflineUser(user) {
+    localStorage.setItem(SM_USER_KEY, JSON.stringify({ id: user.id, email: user.email || "" }));
+}
+
+/* Returns the saved user only while the phone is offline. */
+function smOfflineUser() {
+    if (!smIsOffline()) return null;
+    const cached = smReadJson(SM_USER_KEY);
+    return cached && cached.id ? cached : null;
+}
+
+function smClearOfflineUser() {
+    [SM_USER_KEY, SM_SUB_KEY, SM_STAFF_KEY, SM_STAFF_SUBJECTS_KEY].forEach(function (k) {
+        localStorage.removeItem(k);
+    });
+}
+
+async function smBlockLogoutIfUnsynced() {
+    try {
+        const pending = await Offline.pending();
+        if (pending === 0) return false;
+
+        if (typeof Offline.failures === "function" && typeof Offline.discardFailed === "function") {
+            const f = await Offline.failures();
+            if (f.length && f.length === pending) {
+                if (window.confirm("The server rejected these changes, so they cannot sync:\n\n" +
+                                   f.join("\n") + "\n\nDiscard them and log out?")) {
+                    await Offline.discardFailed();
+                    return false;
+                }
+                return true;
+            }
+        }
+        alert("Some changes have not synced yet. Connect to the internet and wait for sync to finish before logging out.");
+        return true;
+    } catch (e) {
+        console.error(e);
+        return false; // if the check itself breaks, don't trap the user
+    }
+}
+
+
+/* =========================================================
+   PAYSTACK
+   ========================================================= */
+
+const PAYSTACK_PUBLIC_KEY =
+    "pk_live_13f21f3e23bb881e317ecafcf21cf4f6acb76144";
+
+
+/* =========================================================
+    GLOBAL VARIABLES
+    ========================================================= */
+
+let students = [];
+
+let currentSubscriptionPlan = "";
+
+let reportsGenerated = 0;
+
+let currentUserId = null;
+
+let currentSubscription = null;
+
+/* =========================================================
+   FREE TRIAL
+   New users receive 10 reports for 7 days. The trial row is
+   created server-side by the Supabase auth trigger.
+   ========================================================= */
+const FREE_TRIAL_PLAN = "free_trial";
+const FREE_TRIAL_STATUS = "trial";
+const FREE_TRIAL_REPORTS = 10;
+const FREE_TRIAL_DURATION_DAYS = 7;
+let freeTrialExpiryTimer = null;
+
+function clearFreeTrialExpiryTimer() {
+    if (freeTrialExpiryTimer) {
+        clearTimeout(freeTrialExpiryTimer);
+        freeTrialExpiryTimer = null;
+    }
+}
+
+function isFreeTrial(subscription) {
+    if (!subscription) return false;
+    const plan = String(subscription.plan || subscription.subscription_plan || subscription.package || "").trim().toLowerCase();
+    const status = String(subscription.status || "").trim().toLowerCase();
+    return plan === FREE_TRIAL_PLAN && status === FREE_TRIAL_STATUS;
+}
+
+function startFreeTrialExpiryTimer(subscription) {
+    clearFreeTrialExpiryTimer();
+    if (!isFreeTrial(subscription) || !subscription.expires_at) return;
+    const expiryTime = new Date(subscription.expires_at).getTime();
+    if (!Number.isFinite(expiryTime)) return;
+    const delay = Math.max(expiryTime - Date.now(), 0);
+    freeTrialExpiryTimer = setTimeout(async function () {
+        freeTrialExpiryTimer = null;
+        if (currentUserId) await checkLogin();
+    }, Math.min(delay + 1000, 2147483647));
+}
+
+
+/* =========================================================
+   LOCAL DATA STORAGE
+   ========================================================= */
+
+const STUDENT_DATA_STORAGE_KEY =
+    "studentReportGeneratorData";
+
+const STUDENT_SUBJECTS_STORAGE_KEY =
+    "studentReportGeneratorSubjects";
+
+const REPORT_SETTINGS_STORAGE_KEY =
+    "studentReportGeneratorSettings";
+
+const GENERATED_REPORTS_STORAGE_KEY =
+    "studentReportGeneratorGeneratedReports";
+
+/* =========================================================
+   GENERATION LEDGER
+
+   A report must not consume another allowance merely because the
+   user refreshed the page, generated the same student again, or
+   switched between Generate Student and Generate All modes.
+
+   The ledger is scoped to the active subscription and stores a
+   fingerprint of the report data. A changed score/comment/term/etc.
+   produces a new fingerprint and can therefore be charged normally.
+   A new subscription gets a new scope, so the user can use the new
+   allowance normally.
+   ========================================================= */
+const REPORT_GENERATION_LEDGER_KEY =
+    "studentReportGeneratorGenerationLedger";
+
+function getGenerationLedger() {
+    try {
+        const raw = localStorage.getItem(REPORT_GENERATION_LEDGER_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (error) {
+        console.error("Unable to read report generation ledger:", error);
+        return {};
+    }
+}
+
+function saveGenerationLedger(ledger) {
+    try {
+        localStorage.setItem(
+            REPORT_GENERATION_LEDGER_KEY,
+            JSON.stringify(ledger)
+        );
+    } catch (error) {
+        console.error("Unable to save report generation ledger:", error);
+    }
+}
+
+function getCurrentSubscriptionScope() {
+    if (!currentSubscription) return "no-subscription";
+
+    return String(
+        currentSubscription.id ||
+        currentSubscription.created_at ||
+        currentSubscription.expires_at ||
+        currentSubscription.plan ||
+        currentSubscriptionPlan ||
+        "subscription"
+    );
+}
+
+function stableValue(value) {
+    if (value === null || value === undefined) return "";
+    if (typeof value !== "object") return String(value);
+
+    if (Array.isArray(value)) {
+        return value.map(stableValue);
+    }
+
+    const output = {};
+    Object.keys(value).sort().forEach(function (key) {
+        if (key === "__generationFingerprint") return;
+        output[key] = stableValue(value[key]);
+    });
+    return output;
+}
+
+function simpleHash(text) {
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash +=
+            (hash << 1) +
+            (hash << 4) +
+            (hash << 7) +
+            (hash << 8) +
+            (hash << 24);
+    }
+    return (hash >>> 0).toString(16);
+}
+
+/* The Automatic Comments feature stores its generated sentences on the student
+   and its bank inside the settings. Neither may change a report's fingerprint,
+   otherwise editing the comment bank would charge already-generated reports again.
+   Comments TYPED by a teacher still count. */
+function studentForFingerprint(student) {
+
+    const copy = Object.assign({}, student);
+    delete copy.__autoComment;
+
+    if (student && student.__behavior) {
+
+        const flags = student.__autoComment || {};
+
+        copy.__behavior = Object.assign({}, student.__behavior);
+
+        if (flags.teacher) delete copy.__behavior["Class Teacher's Comment"];
+        if (flags.principal) delete copy.__behavior["Principal's Comment"];
+
+    }
+
+    return copy;
+
+}
+
+function reportSettingsForFingerprint() {
+    const copy = Object.assign({}, reportSettings);
+    delete copy.commentBank;
+    /* Changing the report outlook must not make reports count as new. */
+    delete copy.reportTemplate;
+    /* Nor must editing the promotion rules (the promotion note on the
+       cumulative report follows the rules without using allowance). */
+    delete copy.promotion;
+    /* Neither must tagging subjects/classes with levels. */
+    delete copy.subjectLevels;
+    delete copy.classLevels;
+    /* Nor must the website marking flag or the wording of the grade remarks. */
+    delete copy.markingFromWebsite;
+    delete copy.gradeRemarks;
+    /* Adding an assessment must not make existing reports count as new; the
+       extra scores themselves are part of the student data, so a report whose
+       extra marks change is still treated as a new version. */
+    delete copy.extraAssessments;
+    return copy;
+}
+
+/* Until levels are used the fingerprint keeps using the whole school list
+   (so reports already generated are not counted as new). Once levels are
+   used, a report is tied to the subjects this student actually has, so
+   adding a subject to another level never changes it. */
+function fingerprintSubjectsFor(student) {
+    if (!levelsInUse()) return schoolSubjects;
+    const detected = detectSubjectsFromRows([student]);
+    return detected.length > 0 ? detected : schoolSubjects;
+}
+
+function getReportGenerationFingerprint(student) {
+    const payload = {
+        student: stableValue(studentForFingerprint(student)),
+        subjects: stableValue(fingerprintSubjectsFor(student)),
+        settings: stableValue(reportSettingsForFingerprint()),
+        website: WEBSITE_ID
+    };
+
+    return simpleHash(JSON.stringify(payload));
+}
+
+function migrateLegacyGeneratedReportsToLedger() {
+    if (!reportContainer || !students || students.length === 0) return;
+
+    const visibleText = reportContainer.textContent || "";
+    const fingerprints = [];
+
+    students.forEach(function (student) {
+        const name = cleanStudentName(student["Student Name"]);
+        const admissionNo = String(student["Admission No"] || "").trim();
+
+        if (!name) return;
+
+        if (
+            visibleText.includes(name) &&
+            (!admissionNo || visibleText.includes(admissionNo))
+        ) {
+            fingerprints.push(
+                getReportGenerationFingerprint(student)
+            );
+        }
+    });
+
+    if (fingerprints.length > 0) {
+        markReportsAsGenerated(fingerprints);
+    }
+}
+
+function hasReportBeenGenerated(fingerprint) {
+    const ledger = getGenerationLedger();
+    const scope = getCurrentSubscriptionScope();
+    return !!(ledger[scope] && ledger[scope][fingerprint]);
+}
+
+function markReportsAsGenerated(fingerprints) {
+    if (!Array.isArray(fingerprints) || fingerprints.length === 0) return;
+
+    const ledger = getGenerationLedger();
+    const scope = getCurrentSubscriptionScope();
+
+    if (!ledger[scope]) ledger[scope] = {};
+
+    fingerprints.forEach(function (fingerprint) {
+        if (fingerprint) ledger[scope][fingerprint] = Date.now();
+    });
+
+    /* Keep the local ledger small. */
+    const keys = Object.keys(ledger);
+    if (keys.length > 8) {
+        keys.sort(function (a, b) {
+            const aTime = Math.max.apply(null, Object.values(ledger[a] || {}).map(Number).concat([0]));
+            const bTime = Math.max.apply(null, Object.values(ledger[b] || {}).map(Number).concat([0]));
+            return bTime - aTime;
+        });
+        keys.slice(8).forEach(function (key) { delete ledger[key]; });
+    }
+
+    saveGenerationLedger(ledger);
+}
+
+
+/* =========================================================
+   SAVE APP DATA
+   ========================================================= */
+
+function saveAppData() {
+
+    try {
+
+        localStorage.setItem(
+            STUDENT_DATA_STORAGE_KEY,
+            JSON.stringify(students)
+        );
+
+        localStorage.setItem(
+            STUDENT_SUBJECTS_STORAGE_KEY,
+            JSON.stringify(schoolSubjects)
+        );
+
+        localStorage.setItem(
+            REPORT_SETTINGS_STORAGE_KEY,
+            JSON.stringify(reportSettings)
+        );
+
+        scheduleSchoolProfileSync();
+
+        prepareReportWatermark();
+
+    } catch (error) {
+
+        console.error(
+            "Unable to save app data:",
+            error
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   RESTORE APP DATA
+   ========================================================= */
+
+function restoreAppData() {
+
+    try {
+
+        const savedStudents =
+            localStorage.getItem(
+                STUDENT_DATA_STORAGE_KEY
+            );
+
+        const savedSubjects =
+            localStorage.getItem(
+                STUDENT_SUBJECTS_STORAGE_KEY
+            );
+
+        const savedSettings =
+            localStorage.getItem(
+                REPORT_SETTINGS_STORAGE_KEY
+            );
+
+
+        /* =========================
+           STUDENTS
+           ========================= */
+
+        if (savedStudents) {
+
+            const parsedStudents =
+                JSON.parse(savedStudents);
+
+            if (
+                Array.isArray(
+                    parsedStudents
+                )
+            ) {
+
+                students =
+                    parsedStudents;
+
+            }
+
+        }
+
+
+        /* =========================
+           SUBJECTS
+           ========================= */
+
+        if (savedSubjects) {
+
+            const parsedSubjects =
+                JSON.parse(savedSubjects);
+
+            if (
+                Array.isArray(
+                    parsedSubjects
+                ) &&
+                parsedSubjects.length > 0
+            ) {
+
+                schoolSubjects =
+                    parsedSubjects;
+
+            }
+
+        }
+
+
+        /* =========================
+           SETTINGS
+           ========================= */
+
+        if (savedSettings) {
+
+            const parsedSettings =
+                JSON.parse(savedSettings);
+
+            if (
+                parsedSettings &&
+                typeof parsedSettings === "object"
+            ) {
+
+                reportSettings = {
+                    ...reportSettings,
+                    ...parsedSettings
+                };
+
+            }
+
+        }
+
+
+        /* =========================
+           RESTORE STUDENTS
+           ========================= */
+
+        if (students.length > 0) {
+
+            students.forEach(
+                function (student) {
+
+                    if (
+                        !student.__behavior
+                    ) {
+
+                        student.__behavior = {};
+
+                    }
+
+                }
+            );
+
+
+            loadStudents();
+
+
+            if (reportSection) {
+
+                reportSection.style.display =
+                    "block";
+
+            }
+
+
+            updateReportStatus();
+
+
+            setFileStatus(
+                "✅ Previous Excel data restored. " +
+                students.length +
+                " student record(s) available."
+            );
+
+        }
+
+
+        renderSubjectList();
+
+    } catch (error) {
+
+        console.error(
+            "Unable to restore app data:",
+            error
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   SAVE GENERATED REPORTS
+   ========================================================= */
+
+function saveGeneratedReports() {
+
+    if (!reportContainer) {
+        return;
+    }
+
+    try {
+
+        const reportsHTML =
+            reportContainer.innerHTML;
+
+        localStorage.setItem(
+            GENERATED_REPORTS_STORAGE_KEY,
+            reportsHTML
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Unable to save generated reports:",
+            error
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   RESTORE GENERATED REPORTS
+   ========================================================= */
+
+function restoreGeneratedReports() {
+
+    if (!reportContainer) {
+        return;
+    }
+
+    try {
+
+        const savedReports =
+            localStorage.getItem(
+                GENERATED_REPORTS_STORAGE_KEY
+            );
+
+        if (
+            savedReports &&
+            savedReports.trim() !== ""
+        ) {
+
+            reportContainer.innerHTML =
+                savedReports;
+
+            /* Migrate reports generated by the previous version so
+               an already-paid report is not charged again. */
+            migrateLegacyGeneratedReportsToLedger();
+
+        }
+
+    } catch (error) {
+
+        console.error(
+            "Unable to restore generated reports:",
+            error
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   CLEAR GENERATED REPORTS
+   ========================================================= */
+
+function clearGeneratedReports() {
+
+    try {
+
+        localStorage.removeItem(
+            GENERATED_REPORTS_STORAGE_KEY
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Unable to clear generated reports:",
+            error
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   REPORT GENERATION LIMITS
+   ========================================================= */
+
+const REPORT_LIMITS = {
+
+    basic: 100,
+
+    standard: 500,
+
+    premium: 1000,
+
+    /* Not a literal Infinity: kept as a large finite number so every
+       calculation above (carry-over math, remaining counts, the
+       claim_report_allowance RPC) stays well-defined. Must match
+       PLAN_CONFIG.unlimited.reports in the paystack-verification1
+       edge function and the RPC's own CASE branch. */
+    unlimited: 1000000,
+
+    free_trial: FREE_TRIAL_REPORTS
+
+};
+
+/* Any plan limit at or above this is treated as "Unlimited" for
+   on-screen display, instead of printing the raw sentinel number. */
+const UNLIMITED_DISPLAY_THRESHOLD = 1000000;
+
+function formatReportCount(n) {
+
+    return (Number(n) || 0) >= UNLIMITED_DISPLAY_THRESHOLD
+        ? "Unlimited"
+        : n;
+
+}
+
+
+/* =========================================================
+   SCHOOL SUBJECTS
+   ========================================================= */
+
+let schoolSubjects = [
+
+    "Mathematics",
+    "English",
+    "Biology",
+    "Physics",
+    "Chemistry",
+    "Computer Science"
+
+];
+
+/* Untouched copy of the starting subject list. */
+const DEFAULT_SCHOOL_SUBJECTS = schoolSubjects.slice();
+
+
+/* =========================================================
+   SUBJECT LEVELS  (Pre Basic / Basic / Post Basic)
+
+   The school keeps ONE subject list. Each subject is tagged with
+   the level(s) it is taught at (reportSettings.subjectLevels) and each
+   class is tagged with its level (reportSettings.classLevels). A class
+   then only offers the subjects of its own level. Subjects or classes
+   with no level behave exactly as before (every subject / every class).
+
+   Both maps live inside reportSettings, so they are saved in the
+   browser and in Supabase (school_profile.report_settings) with no
+   database change.
+   ========================================================= */
+
+const SUBJECT_LEVELS = ["Pre Basic", "Basic", "Post Basic"];
+
+function getSubjectLevelMap() {
+    if (
+        !reportSettings.subjectLevels ||
+        typeof reportSettings.subjectLevels !== "object" ||
+        Array.isArray(reportSettings.subjectLevels)
+    ) {
+        reportSettings.subjectLevels = {};
+    }
+    return reportSettings.subjectLevels;
+}
+
+function getClassLevelMap() {
+    if (
+        !reportSettings.classLevels ||
+        typeof reportSettings.classLevels !== "object" ||
+        Array.isArray(reportSettings.classLevels)
+    ) {
+        reportSettings.classLevels = {};
+    }
+    return reportSettings.classLevels;
+}
+
+/* Levels a subject is taught at, in Pre Basic / Basic / Post Basic order. */
+function getSubjectLevels(subject) {
+    const stored = getSubjectLevelMap()[subject];
+    const levels = Array.isArray(stored) ? stored : [];
+    return SUBJECT_LEVELS.filter(function (level) {
+        return levels.indexOf(level) !== -1;
+    });
+}
+
+function setSubjectLevels(subject, levels) {
+    const map = getSubjectLevelMap();
+    const clean = SUBJECT_LEVELS.filter(function (level) {
+        return (levels || []).indexOf(level) !== -1;
+    });
+    if (clean.length) {
+        map[subject] = clean;
+    } else {
+        delete map[subject];
+    }
+}
+
+/* Subjects offered at a level (subjects with no level are offered everywhere). */
+function subjectsForLevel(level) {
+    return schoolSubjects.filter(function (subject) {
+        const levels = getSubjectLevels(subject);
+        return levels.length === 0 || levels.indexOf(level) !== -1;
+    });
+}
+
+function getClassLevel(className) {
+    const wanted = normalizeClassKey(className);
+    if (!wanted) return "";
+    const map = getClassLevelMap();
+    const key = Object.keys(map).find(function (name) {
+        return normalizeClassKey(name) === wanted;
+    });
+    const level = key ? map[key] : "";
+    return SUBJECT_LEVELS.indexOf(level) !== -1 ? level : "";
+}
+
+function setClassLevel(className, level) {
+    const wanted = normalizeClassKey(className);
+    if (!wanted) return;
+    const map = getClassLevelMap();
+    Object.keys(map).forEach(function (name) {
+        if (normalizeClassKey(name) === wanted) delete map[name];
+    });
+    if (SUBJECT_LEVELS.indexOf(level) !== -1) {
+        map[className] = level;
+    }
+}
+
+/* The subjects a class works with: its level's subjects, or every
+   subject when the class has no level yet. */
+function subjectsForClass(className) {
+    const level = getClassLevel(className);
+    return level ? subjectsForLevel(level) : schoolSubjects.slice();
+}
+
+function levelsInUse() {
+    return (
+        Object.keys(getSubjectLevelMap()).length > 0 ||
+        Object.keys(getClassLevelMap()).length > 0
+    );
+}
+
+/* =========================================================
+   FORM MASTER: SCORE ENTRY FOR EVERY SUBJECT OF A PRE BASIC / BASIC CLASS
+
+   A form master (assigned in Staff Access) of a Pre Basic or Basic
+   class sees the Step 1B subject template section and may download /
+   upload the template of EVERY subject offered at that class's level,
+   not only subjects assigned to them. They still cannot add, rename or
+   remove subjects: the School Subjects section stays owner-only.
+   The database must also allow it (see form_master_score_entry.sql).
+   ========================================================= */
+
+const FORM_MASTER_SCORE_LEVELS = ["Pre Basic", "Basic"];
+const SRG_FORCED_ATTR = "data-srg-forced-display";
+
+/* The school's full subject list as saved by the owner (staff copy,
+   read only). Staff's own schoolSubjects holds just their class subjects. */
+let staffServerSubjects = [];
+
+function staffCanEnterAllSubjects(className) {
+
+    if (typeof staffContext === "undefined" || !staffContext || !className) return false;
+
+    const wanted = normalizeClassKey(className);
+
+    if (FORM_MASTER_SCORE_LEVELS.indexOf(getClassLevel(className)) === -1) return false;
+
+    return staffContext.assignments.some(function (a) {
+        return !a.subject && normalizeClassKey(a.class_name) === wanted;
+    });
+
+}
+
+/* True when this staff member is form master of at least one Pre Basic / Basic class. */
+function staffIsFormMasterOfBasicClass() {
+
+    if (typeof staffContext === "undefined" || !staffContext) return false;
+
+    return staffContext.assignments.some(function (a) {
+        return !a.subject && FORM_MASTER_SCORE_LEVELS.indexOf(getClassLevel(a.class_name)) !== -1;
+    });
+
+}
+
+/* Subjects offered at this class's level, from the owner's full list. */
+function staffClassLevelSubjects(className) {
+
+    const level = getClassLevel(className);
+
+    if (!level) return [];
+
+    let source = staffServerSubjects;
+
+    if (!source.length) {
+        try {
+            const cached = JSON.parse(localStorage.getItem(SM_STAFF_SUBJECTS_KEY) || "null");
+            if (cached && staffContext && cached.owner === staffContext.ownerId && Array.isArray(cached.subjects)) {
+                source = cached.subjects;
+            }
+        } catch (readError) { /* ignore a damaged cache */ }
+    }
+
+    return source.filter(function (subject) {
+        const levels = getSubjectLevels(subject);
+        return levels.length === 0 || levels.indexOf(level) !== -1;
+    });
+
+}
+
+/* Makes the Step 1B subject template section visible for a form master
+   of the selected Pre Basic / Basic class, and puts everything back the
+   way it was otherwise. */
+function applySubjectEntryAccess() {
+
+    /* Only a body class is switched. The page's own CSS (Index.html) then lets
+       Step 1B appear, and the page system keeps it on its own page. Forcing
+       the section visible from here would make it show on every page. */
+    const show =
+        typeof staffContext !== "undefined" &&
+        !!staffContext &&
+        staffIsFormMasterOfBasicClass();
+
+    document.body.classList.toggle("srg-subject-entry", show);
+
+}
+
+/* Adds subjects found in an uploaded file to the school list WITHOUT
+   dropping the school's other subjects (a class's file only holds its
+   own level's subjects, so replacing the list would wipe the rest). */
+function mergeDetectedSubjects(detected) {
+    let added = false;
+    (detected || []).forEach(function (name) {
+        const clean = String(name || "").trim();
+        if (clean && schoolSubjects.indexOf(clean) === -1) {
+            schoolSubjects.push(clean);
+            added = true;
+        }
+    });
+    return added;
+}
+
+
+/* =========================================================
+   BEHAVIORAL TRAITS
+   ========================================================= */
+
+/* The three domains shown on the report. Attendance belongs to the
+   Affective domain. Excel columns, uploads and reports all follow this list. */
+const behavioralDomains = [
+
+    {
+        name: "Cognitive Domain",
+        traits: [
+            "Class Participation",
+            "Critical Thinking",
+            "Problem Solving",
+            "Comprehension",
+            "Innovation"
+        ]
+    },
+
+    {
+        name: "Affective Domain",
+        traits: [
+            "Attendance",
+            "Punctuality",
+            "Honesty",
+            "Cooperation",
+            "Leadership",
+            "Obedience",
+            "Neatness",
+            "Confidence"
+        ]
+    },
+
+    {
+        name: "Psychomotor Domain",
+        traits: [
+            "Handwriting",
+            "Drawing and Painting",
+            "Sports and Games",
+            "Craftsmanship"
+        ]
+    }
+
+];
+
+const behavioralTraits = behavioralDomains.reduce(function (all, domain) {
+    return all.concat(domain.traits);
+}, []);
+
+
+/* =========================================================
+   REPORT SETTINGS
+   ========================================================= */
+
+let reportSettings = {
+
+    schoolName:
+        "YOUR SCHOOL NAME",
+
+    schoolAddress:
+        "YOUR SCHOOL ADDRESS",
+
+    schoolLogo:
+        "",
+
+    firstCAMaximum:
+        20,
+
+    secondCAMaximum:
+        20,
+
+    examsMaximum:
+        60,
+
+    gradeA:
+        70,
+
+    gradeB:
+        60,
+
+    gradeC:
+        50,
+
+    gradeD:
+        45,
+
+    gradeE:
+        40,
+
+    gradeF:
+        0,
+
+    reportTemplate:
+        "classic",
+
+    /* Subject levels: { "Mathematics": ["Pre Basic", "Basic"] }.
+       A subject with no entry is treated as available to every level. */
+    subjectLevels:
+        {},
+
+    /* Class levels: { "JSS 1": "Basic" }. A class with no entry uses
+       every subject, exactly as before levels existed. */
+    classLevels:
+        {},
+
+    /* Next term fees per class: { "JSS 1": 45000 }, and the next term's
+       resumption date (YYYY-MM-DD). Both are shown on the generated reports. */
+    nextTermFees:
+        {},
+
+    nextTermResumption:
+        "",
+
+    /* Extra assessments added by the school besides 1st CA, 2nd CA and
+       Exams: [{ name: "3rd CA", max: 10 }]. Empty = the classic three. */
+    extraAssessments:
+        []
+
+};
+
+
+const TEMPLATE_STUDENT_ROWS = 300;
+
+/* =========================================================
+   EXTRA ASSESSMENTS (beyond 1st CA / 2nd CA / Exams)
+
+   A school may add more assessments in School Information. Each
+   subject then gets one more column in the templates and on the
+   report, and the extra marks are added into the subject total.
+   Scores are saved in subject_scores.extras (jsonb, see
+   extra_assessments.sql) as { "3rd CA": 8 }.
+   ========================================================= */
+
+const MAX_EXTRA_ASSESSMENTS = 4;
+const RESERVED_ASSESSMENT_NAMES = ["1st ca", "2nd ca", "exams", "total", "average", "position", "adm no", "student name", "match key", "gender", "class", "term", "session", "house"];
+
+function getExtraAssessments(settings) {
+
+    const source = settings || reportSettings;
+    const list = source && Array.isArray(source.extraAssessments) ? source.extraAssessments : [];
+    const seen = [];
+    const result = [];
+
+    list.forEach(function (item) {
+
+        const name = String((item && item.name) || "").replace(/\s+/g, " ").trim();
+        const max = Number(item && item.max);
+        const key = name.toLowerCase();
+
+        if (!name || !isFinite(max) || max <= 0) return;
+        if (RESERVED_ASSESSMENT_NAMES.indexOf(key) !== -1 || seen.indexOf(key) !== -1) return;
+        if (result.length >= MAX_EXTRA_ASSESSMENTS) return;
+
+        seen.push(key);
+        result.push({ name: name, max: max });
+
+    });
+
+    return result;
+
+}
+
+/* Total of every assessment maximum (1st CA + 2nd CA + Exams + extras). */
+function getTotalMaximumMarks(settings) {
+
+    const s = settings || reportSettings;
+
+    return (Number(s.firstCAMaximum) || 20) +
+        (Number(s.secondCAMaximum) || 20) +
+        (Number(s.examsMaximum) || 60) +
+        getExtraAssessments(s).reduce(function (sum, item) { return sum + item.max; }, 0);
+
+}
+
+/* Raw cell values of a student's subject: [1st CA, 2nd CA, Exams, ...extras]. */
+function studentSubjectParts(student, subject) {
+
+    const parts = [
+        student[subject + " 1st CA"],
+        student[subject + " 2nd CA"],
+        student[subject + " Exams"]
+    ];
+
+    getExtraAssessments().forEach(function (item) {
+        parts.push(student[subject + " " + item.name]);
+    });
+
+    return parts;
+
+}
+
+function studentOffersSubject(student, subject) {
+    return studentSubjectParts(student, subject).some(function (value) {
+        return String(value ?? "").trim() !== "";
+    });
+}
+
+function studentSubjectSum(student, subject) {
+    return studentSubjectParts(student, subject).reduce(function (sum, value) {
+        return sum + (Number(value) || 0);
+    }, 0);
+}
+
+let subjectScoresExtrasMissing = false;
+
+function isMissingExtrasColumn(error) {
+
+    if (!error) return false;
+
+    const text = String(error.message || "");
+
+    return error.code === "42703" ||
+        error.code === "PGRST204" ||
+        (/extras/i.test(text) && /(column|schema cache)/i.test(text));
+
+}
+
+/* Runs a subject_scores select that also asks for the extras column, and
+   quietly falls back to the old columns if the database has no such column. */
+async function runSubjectScoreSelect(columns, build) {
+
+    if (!subjectScoresExtrasMissing) {
+
+        const result = await build(columns + ", extras");
+
+        if (!(result.error && isMissingExtrasColumn(result.error))) return result;
+
+        subjectScoresExtrasMissing = true;
+
+    }
+
+    return build(columns);
+
+}
+
+function cleanExtrasObject(value) {
+
+    const clean = {};
+
+    if (!value || typeof value !== "object" || Array.isArray(value)) return clean;
+
+    Object.keys(value).forEach(function (key) {
+        const text = String(value[key] === null || value[key] === undefined ? "" : value[key]).trim();
+        if (text !== "" && isFinite(Number(text))) clean[key] = Number(text);
+    });
+
+    return clean;
+
+}
+
+/* Column letters of the extra assessments on a subject sheet. They sit after
+   Match Key (F) and Total (G), starting in column H. */
+function subjectSheetExtraLetters() {
+    return getExtraAssessments().map(function (item, index) {
+        return XLSX.utils.encode_col(7 + index);
+    });
+}
+
+/* Formula of the visible Total column (G) of a subject sheet row. */
+function subjectSheetTotalFormula(row) {
+
+    const letters = subjectSheetExtraLetters();
+
+    if (letters.length === 0) {
+        return `IF(COUNT(C${row}:E${row})=0,"",SUM(C${row}:E${row}))`;
+    }
+
+    const range = "C" + row + ":E" + row + "," + letters[0] + row + ":" + letters[letters.length - 1] + row;
+
+    return `IF(COUNT(${range})=0,"",SUM(${range}))`;
+
+}
+
+/* Untouched copy of the default report settings. */
+const DEFAULT_REPORT_SETTINGS = JSON.parse(JSON.stringify(reportSettings));
+
+
+/* =========================================================
+   DOM ELEMENTS
+   ========================================================= */
+
+let authSection;
+
+let appSection;
+
+let subscriptionPlans;
+
+let subscriptionStatus;
+
+let emailInput;
+
+let passwordInput;
+
+let signUpButton;
+
+let signInButton;
+
+let logoutButton;
+
+let authStatus;
+
+let downloadTemplateButton;
+
+let excelFileInput;
+
+let fileStatus;
+
+let classNameInput;
+
+let newClassNameInput;
+
+let addClassButton;
+
+let classListContainer;
+
+let classManagerStatus;
+
+let subjectTemplateSelect;
+
+let downloadSubjectTemplateButton;
+
+let subjectTemplateFileInput;
+
+let subjectTemplateStatus;
+
+let reportSection;
+
+let studentSelect;
+
+let generateReportButton;
+
+let generateAllButton;
+let generateMasterSheetButton;
+
+let reportContainer;
+
+let printReportButton;
+
+let publishResultsSection;
+
+let publishStudentSelect;
+
+let publishSingleResultButton;
+
+let publishAllResultsButton;
+
+let publishResultsStatus;
+
+let publishedResultInfo;
+
+let schoolNameInput;
+
+let schoolAddressInput;
+
+let schoolLogoInput;
+
+let schoolLogoPreview;
+
+let removeSchoolLogoButton;
+
+let saveSchoolInformationButton;
+
+let schoolInformationStatus;
+
+
+/* =========================================================
+   COLLAPSIBLE SECTIONS  (minimize / expand arrow)
+   A small arrow button is added to the title of a section.
+   Click the arrow (or the title) to minimize the section down to
+   its title, and click again to open it. Only the display is
+   changed - no data, buttons or saved settings are touched.
+   ========================================================= */
+
+const SRG_COLLAPSE_CARDS = "section, .card, fieldset, details, .step-card, .panel";
+const SRG_COLLAPSE_HEADINGS = "h1, h2, h3, h4, h5, h6";
+const SRG_COLLAPSE_BUSY = "button, input, select, textarea, table, #studentPreviewContainer";
+
+function srgInjectCollapseStyle() {
+
+    if (document.getElementById("srgCollapseStyle")) return;
+
+    const style = document.createElement("style");
+    style.id = "srgCollapseStyle";
+    style.textContent =
+        ".srg-collapse-title{position:relative;padding-right:44px;cursor:pointer;-webkit-user-select:none;user-select:none;}" +
+        ".srg-collapse-btn{position:absolute;right:0;top:50%;transform:translateY(-50%);" +
+        "width:32px !important;height:32px !important;min-width:0 !important;padding:0 !important;margin:0 !important;" +
+        "display:inline-flex !important;align-items:center;justify-content:center;" +
+        "background:transparent !important;box-shadow:none !important;color:inherit !important;" +
+        "border:1px solid rgba(128,128,128,0.55) !important;border-radius:50% !important;cursor:pointer;line-height:1;}" +
+        ".srg-collapse-btn:hover{background:rgba(128,128,128,0.18) !important;}" +
+        ".srg-collapse-btn svg{width:18px;height:18px;display:block;transition:transform 0.2s ease;transform:rotate(180deg);}" +
+        ".srg-collapse-btn[aria-expanded=\"false\"] svg{transform:rotate(0deg);}" +
+        ".srg-collapsed-item{display:none !important;}" +
+        ".srg-has-lock{padding-right:84px;}" +
+        ".srg-lock-btn{position:absolute;right:38px;top:50%;transform:translateY(-50%);width:32px !important;height:32px !important;min-width:0 !important;padding:0 !important;margin:0 !important;display:inline-flex !important;align-items:center;justify-content:center;background:transparent !important;box-shadow:none !important;border:1px solid rgba(128,128,128,0.55) !important;border-radius:50% !important;cursor:pointer;font-size:15px;line-height:1;}" +
+        ".srg-lock-btn:hover{background:rgba(128,128,128,0.18) !important;}" +
+        ".srg-modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.55);z-index:100000;display:flex;align-items:center;justify-content:center;padding:16px;}" +
+        ".srg-modal{background:#fff;color:#222;border-radius:12px;width:100%;max-width:360px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,0.35);font-family:inherit;}" +
+        ".srg-modal h3{margin:0 0 8px;font-size:18px;color:#222;}" +
+        ".srg-modal p{margin:0 0 12px;font-size:14px;line-height:1.4;color:#444;}" +
+        ".srg-modal input{display:block;width:100%;box-sizing:border-box;margin:0 0 10px;padding:10px;font-size:16px;border:1px solid #bbb;border-radius:8px;background:#fff;color:#222;}" +
+        ".srg-modal-error{min-height:18px;margin:0 0 8px;font-size:13px;color:#c62828;}" +
+        ".srg-modal-row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;}" +
+        ".srg-modal-btn{padding:9px 14px;border-radius:8px;border:1px solid #bbb;font-size:14px;cursor:pointer;width:auto !important;margin:0 !important;}" +
+        ".srg-modal-cancel{background:#f1f1f1;color:#222;}" +
+        ".srg-modal-danger{background:#fff;color:#c62828;border-color:#c62828;}" +
+        ".srg-modal-ok{background:#1565c0;color:#fff;border-color:#1565c0;}" +
+        ".srg-modal-ok:disabled{opacity:0.6;}" +
+        "@media print{.srg-collapse-btn,.srg-lock-btn,.srg-modal-overlay{display:none !important;}}";
+    document.head.appendChild(style);
+
+}
+
+/* =========================================================
+   SECTION PASSWORD
+   The school owner can set one password. Sections marked
+   `protect` (School Subjects, Staff Access, Manage Classes,
+   School Information) then ask for it before they open.
+   Student Photos is never protected.
+   Only a salted SHA-256 hash is stored (inside the school
+   settings, so it follows the school login on every device).
+   Once the right password is typed the sections stay open for
+   this session; logging out or refreshing locks them again.
+   ========================================================= */
+
+const SRG_PROTECTED = { protect: true };
+const SRG_PROTECTED_WITH_LOCK = { protect: true, passwordControl: true };
+
+let srgSectionsUnlocked = false;
+let srgProtectedClosers = [];
+let srgPasswordDialogOpen = false;
+
+function srgPasswordRecord() {
+    const record = typeof reportSettings !== "undefined" && reportSettings ? reportSettings.sectionPassword : null;
+    return record && record.hash && record.salt ? record : null;
+}
+
+function srgSectionsAreLocked() {
+    return !!srgPasswordRecord() && !srgSectionsUnlocked;
+}
+
+/* Closes every protected section and asks for the password again. */
+function srgLockAllSections() {
+    srgSectionsUnlocked = false;
+    srgProtectedClosers.forEach(function (close) {
+        try { close(); } catch (error) { console.error(error); }
+    });
+}
+
+async function srgHashPassword(password, salt) {
+
+    if (!window.crypto || !window.crypto.subtle) {
+        throw new Error("This browser cannot check passwords (a secure https connection is needed).");
+    }
+
+    const data = new TextEncoder().encode(String(salt) + "|" + WEBSITE_ID + "|" + password);
+    const digest = await window.crypto.subtle.digest("SHA-256", data);
+
+    return Array.from(new Uint8Array(digest)).map(function (b) {
+        return b.toString(16).padStart(2, "0");
+    }).join("");
+
+}
+
+function srgRandomSalt() {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+}
+
+/* Password pop-up. Resolves {action:"ok", value}, {action:"secondary"} or null (cancelled).
+   config: title, message, confirmText, confirmField, secondaryText, verify(value, confirm) -> error text or "" */
+function srgPasswordDialog(config) {
+
+    if (srgPasswordDialogOpen) return Promise.resolve(null);
+
+    srgPasswordDialogOpen = true;
+    srgInjectCollapseStyle();
+
+    return new Promise(function (resolve) {
+
+        const overlay = document.createElement("div");
+        overlay.className = "srg-modal-overlay";
+
+        const box = document.createElement("div");
+        box.className = "srg-modal";
+        box.setAttribute("role", "dialog");
+        box.setAttribute("aria-modal", "true");
+
+        const title = document.createElement("h3");
+        title.textContent = config.title || "Password";
+        box.appendChild(title);
+
+        if (config.message) {
+            const message = document.createElement("p");
+            message.textContent = config.message;
+            box.appendChild(message);
+        }
+
+        function makeInput(placeholder) {
+            const input = document.createElement("input");
+            input.type = "password";
+            input.placeholder = placeholder;
+            input.autocomplete = "new-password";
+            input.setAttribute("autocapitalize", "off");
+            input.setAttribute("autocorrect", "off");
+            box.appendChild(input);
+            return input;
+        }
+
+        const input = makeInput("Password");
+        const confirmInput = config.confirmField ? makeInput("Confirm password") : null;
+
+        const error = document.createElement("div");
+        error.className = "srg-modal-error";
+        box.appendChild(error);
+
+        const row = document.createElement("div");
+        row.className = "srg-modal-row";
+        box.appendChild(row);
+
+        function makeButton(text, className) {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.textContent = text;
+            b.className = className;
+            row.appendChild(b);
+            return b;
+        }
+
+        const cancelButton = makeButton("Cancel", "srg-modal-btn srg-modal-cancel");
+        const secondaryButton = config.secondaryText ? makeButton(config.secondaryText, "srg-modal-btn srg-modal-danger") : null;
+        const okButton = makeButton(config.confirmText || "OK", "srg-modal-btn srg-modal-ok");
+
+        overlay.appendChild(box);
+        document.body.appendChild(overlay);
+
+        let busy = false;
+
+        function close(result) {
+            document.removeEventListener("keydown", onKey, true);
+            overlay.remove();
+            srgPasswordDialogOpen = false;
+            resolve(result);
+        }
+
+        async function submit() {
+
+            if (busy) return;
+            busy = true;
+            okButton.disabled = true;
+            error.textContent = "";
+
+            let problem = "";
+
+            try {
+                problem = config.verify ? await config.verify(input.value, confirmInput ? confirmInput.value : "") : "";
+            } catch (err) {
+                problem = (err && err.message) ? err.message : "Something went wrong.";
+            }
+
+            busy = false;
+            okButton.disabled = false;
+
+            if (problem) {
+                error.textContent = problem;
+                input.focus();
+                input.select();
+                return;
+            }
+
+            close({ action: "ok", value: input.value });
+
+        }
+
+        function onKey(event) {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                close(null);
+            } else if (event.key === "Enter" && overlay.contains(document.activeElement)) {
+                event.preventDefault();
+                submit();
+            }
+        }
+
+        document.addEventListener("keydown", onKey, true);
+        okButton.addEventListener("click", submit);
+        cancelButton.addEventListener("click", function () { close(null); });
+        if (secondaryButton) secondaryButton.addEventListener("click", function () { close({ action: "secondary" }); });
+
+        setTimeout(function () { input.focus(); }, 50);
+
+    });
+
+}
+
+/* Asks for the password so a protected section can open. Resolves true when allowed. */
+async function srgRequestUnlock() {
+
+    const record = srgPasswordRecord();
+
+    if (!record || srgSectionsUnlocked) return true;
+
+    const result = await srgPasswordDialog({
+        title: "🔒 Protected section",
+        message: "Enter the password to open this section.",
+        confirmText: "Open",
+        verify: async function (value) {
+            if (!value) return "Enter the password.";
+            const hash = await srgHashPassword(value, record.salt);
+            return hash === record.hash ? "" : "Wrong password. Try again.";
+        }
+    });
+
+    if (result && result.action === "ok") {
+        srgSectionsUnlocked = true;
+        return true;
+    }
+
+    return false;
+
+}
+
+/* The 🔒 button next to School Information: set, change or remove the password. */
+async function srgManagePassword() {
+
+    if (typeof staffContext !== "undefined" && staffContext) {
+        alert("Only the school owner can set or change the section password.");
+        return;
+    }
+
+    const record = srgPasswordRecord();
+
+    if (record && !srgSectionsUnlocked) {
+
+        const current = await srgPasswordDialog({
+            title: "🔒 Section password",
+            message: "Enter the current password to continue.",
+            confirmText: "Continue",
+            verify: async function (value) {
+                if (!value) return "Enter the current password.";
+                const hash = await srgHashPassword(value, record.salt);
+                return hash === record.hash ? "" : "Wrong password. Try again.";
+            }
+        });
+
+        if (!current || current.action !== "ok") return;
+
+        srgSectionsUnlocked = true;
+
+    }
+
+    const result = await srgPasswordDialog({
+        title: record ? "Change section password" : "Set section password",
+        message: "School Subjects, Staff Access, Manage Classes and School Information will ask for this password before they open. Student Photos stays open.",
+        confirmText: "Save password",
+        confirmField: true,
+        secondaryText: record ? "Remove password" : "",
+        verify: function (value, confirm) {
+            if (value.length < 4) return "Use at least 4 characters.";
+            if (value !== confirm) return "The two passwords do not match.";
+            return "";
+        }
+    });
+
+    if (!result) return;
+
+    if (result.action === "secondary") {
+        delete reportSettings.sectionPassword;
+        srgSectionsUnlocked = false;
+        saveAppData();
+        alert("✅ Section password removed. The sections now open freely.");
+        return;
+    }
+
+    const salt = srgRandomSalt();
+    const hash = await srgHashPassword(result.value, salt);
+
+    reportSettings.sectionPassword = { salt: salt, hash: hash };
+    srgSectionsUnlocked = true;
+    saveAppData();
+
+    alert("✅ Section password saved. Staff will need it to open the protected sections.");
+
+}
+
+/* Puts the arrow in `heading`. getItems() returns the elements that
+   are hidden while the section is minimized. */
+function srgMakeCollapsible(heading, getItems, options) {
+
+    options = options || {};
+
+    if (!heading || heading.getAttribute("data-srg-collapsible") === "1") return null;
+
+    srgInjectCollapseStyle();
+
+    heading.setAttribute("data-srg-collapsible", "1");
+    heading.classList.add("srg-collapse-title");
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "srg-collapse-btn";
+    button.innerHTML =
+        "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" " +
+        "stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">" +
+        "<polyline points=\"6 9 12 15 18 9\"></polyline></svg>";
+    heading.appendChild(button);
+
+    if (options.passwordControl) {
+
+        const lock = document.createElement("button");
+        lock.type = "button";
+        lock.className = "srg-lock-btn";
+        lock.textContent = "🔒";
+        lock.title = "Set or change the section password";
+        lock.setAttribute("aria-label", "Set or change the section password");
+
+        heading.classList.add("srg-has-lock");
+        heading.appendChild(lock);
+
+        lock.addEventListener("click", function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            srgManagePassword();
+        });
+
+    }
+
+    /* Sections start closed. */
+    let collapsed = true;
+    let hiddenItems = [];
+
+    function apply() {
+
+        if (collapsed) {
+            hiddenItems = getItems();
+            hiddenItems.forEach(function (el) { el.classList.add("srg-collapsed-item"); });
+        } else {
+            hiddenItems.concat(getItems()).forEach(function (el) { el.classList.remove("srg-collapsed-item"); });
+            hiddenItems = [];
+        }
+
+        const label = collapsed ? "Expand section" : "Minimize section";
+        button.setAttribute("aria-expanded", collapsed ? "false" : "true");
+        button.setAttribute("aria-label", label);
+        button.title = label;
+
+    }
+
+    function toggle(event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+        if (collapsed && options.protect && srgSectionsAreLocked()) {
+            srgRequestUnlock().then(function (allowed) {
+                if (!allowed) return;
+                collapsed = false;
+                apply();
+            });
+            return;
+        }
+
+        collapsed = !collapsed;
+        apply();
+    }
+
+    if (options.protect) {
+        srgProtectedClosers.push(function () {
+            if (!collapsed) {
+                collapsed = true;
+                apply();
+            }
+        });
+    }
+
+    button.addEventListener("click", toggle);
+
+    heading.addEventListener("click", function (event) {
+        if (event.target.closest(".srg-collapse-btn")) return;
+        if (event.target.closest("a, input, select, textarea")) return;
+        toggle(event);
+    });
+
+    apply();
+
+    return { toggle: toggle, heading: heading };
+
+}
+
+function srgFollowingSiblings(head) {
+
+    const items = [];
+    let node = head.nextElementSibling;
+
+    while (node) {
+        if (node.tagName !== "STYLE" && node.tagName !== "SCRIPT") items.push(node);
+        node = node.nextElementSibling;
+    }
+
+    return items;
+
+}
+
+/* Whole card: arrow on the card's first title, hides everything under it. */
+function srgCollapsibleCard(card, options) {
+
+    if (!card) return null;
+
+    const heading = card.querySelector(SRG_COLLAPSE_HEADINGS);
+
+    if (!heading || heading.getAttribute("data-srg-collapsible") === "1") return null;
+
+    let head = heading;
+    while (head.parentElement && head.parentElement !== card) head = head.parentElement;
+
+    if (head.parentElement !== card) return null;
+
+    return srgMakeCollapsible(heading, function () { return srgFollowingSiblings(head); }, options);
+
+}
+
+function srgSafeCard(el) {
+
+    const card = el ? el.closest(SRG_COLLAPSE_CARDS) : null;
+
+    if (!card || card.id === "appSection" || card.id === "authSection" || card.matches("main, body")) return null;
+
+    return card;
+
+}
+
+/* A part of a page: arrow on the title just above `anchorList`, hides only
+   what lies between that title and the last anchor. If no suitable title
+   exists (or hiding would also hide other buttons/inputs), a new title
+   called `title` is added above the anchors and only the anchors are hidden. */
+function srgCollapsibleBlock(anchorList, title, options) {
+
+    const anchors = anchorList.filter(Boolean);
+
+    if (!anchors.length) return null;
+
+    anchors.sort(function (a, b) {
+        if (a === b) return 0;
+        return (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1;
+    });
+
+    const primary = anchors[0];
+
+    function insideAnchor(el) {
+        return anchors.some(function (a) { return a.contains(el); });
+    }
+
+    const card = srgSafeCard(primary);
+    let heading = null;
+
+    if (card) {
+        const all = Array.from(card.querySelectorAll(SRG_COLLAPSE_HEADINGS));
+        for (let i = all.length - 1; i >= 0; i--) {
+            if (!all[i].contains(primary) && (all[i].compareDocumentPosition(primary) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+                heading = all[i];
+                break;
+            }
+        }
+    }
+
+    if (heading && heading.getAttribute("data-srg-collapsible") === "1") return null;
+
+    let items = null;
+
+    if (heading) {
+
+        let host = heading.parentElement;
+        while (host && !anchors.every(function (a) { return host.contains(a); })) host = host.parentElement;
+
+        if (host) {
+
+            const childOf = function (el) {
+                let n = el;
+                while (n && n.parentElement !== host) n = n.parentElement;
+                return n;
+            };
+
+            const kids = Array.from(host.children);
+            const startIndex = kids.indexOf(childOf(heading));
+            const endIndex = Math.max.apply(null, anchors.map(function (a) { return kids.indexOf(childOf(a)); }));
+
+            if (startIndex >= 0 && endIndex > startIndex) {
+
+                const between = kids.slice(startIndex + 1, endIndex + 1).filter(function (el) {
+                    return el.tagName !== "STYLE" && el.tagName !== "SCRIPT";
+                });
+
+                const clean = between.every(function (el) {
+                    const busy = Array.from(el.querySelectorAll(SRG_COLLAPSE_BUSY));
+                    if (el.matches(SRG_COLLAPSE_BUSY)) busy.push(el);
+                    return busy.every(insideAnchor);
+                });
+
+                if (clean) items = between;
+
+            }
+
+        }
+
+    }
+
+    if (!items) {
+        heading = document.createElement("h3");
+        heading.textContent = title;
+        primary.parentNode.insertBefore(heading, primary);
+        items = anchors;
+    }
+
+    return srgMakeCollapsible(heading, function () { return items; }, options);
+
+}
+
+function initializeCollapsibleSections() {
+
+    function byId(id) { return document.getElementById(id); }
+
+    function safely(fn) {
+        try { fn(); } catch (error) { console.error("Collapsible section error:", error); }
+    }
+
+    /* School Subjects */
+    safely(function () { srgCollapsibleCard(byId("subjectManager"), SRG_PROTECTED); });
+
+    /* Staff Access */
+    safely(function () { srgCollapsibleCard(byId("staffManagementSection"), SRG_PROTECTED); });
+
+    /* Promotion */
+    safely(function () { srgCollapsibleCard(byId("promotionSection"), SRG_PROTECTED); });
+
+    /* Manage Classes */
+    safely(function () {
+        srgCollapsibleBlock(
+            ["newClassNameInput", "classLevelRow", "addClassButton", "classManagerStatus", "classListContainer"].map(byId),
+            "Manage Classes",
+            SRG_PROTECTED
+        );
+    });
+
+    /* Student Photos */
+    safely(function () {
+        srgCollapsibleBlock(
+            ["studentPhotoManager", "studentPhotoStatus"].map(byId),
+            "Student Photos"
+        );
+    });
+
+    /* School Information */
+    safely(function () {
+        srgCollapsibleBlock(
+            [
+                "schoolNameInput", "schoolAddressInput", "schoolLogoInput",
+                "schoolLogoPreview", "removeSchoolLogo", "markingSettingsBlock",
+                "nextTermBlock",
+                "saveSchoolInformation", "schoolInformationStatus"
+            ].map(byId),
+            "School Information",
+            SRG_PROTECTED_WITH_LOCK
+        );
+    });
+
+}
+
+
+/* =========================================================
+   INITIALIZE
+   ========================================================= */
+
+document.addEventListener(
+    "DOMContentLoaded",
+    function () {
+
+        initializeElements();
+
+        attachAuthenticationEvents();
+
+        attachApplicationEvents();
+
+        createSubjectManager();
+
+        initializeAcademicWorkflow();
+        attachStaffEvents();
+
+        restoreAppData();
+
+        createAutoCommentManager();
+
+        initializePromotionSection();
+
+        initializeOnlineScoreEntry();
+        initializeOnlineClassList();
+        initializeMarkingSettingsBlock();
+
+        /* Built before the collapse arrows are added, so the School
+           Information arrow opens and closes it with everything else. */
+        renderNextTermBlock();
+
+        initializeCollapsibleSections();
+
+        loadSchoolInformation();
+
+        restoreGeneratedReports();
+
+        Offline.init(supabaseClient);
+
+        checkLogin();
+
+        initializeWhatsNewBadge();
+
+    }
+);
+
+
+/* =========================================================
+   INITIALIZE ELEMENTS
+   ========================================================= */
+
+function initializeElements() {
+
+    authSection =
+        document.getElementById(
+            "authSection"
+        );
+
+    appSection =
+        document.getElementById(
+            "appSection"
+        );
+
+    subscriptionPlans =
+        document.getElementById(
+            "subscriptionPlans"
+        );
+
+    subscriptionStatus =
+        document.getElementById(
+            "subscriptionStatus"
+        );
+
+    emailInput =
+        document.getElementById(
+            "email"
+        );
+
+    passwordInput =
+        document.getElementById(
+            "password"
+        );
+
+    signUpButton =
+        document.getElementById(
+            "signUpButton"
+        );
+
+    signInButton =
+        document.getElementById(
+            "signInButton"
+        );
+
+    logoutButton =
+        document.getElementById(
+            "logoutButton"
+        );
+
+    authStatus =
+        document.getElementById(
+            "authStatus"
+        );
+
+    downloadTemplateButton =
+        document.getElementById(
+            "downloadTemplate"
+        );
+
+    excelFileInput =
+        document.getElementById(
+            "excelFile"
+        );
+
+    fileStatus =
+        document.getElementById(
+            "fileStatus"
+        );
+
+    classNameInput =
+        document.getElementById(
+            "classNameSelect"
+        );
+
+    newClassNameInput =
+        document.getElementById(
+            "newClassNameInput"
+        );
+
+    addClassButton =
+        document.getElementById(
+            "addClassButton"
+        );
+
+    classListContainer =
+        document.getElementById(
+            "classListContainer"
+        );
+
+    classManagerStatus =
+        document.getElementById(
+            "classManagerStatus"
+        );
+
+    subjectTemplateSelect =
+        document.getElementById(
+            "subjectTemplateSelect"
+        );
+
+    downloadSubjectTemplateButton =
+        document.getElementById(
+            "downloadSubjectTemplate"
+        );
+
+    subjectTemplateFileInput =
+        document.getElementById(
+            "subjectTemplateFile"
+        );
+
+    subjectTemplateStatus =
+        document.getElementById(
+            "subjectTemplateStatus"
+        );
+
+    reportSection =
+        document.getElementById(
+            "reportSection"
+        );
+
+    studentSelect =
+        document.getElementById(
+            "studentSelect"
+        );
+
+    generateReportButton =
+        document.getElementById(
+            "generateReport"
+        );
+
+    generateAllButton =
+        document.getElementById(
+            "generateAll"
+        );
+
+    generateMasterSheetButton =
+        document.getElementById(
+            "generateMasterSheet"
+        );
+
+    reportContainer =
+        document.getElementById(
+            "reportContainer"
+        );
+
+    printReportButton =
+    document.getElementById(
+        "printReportButton"
+    );
+
+    publishResultsSection =
+        document.getElementById(
+            "publishResultsSection"
+        );
+
+    publishStudentSelect =
+        document.getElementById(
+            "publishStudentSelect"
+        );
+
+    publishSingleResultButton =
+        document.getElementById(
+            "publishSingleResult"
+        );
+
+    publishAllResultsButton =
+        document.getElementById(
+            "publishAllResults"
+        );
+
+    publishResultsStatus =
+        document.getElementById(
+            "publishResultsStatus"
+        );
+
+    publishedResultInfo =
+        document.getElementById(
+            "publishedResultInfo"
+        );
+
+
+    schoolNameInput =
+        document.getElementById(
+            "schoolNameInput"
+        );
+
+
+    schoolAddressInput =
+        document.getElementById(
+            "schoolAddressInput"
+        );
+
+
+    schoolLogoInput =
+        document.getElementById(
+            "schoolLogoInput"
+        );
+
+
+    schoolLogoPreview =
+        document.getElementById(
+            "schoolLogoPreview"
+        );
+
+
+    removeSchoolLogoButton =
+        document.getElementById(
+            "removeSchoolLogo"
+        );
+
+
+    saveSchoolInformationButton =
+        document.getElementById(
+            "saveSchoolInformation"
+        );
+
+
+    schoolInformationStatus =
+        document.getElementById(
+            "schoolInformationStatus"
+        );
+
+}
+
+
+/* =========================================================
+   ELEMENT EXISTS
+   ========================================================= */
+
+function elementExists(element) {
+
+    return (
+        element !== null &&
+        element !== undefined
+    );
+
+}
+
+
+/* =========================================================
+   SHOW LOGIN
+   ========================================================= */
+
+function showLogin() {
+
+    if (
+        elementExists(
+            authSection
+        )
+    ) {
+
+        authSection.style.display =
+            "block";
+
+    }
+
+    if (
+        elementExists(
+            subscriptionPlans
+        )
+    ) {
+
+        subscriptionPlans.style.display =
+            "none";
+
+    }
+
+    if (
+        elementExists(
+            appSection
+        )
+    ) {
+
+        appSection.style.display =
+            "none";
+
+    }
+
+    if (
+        elementExists(
+            subscriptionStatus
+        )
+    ) {
+
+        subscriptionStatus.style.display =
+            "none";
+
+    }
+
+}
+
+
+/* =========================================================
+   SHOW SUBSCRIPTION
+   ========================================================= */
+
+function showSubscription() {
+
+    if (
+        elementExists(
+            authSection
+        )
+    ) {
+
+        authSection.style.display =
+            "none";
+
+    }
+
+    if (
+        elementExists(
+            subscriptionPlans
+        )
+    ) {
+
+        subscriptionPlans.style.display =
+            "block";
+
+    }
+
+    if (
+        elementExists(
+            appSection
+        )
+    ) {
+
+        appSection.style.display =
+            "none";
+
+    }
+
+    if (
+        elementExists(
+            subscriptionStatus
+        )
+    ) {
+
+        subscriptionStatus.style.display =
+            "block";
+
+    }
+
+}
+
+
+/* =========================================================
+   SHOW APPLICATION
+   ========================================================= */
+
+function showApp() {
+
+    if (
+        elementExists(
+            authSection
+        )
+    ) {
+
+        authSection.style.display =
+            "none";
+
+    }
+
+
+    if (
+        elementExists(
+            subscriptionPlans
+        )
+    ) {
+
+        subscriptionPlans.style.display =
+            "none";
+
+    }
+
+
+    if (
+        elementExists(
+            appSection
+        )
+    ) {
+
+        appSection.style.display =
+            "block";
+
+    }
+
+
+    if (
+        elementExists(
+            subscriptionStatus
+        )
+    ) {
+
+        subscriptionStatus.style.display =
+            "block";
+
+    }
+
+
+    /* =================================================
+       CREATE RENEW / UPGRADE BUTTON
+    ================================================= */
+
+    let renewButton =
+        document.getElementById(
+            "renewUpgradeButton"
+        );
+
+
+    if (!renewButton) {
+
+        renewButton =
+            document.createElement(
+                "button"
+            );
+
+
+        renewButton.id =
+            "renewUpgradeButton";
+
+
+        renewButton.type =
+            "button";
+
+
+        renewButton.innerHTML =
+            "🔄 RENEW / UPGRADE SUBSCRIPTION";
+
+
+        /* =================================================
+           BUTTON STYLE
+        ================================================= */
+
+        renewButton.style.display =
+            "block";
+
+        renewButton.style.width =
+            "100%";
+
+        renewButton.style.margin =
+            "20px 0";
+
+        renewButton.style.padding =
+            "18px";
+
+        renewButton.style.border =
+            "2px solid #ffffff";
+
+        renewButton.style.borderRadius =
+            "10px";
+
+        renewButton.style.fontSize =
+            "18px";
+
+        renewButton.style.fontWeight =
+            "bold";
+
+        renewButton.style.cursor =
+            "pointer";
+
+        renewButton.style.boxShadow =
+            "0 5px 15px rgba(0,0,0,0.25)";
+
+        renewButton.style.backgroundColor =
+            "#198754";
+
+        renewButton.style.color =
+            "#ffffff";
+
+
+        /* =================================================
+           BUTTON ACTION
+        ================================================= */
+
+        renewButton.addEventListener(
+            "click",
+            function () {
+
+                if (
+                    elementExists(
+                        appSection
+                    )
+                ) {
+
+                    appSection.style.display =
+                        "none";
+
+                }
+
+
+                if (
+                    elementExists(
+                        subscriptionPlans
+                    )
+                ) {
+
+                    subscriptionPlans.style.display =
+                        "block";
+
+                }
+
+
+                if (
+                    elementExists(
+                        subscriptionPlans
+                    )
+                ) {
+
+                    subscriptionPlans.scrollIntoView({
+
+                        behavior:
+                            "smooth",
+
+                        block:
+                            "start"
+
+                    });
+
+                }
+
+            }
+        );
+
+    }
+
+
+    /* =================================================
+       PLACE BUTTON ABOVE THE APP
+    ================================================= */
+
+    if (
+        elementExists(
+            appSection
+        ) &&
+        renewButton.parentElement !==
+            appSection
+    ) {
+
+        appSection.insertBefore(
+            renewButton,
+            appSection.firstChild
+        );
+
+    }
+
+}
+/* =========================================================
+   AUTHENTICATION EVENTS
+   ========================================================= */
+
+function attachAuthenticationEvents() {
+
+    if (elementExists(printReportButton)) {
+    printReportButton.addEventListener(
+        "click",
+        function () {
+            printReportsPage();
+        }
+    );
+    }
+
+
+    /* =========================
+       SIGN UP
+       ========================= */
+
+    if (
+        elementExists(
+            signUpButton
+        )
+    ) {
+
+        signUpButton.addEventListener(
+            "click",
+            async function () {
+
+                const email =
+                    emailInput.value.trim();
+
+                const password =
+                    passwordInput.value;
+
+
+                if (
+                    !email ||
+                    !password
+                ) {
+
+                    setAuthStatus(
+                        "❌ Please enter your email and password."
+                    );
+
+                    return;
+
+                }
+
+
+                if (
+                    password.length < 6
+                ) {
+
+                    setAuthStatus(
+                        "❌ Password must contain at least 6 characters."
+                    );
+
+                    return;
+
+                }
+
+
+                /* Name and phone number are required to register, so the
+                   developer can contact new users and guide them. */
+                const extra = document.getElementById("signupExtra");
+                const nameInput = document.getElementById("signupFullName");
+                const phoneInput = document.getElementById("signupPhone");
+
+                let fullName = "";
+                let phone = "";
+
+                if (extra && nameInput && phoneInput) {
+
+                    if (extra.style.display === "none") {
+                        extra.style.display = "block";
+                        nameInput.focus();
+                        setAuthStatus(
+                            "Enter your full name and phone number, then tap Create Account again."
+                        );
+                        return;
+                    }
+
+                    fullName = nameInput.value.trim().replace(/\s+/g, " ");
+                    phone = phoneInput.value.replace(/[\s().-]/g, "");
+
+                    if (fullName.length < 3 || fullName.indexOf(" ") === -1) {
+                        setAuthStatus("❌ Please enter your full name (first and last name).");
+                        nameInput.focus();
+                        return;
+                    }
+
+                    if (!/^\+?\d{10,15}$/.test(phone)) {
+                        setAuthStatus("❌ Please enter a valid phone number, e.g. 08012345678.");
+                        phoneInput.focus();
+                        return;
+                    }
+
+                }
+
+
+                setAuthStatus(
+                    "Creating your account..."
+                );
+
+
+                try {
+
+                    const {
+                        data,
+                        error
+                    } =
+                        await supabaseClient.auth
+                            .signUp({
+
+                                email:
+                                    email,
+
+                                password:
+                                    password,
+
+                                options: {
+
+                                    emailRedirectTo:
+                                        WEBSITE_URL,
+
+                                    data: {
+                                        full_name: fullName,
+                                        phone: phone,
+                                        website: WEBSITE_ID,
+                                        role: "owner"
+                                    }
+
+                                }
+
+                            });
+
+
+                    if (error) {
+
+                        console.error(
+                            "Sign up error:",
+                            error
+                        );
+
+                        setAuthStatus(
+                            "❌ " +
+                            error.message
+                        );
+
+                        return;
+
+                    }
+
+
+                    if (
+                        data.user &&
+                        !data.session
+                    ) {
+
+                        setAuthStatus(
+                            "✅ Account created. Please check your email and confirm your account before signing in."
+                        );
+
+                        return;
+
+                    }
+
+
+                    setAuthStatus(
+                        "✅ Account created successfully."
+                    );
+
+
+                } catch (error) {
+
+                    console.error(
+                        error
+                    );
+
+                    setAuthStatus(
+                        "❌ An unexpected error occurred: " +
+                        (error && error.message ? error.message : error)
+                    );
+
+                }
+
+            }
+        );
+
+    }
+
+
+    /* =========================
+       SIGN IN
+       ========================= */
+
+    if (
+        elementExists(
+            signInButton
+        )
+    ) {
+
+        signInButton.addEventListener(
+            "click",
+            async function () {
+
+                const email =
+                    emailInput.value.trim();
+
+                const password =
+                    passwordInput.value;
+
+
+                if (
+                    !email ||
+                    !password
+                ) {
+
+                    setAuthStatus(
+                        "❌ Please enter your email and password."
+                    );
+
+                    return;
+
+                }
+
+
+                setAuthStatus(
+                    "Signing in..."
+                );
+
+
+                try {
+
+                    const {
+                        data,
+                        error
+                    } =
+                        await supabaseClient.auth
+                            .signInWithPassword({
+
+                                email:
+                                    email,
+
+                                password:
+                                    password
+
+                            });
+
+
+                    if (error) {
+
+                        console.error(
+                            "Sign in error:",
+                            error
+                        );
+
+                        setAuthStatus(
+                            "❌ " +
+                            error.message
+                        );
+
+                        return;
+
+                    }
+
+
+                    setAuthStatus(
+                        "✅ Login successful."
+                    );
+
+
+                    await checkLogin();
+
+
+                } catch (error) {
+
+                    console.error(
+                        error
+                    );
+
+                    setAuthStatus(
+                        "❌ Unable to sign in: " +
+                        (error && error.message ? error.message : error)
+                    );
+
+                }
+
+            }
+        );
+
+    }
+
+
+    /* =========================
+       LOGOUT
+       ========================= */
+
+    if (
+        elementExists(
+            logoutButton
+        )
+    ) {
+
+        logoutButton.addEventListener(
+            "click",
+            async function () {
+
+                try {
+                    if (await smBlockLogoutIfUnsynced()) return;
+
+                    const {
+                        error
+                    } =
+                        await supabaseClient.auth
+                            .signOut();
+
+
+                    if (error) {
+
+                        console.error(
+                            error
+                        );
+
+                        return;
+
+                    }
+
+
+                    students = [];
+
+                    currentSubscriptionPlan =
+                        "";
+
+                    reportsGenerated =
+                        0;
+
+                    currentUserId =
+                        null;
+
+
+                    resetSchoolProfileState();
+                    localStorage.removeItem(SCHOOL_PROFILE_OWNER_KEY);
+                    smClearOfflineUser();
+                    await Offline.clearAll();
+
+                    /* =========================
+                       CLEAR LOCAL APP DATA
+                       ========================= */
+
+                    localStorage.removeItem(
+                        STUDENT_DATA_STORAGE_KEY
+                    );
+
+                    localStorage.removeItem(
+                        STUDENT_SUBJECTS_STORAGE_KEY
+                    );
+
+                    localStorage.removeItem(
+                        REPORT_SETTINGS_STORAGE_KEY
+                    );
+
+                    clearGeneratedReports();
+
+
+                    /* =========================
+                       CLEAR INTERFACE
+                       ========================= */
+
+                    if (studentSelect) {
+
+                        studentSelect.innerHTML =
+                            "-- Select Student --";
+
+                    }
+
+                    if (reportContainer) {
+
+                        reportContainer.innerHTML =
+                            "";
+
+                    }
+
+                    if (reportSection) {
+
+                        reportSection.style.display =
+                            "none";
+
+                    }
+
+
+                    showLogin();
+
+
+                    setAuthStatus(
+                        "You have been logged out."
+                    );
+
+
+                } catch (error) {
+
+                    console.error(
+                        error
+                    );
+
+                }
+
+            }
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   FORGOT PASSWORD
+   ========================================================= */
+
+async function forgotPassword() {
+
+    const email =
+        prompt(
+            "Enter the email address you used to create your account:"
+        );
+
+
+    if (!email) {
+        return;
+    }
+
+
+    const cleanEmail =
+        email.trim();
+
+
+    if (!cleanEmail) {
+
+        alert(
+            "Please enter your email address."
+        );
+
+        return;
+
+    }
+
+
+    try {
+
+        const {
+            error
+        } =
+            await supabaseClient.auth
+                .resetPasswordForEmail(
+                    cleanEmail,
+                    {
+
+                        redirectTo:
+                            WEBSITE_URL
+
+                    }
+                );
+
+
+        if (error) {
+
+            console.error(
+                error
+            );
+
+            alert(
+                "❌ " +
+                error.message
+            );
+
+            return;
+
+        }
+
+
+        alert(
+            "✅ Password reset email sent."
+        );
+
+
+    } catch (error) {
+
+        console.error(
+            error
+        );
+
+        alert(
+            "❌ Unable to send password reset email."
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   UPDATE PASSWORD
+   ========================================================= */
+
+/* After the owner finishes the "Forgot password" email reset, the section
+   password (the lock on the collapse-arrow sections) is cleared too, so the
+   owner is never locked out of their own school. Staff logins are skipped on
+   purpose - they must not be able to unlock the sections by resetting their
+   own login password. Any doubt or error means nothing is cleared. */
+async function srgClearSectionPasswordAfterReset(user) {
+
+    try {
+
+        if (!user || !user.id) return false;
+
+        const staffCheck = await supabaseClient
+            .from("school_staff")
+            .select("id")
+            .eq("staff_user_id", user.id)
+            .eq("website_id", WEBSITE_ID)
+            .limit(1);
+
+        if (staffCheck.error || (staffCheck.data && staffCheck.data.length > 0)) return false;
+
+        const profile = await supabaseClient
+            .from(SCHOOL_PROFILE_TABLE)
+            .select("report_settings")
+            .eq("owner_user_id", user.id)
+            .eq("website_id", WEBSITE_ID)
+            .maybeSingle();
+
+        if (profile.error || !profile.data) return false;
+
+        const settings = Object.assign({}, profile.data.report_settings || {});
+
+        if (!settings.sectionPassword) return false;
+
+        delete settings.sectionPassword;
+
+        const result = await supabaseClient
+            .from(SCHOOL_PROFILE_TABLE)
+            .update({ report_settings: settings, updated_at: new Date().toISOString() })
+            .eq("owner_user_id", user.id)
+            .eq("website_id", WEBSITE_ID);
+
+        if (result.error) {
+            console.error("Section password reset error:", result.error);
+            return false;
+        }
+
+        delete reportSettings.sectionPassword;
+        srgSectionsUnlocked = false;
+
+        try {
+            localStorage.setItem(REPORT_SETTINGS_STORAGE_KEY, JSON.stringify(reportSettings));
+        } catch (error) { /* storage unavailable */ }
+
+        return true;
+
+    } catch (error) {
+
+        console.error("Section password reset error:", error);
+        return false;
+
+    }
+
+}
+
+async function updatePassword() {
+
+    const newPasswordElement =
+        document.getElementById(
+            "newPassword"
+        );
+
+    const confirmPasswordElement =
+        document.getElementById(
+            "confirmNewPassword"
+        );
+
+
+    if (
+        !newPasswordElement ||
+        !confirmPasswordElement
+    ) {
+
+        alert(
+            "Password fields could not be found."
+        );
+
+        return;
+
+    }
+
+
+    const newPassword =
+        newPasswordElement.value;
+
+    const confirmPassword =
+        confirmPasswordElement.value;
+
+
+    if (!newPassword) {
+
+        alert(
+            "Please enter a new password."
+        );
+
+        return;
+
+    }
+
+
+    if (
+        newPassword !==
+        confirmPassword
+    ) {
+
+        alert(
+            "❌ The passwords do not match."
+        );
+
+        return;
+
+    }
+
+
+    if (
+        newPassword.length < 6
+    ) {
+
+        alert(
+            "❌ Password must be at least 6 characters."
+        );
+
+        return;
+
+    }
+
+
+    try {
+
+        const {
+            data,
+            error
+        } =
+            await supabaseClient.auth
+                .updateUser({
+
+                    password:
+                        newPassword
+
+                });
+
+
+        if (error) {
+
+            console.error(
+                error
+            );
+
+            alert(
+                "❌ " +
+                error.message
+            );
+
+            return;
+
+        }
+
+
+        const sectionLockCleared = await srgClearSectionPasswordAfterReset(data && data.user);
+
+        alert(
+            "✅ Password changed successfully." +
+            (sectionLockCleared
+                ? "\n\n🔓 The section password was also cleared. Sign in, then tap 🔒 on School Information to set a new one."
+                : "")
+        );
+
+
+        const resetSection =
+            document.getElementById(
+                "resetPasswordSection"
+            );
+
+
+        if (resetSection) {
+
+            resetSection.style.display =
+                "none";
+
+        }
+
+
+        newPasswordElement.value =
+            "";
+
+        confirmPasswordElement.value =
+            "";
+
+
+    } catch (error) {
+
+        console.error(
+            error
+        );
+
+        alert(
+            "❌ Unable to change password."
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   AUTH STATUS
+   ========================================================= */
+
+function setAuthStatus(message) {
+
+    if (
+        elementExists(
+            authStatus
+        )
+    ) {
+
+        authStatus.innerHTML =
+            message;
+
+    }
+
+}
+
+
+/* =========================================================
+   CHECK LOGIN
+   ========================================================= */
+
+/* withTimeout: a stalled network request can no longer leave the page
+   waiting forever; after the limit the caller falls back. */
+function withTimeout(promise, ms, fallbackValue) {
+
+    return new Promise(function (resolve) {
+
+        const timer = setTimeout(function () {
+            console.warn("Request timed out after " + ms + "ms.");
+            resolve(fallbackValue);
+        }, ms);
+
+        Promise.resolve(promise).then(
+            function (value) {
+                clearTimeout(timer);
+                resolve(value);
+            },
+            function (error) {
+                clearTimeout(timer);
+                console.error(error);
+                resolve(fallbackValue);
+            }
+        );
+
+    });
+
+}
+
+/* =========================================================
+   SCHOOL PROFILE  (name, address, logo, grading settings)
+
+   Saved in Supabase (table school_profile) so it follows the
+   school's login on any device and is no longer lost at logout.
+   - Owner: loads it at login; every change is saved (after a
+     short delay). The first time, whatever this browser already
+     holds is uploaded.
+   - Staff: read-only copy of the owner's profile.
+   ========================================================= */
+
+const SCHOOL_LOGO_BUCKET = "school-logos";
+const SCHOOL_LOGO_MAX_W = 200;
+const SCHOOL_LOGO_MAX_H = 250;
+const SCHOOL_LOGO_PNG_MAX_BYTES = 30 * 1024;   /* bigger than this -> saved as a small JPEG instead */
+
+/* Shrinks an image (File/Blob) to fit inside 200 x 250 px (keeps the shape,
+   never crops or stretches, never enlarges). Saved as PNG so a transparent
+   background is kept; if that is still over about 30 KB it is saved as a
+   white-background JPEG (about 8-14 KB). Falls back to the original file if
+   the browser cannot re-encode it. */
+function shrinkLogoBlob(blob) {
+    return new Promise(function (resolve) {
+        const url = URL.createObjectURL(blob);
+        const image = new Image();
+
+        image.onload = function () {
+            try {
+                const w = image.naturalWidth || 1;
+                const h = image.naturalHeight || 1;
+                const scale = Math.min(1, SCHOOL_LOGO_MAX_W / w, SCHOOL_LOGO_MAX_H / h);
+                const canvas = document.createElement("canvas");
+                canvas.width = Math.max(1, Math.round(w * scale));
+                canvas.height = Math.max(1, Math.round(h * scale));
+                const context = canvas.getContext("2d");
+                context.imageSmoothingQuality = "high";
+                context.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+                canvas.toBlob(function (png) {
+                    if (png && png.size <= SCHOOL_LOGO_PNG_MAX_BYTES) {
+                        URL.revokeObjectURL(url);
+                        resolve(png);
+                        return;
+                    }
+
+                    context.globalCompositeOperation = "destination-over";
+                    context.fillStyle = "#ffffff";
+                    context.fillRect(0, 0, canvas.width, canvas.height);
+
+                    canvas.toBlob(function (jpg) {
+                        URL.revokeObjectURL(url);
+                        resolve(jpg || png || blob);
+                    }, "image/jpeg", 0.72);
+                }, "image/png");
+            } catch (error) {
+                URL.revokeObjectURL(url);
+                resolve(blob);
+            }
+        };
+
+        image.onerror = function () {
+            URL.revokeObjectURL(url);
+            resolve(blob);
+        };
+
+        image.src = url;
+    });
+}
+
+/* Uploads the logo to Supabase Storage (one file per school) and returns its
+   public link. Only this short link is saved in the database tables. */
+async function uploadSchoolLogoToStorage(blob) {
+    const { data: userData, error: userError } = await supabaseClient.auth.getUser();
+
+    if (userError || !userData || !userData.user) {
+        throw new Error("Not signed in");
+    }
+
+    const small = await shrinkLogoBlob(blob);
+    const ext = small.type === "image/png" ? "png" : (small.type === "image/jpeg" ? "jpg" : "img");
+    const path = userData.user.id + "/logo." + ext;
+
+    const { error } = await supabaseClient.storage
+        .from(SCHOOL_LOGO_BUCKET)
+        .upload(path, small, {
+            upsert: true,
+            contentType: small.type || "image/png",
+            cacheControl: "3600"
+        });
+
+    if (error) throw error;
+
+    const { data } = supabaseClient.storage.from(SCHOOL_LOGO_BUCKET).getPublicUrl(path);
+
+    /* The file name never changes, so add a version to bypass old cached copies. */
+    return data.publicUrl + "?v=" + Date.now();
+}
+
+/* One-time move of an older logo that is still stored inside the database
+   (a "data:" image) into Storage. Returns true if the logo was replaced. */
+async function migrateSchoolLogoToStorage() {
+    const logo = reportSettings && reportSettings.schoolLogo;
+
+    if (staffContext || !logo || logo.indexOf("data:") !== 0) return false;
+
+    try {
+        const blob = await (await fetch(logo)).blob();
+        reportSettings.schoolLogo = await uploadSchoolLogoToStorage(blob);
+        return true;
+    } catch (error) {
+        /* Keep the old logo working; it will be tried again next login. */
+        console.error("Logo migration failed:", error);
+        return false;
+    }
+}
+
+const SCHOOL_PROFILE_TABLE = "school_profile";
+const SCHOOL_PROFILE_OWNER_KEY = "srgSchoolProfileOwner";
+
+let schoolProfileLoaded = false;
+let lastSyncedProfileJson = "";
+
+/* The school's subject list as last saved to Supabase (owner only). */
+let profileSubjects = null;
+let schoolProfileSyncTimer = null;
+
+function buildSchoolProfilePayload() {
+
+    const rest = Object.assign({}, reportSettings);
+
+    delete rest.schoolName;
+    delete rest.schoolAddress;
+    delete rest.schoolLogo;
+
+    return {
+        school_name: reportSettings.schoolName || "",
+        school_address: reportSettings.schoolAddress || "",
+        school_logo: reportSettings.schoolLogo || "",
+        report_settings: rest,
+        subjects: Array.isArray(profileSubjects) ? profileSubjects : []
+    };
+
+}
+
+function schoolInfoIsDefault() {
+    return (
+        (reportSettings.schoolName || "") === DEFAULT_REPORT_SETTINGS.schoolName &&
+        (reportSettings.schoolAddress || "") === DEFAULT_REPORT_SETTINGS.schoolAddress &&
+        !reportSettings.schoolLogo
+    );
+}
+
+function schoolSubjectsAreDefault() {
+    return JSON.stringify(schoolSubjects) === JSON.stringify(DEFAULT_SCHOOL_SUBJECTS);
+}
+
+/* Called when the owner adds, renames or removes a subject in the
+   School Subjects section: that list is what gets saved to Supabase. */
+function markSubjectListChanged() {
+    if (staffContext) return;
+    profileSubjects = schoolSubjects.slice();
+}
+
+function applySchoolProfile(row) {
+
+    reportSettings = Object.assign(
+        {},
+        reportSettings,
+        row.report_settings || {},
+        {
+            schoolName: row.school_name || DEFAULT_REPORT_SETTINGS.schoolName,
+            schoolAddress: row.school_address || DEFAULT_REPORT_SETTINGS.schoolAddress,
+            schoolLogo: row.school_logo || ""
+        }
+    );
+
+    /* The server copy decides: a password removed or reset elsewhere must
+       not survive in this browser's cached settings. */
+    if (!row.report_settings || !row.report_settings.sectionPassword) {
+        delete reportSettings.sectionPassword;
+    }
+
+}
+
+/* The class list and class dropdown are drawn BEFORE the school profile is
+   loaded at login. When the saved class levels arrive afterwards, draw them
+   again so each class shows its level instead of "Level not set". */
+function refreshClassLevelViews() {
+
+    try {
+
+        renderClassList();
+
+        if (Array.isArray(schoolClasses) && schoolClasses.length > 0) {
+            populateClassNameSelect();
+        }
+
+        if (typeof promotionRefresh === "function") promotionRefresh();
+
+    } catch (error) {
+
+        console.error("Could not refresh class levels:", error);
+
+    }
+
+}
+
+function resetSchoolProfileState() {
+
+    srgLockAllSections();
+
+    resetStudentPhotoState();
+
+    schoolProfileLoaded = false;
+    lastSyncedProfileJson = "";
+
+    if (schoolProfileSyncTimer) {
+        clearTimeout(schoolProfileSyncTimer);
+        schoolProfileSyncTimer = null;
+    }
+
+    reportSettings = JSON.parse(JSON.stringify(DEFAULT_REPORT_SETTINGS));
+
+    profileSubjects = null;
+    staffServerSubjects = [];
+    schoolSubjects = DEFAULT_SCHOOL_SUBJECTS.slice();
+
+    try {
+        loadSchoolInformation();
+        renderSubjectList();
+    } catch (error) { /* inputs may not exist yet */ }
+
+}
+
+async function loadSchoolProfile(authUserId) {
+
+    if (!currentUserId) return;
+
+    try {
+
+        /* Settings left in this browser by a DIFFERENT login are never used. */
+        const markedOwner = localStorage.getItem(SCHOOL_PROFILE_OWNER_KEY);
+
+        if (markedOwner && markedOwner !== authUserId) {
+            reportSettings = JSON.parse(JSON.stringify(DEFAULT_REPORT_SETTINGS));
+            schoolSubjects = DEFAULT_SCHOOL_SUBJECTS.slice();
+        }
+
+        const { data, error } = await withTimeout(
+            supabaseClient
+                .from(SCHOOL_PROFILE_TABLE)
+                .select("school_name, school_address, school_logo, report_settings, subjects")
+                .eq("owner_user_id", currentUserId)
+                .eq("website_id", WEBSITE_ID)
+                .maybeSingle(),
+            8000,
+            { data: null, error: { message: "Request timed out" } }
+        );
+
+        if (error) {
+            /* Leave syncing off so nothing is overwritten by mistake. */
+            console.error("School profile load error:", error);
+            return;
+        }
+
+        localStorage.setItem(SCHOOL_PROFILE_OWNER_KEY, authUserId);
+
+        if (data) {
+
+            const classLevelsBefore = JSON.stringify(reportSettings.classLevels || {});
+
+            applySchoolProfile(data);
+
+            /* Older logos stored inside the database are moved to Storage. */
+            const migratedLogo = await migrateSchoolLogoToStorage();
+
+            let uploadSubjects = false;
+
+            if (!staffContext) {
+
+                /* The school's subject list comes from Supabase. */
+                const serverSubjects = (Array.isArray(data.subjects) ? data.subjects : [])
+                    .map(function (name) { return String(name || "").trim(); })
+                    .filter(Boolean);
+
+                if (serverSubjects.length > 0) {
+                    schoolSubjects = serverSubjects.slice();
+                    profileSubjects = serverSubjects.slice();
+                } else {
+                    /* Nothing saved yet: upload the list this browser has. */
+                    profileSubjects = schoolSubjects.slice();
+                    uploadSubjects = true;
+                }
+
+            }
+
+            if (staffContext) {
+                staffServerSubjects = (Array.isArray(data.subjects) ? data.subjects : [])
+                    .map(function (name) { return String(name || "").trim(); })
+                    .filter(Boolean);
+
+                try {
+                    localStorage.setItem(
+                        SM_STAFF_SUBJECTS_KEY,
+                        JSON.stringify({ owner: currentUserId, subjects: staffServerSubjects })
+                    );
+                } catch (storageError) { /* storage full or blocked */ }
+            }
+
+            lastSyncedProfileJson = (uploadSubjects || migratedLogo) ? "" : JSON.stringify(buildSchoolProfilePayload());
+            saveAppData();
+            loadSchoolInformation();
+
+            if (!staffContext) renderSubjectList();
+
+            if (JSON.stringify(reportSettings.classLevels || {}) !== classLevelsBefore) {
+                refreshClassLevelViews();
+            }
+
+            if (uploadSubjects || migratedLogo) await syncSchoolProfile(true);
+
+        } else if (!staffContext && (!schoolInfoIsDefault() || !schoolSubjectsAreDefault())) {
+
+            /* First time: upload what this browser already has. */
+            await migrateSchoolLogoToStorage();
+            profileSubjects = schoolSubjects.slice();
+            await syncSchoolProfile(true);
+
+        }
+
+        if (!staffContext) schoolProfileLoaded = true;
+
+    } catch (error) {
+
+        console.error("School profile load error:", error);
+
+    }
+
+}
+
+async function syncSchoolProfile(force) {
+
+    if (staffContext || !currentUserId) return;
+    if (!schoolProfileLoaded && !force) return;
+
+    const payload = buildSchoolProfilePayload();
+    const json = JSON.stringify(payload);
+
+    if (json === lastSyncedProfileJson) return;
+
+    const row = Object.assign(
+        {
+            owner_user_id: currentUserId,
+            website_id: WEBSITE_ID,
+            updated_at: new Date().toISOString()
+        },
+        payload
+    );
+
+    const { error } = await supabaseClient
+        .from(SCHOOL_PROFILE_TABLE)
+        .upsert(row, { onConflict: "website_id,owner_user_id" });
+
+    if (error) {
+        console.error("School profile save error:", error);
+        return;
+    }
+
+    lastSyncedProfileJson = json;
+
+}
+
+function scheduleSchoolProfileSync() {
+
+    if (staffContext || !currentUserId || !schoolProfileLoaded) return;
+
+    if (schoolProfileSyncTimer) clearTimeout(schoolProfileSyncTimer);
+
+    schoolProfileSyncTimer = setTimeout(function () {
+        schoolProfileSyncTimer = null;
+        syncSchoolProfile(false);
+    }, 800);
+
+}
+
+/* =========================================================
+   SCHOOL LOGO WATERMARK ON REPORT SHEETS
+
+   A faint, centred copy of the school logo sits over the report
+   (term and cumulative). It prints and saves to PDF with the
+   report. A small copy of the logo is made once so that hundreds
+   of reports do not each carry the full-size image.
+   ========================================================= */
+
+let watermarkSource = "";
+let watermarkSmall = "";
+
+function prepareReportWatermark() {
+
+    const logo = (reportSettings && reportSettings.schoolLogo) || "";
+
+    if (!logo) {
+        watermarkSource = "";
+        watermarkSmall = "";
+        return;
+    }
+
+    if (logo === watermarkSource) return;
+
+    watermarkSource = logo;
+    watermarkSmall = "";
+
+    const image = new Image();
+
+    image.onload = function () {
+
+        if (watermarkSource !== logo) return;
+
+        try {
+
+            const scale = Math.min(1, 360 / Math.max(image.naturalWidth || 1, image.naturalHeight || 1));
+            const canvas = document.createElement("canvas");
+
+            canvas.width = Math.max(1, Math.round((image.naturalWidth || 1) * scale));
+            canvas.height = Math.max(1, Math.round((image.naturalHeight || 1) * scale));
+
+            canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+
+            watermarkSmall = canvas.toDataURL("image/png");
+
+        } catch (error) {
+
+            watermarkSmall = logo;
+
+        }
+
+    };
+
+    image.onerror = function () {
+        watermarkSmall = "";
+    };
+
+    if (logo.indexOf("data:") !== 0) image.crossOrigin = "anonymous";
+
+    image.src = logo;
+
+}
+
+function reportWatermarkHtml() {
+
+    const logo = (reportSettings && reportSettings.schoolLogo) || "";
+
+    if (!logo) return "";
+
+    if (logo !== watermarkSource) prepareReportWatermark();
+
+    const source = (logo === watermarkSource && watermarkSmall) ? watermarkSmall : logo;
+
+    return '<img class="report-watermark" src="' + source + '" alt="" aria-hidden="true" ' +
+        'style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); ' +
+        'width:55%; max-height:55%; object-fit:contain; opacity:0.09; ' +
+        'pointer-events:none; z-index:0; border:0; margin:0; padding:0; ' +
+        '-webkit-print-color-adjust:exact; print-color-adjust:exact;">';
+
+}
+
+/* =========================================================
+   STAFF ROLES  (form master / subject teacher)
+
+   - Staff sign up with the school code; the owner approves them.
+   - Once approved, a staff member works on the OWNER'S data
+     (currentUserId is switched to the owner's id), and the
+     database security rules limit what each role can read/write.
+   - The page also hides the sections a role does not need.
+   ========================================================= */
+
+let staffContext = null;
+let staffJoinInProgress = false;
+let staffManagementState = { staff: [], assignments: [], code: "" };
+
+function srgById(id) {
+    return document.getElementById(id);
+}
+
+function sameText(a, b) {
+    return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+}
+
+function hideStaffStatus() {
+    const section = srgById("staffStatusSection");
+    if (section) section.style.display = "none";
+}
+
+function showStaffStatus(title, message) {
+
+    ["authSection", "subscriptionPlans", "appSection", "subscriptionStatus"].forEach(function (id) {
+        const el = srgById(id);
+        if (el) el.style.display = "none";
+    });
+
+    const section = srgById("staffStatusSection");
+    const titleEl = srgById("staffStatusTitle");
+    const messageEl = srgById("staffStatusMessage");
+
+    if (titleEl) titleEl.textContent = title;
+    if (messageEl) messageEl.textContent = message;
+    if (section) section.style.display = "block";
+
+}
+
+function resetStaffMode() {
+
+    staffContext = null;
+
+    document.body.classList.remove("srg-staff-mode", "srg-role-formmaster", "srg-role-subject", "srg-no-allowance");
+
+    applySubjectEntryAccess();
+
+    const nav = document.querySelector(".srg-topbar");
+    if (nav) nav.classList.remove("srg-staff");
+
+    const banner = srgById("staffRoleBanner");
+    if (banner) {
+        banner.style.display = "none";
+        banner.innerHTML = "";
+    }
+
+}
+
+/* Looks up this login's staff membership for this website.
+   Returns { state: "owner" | "approved" | "pending" | "blocked", ... } */
+async function loadStaffMembership(user) {
+
+    if (smIsOffline()) {
+        const cachedStaff = smReadJson(SM_STAFF_KEY);
+        if (cachedStaff && cachedStaff.userId === user.id) return cachedStaff.membership;
+        return { state: "owner" };
+    }
+
+    const membership = await loadStaffMembershipOnline(user);
+
+    if (membership.state === "approved") {
+        localStorage.setItem(SM_STAFF_KEY, JSON.stringify({ userId: user.id, membership: membership }));
+    } else if (membership.state !== "owner") {
+        localStorage.removeItem(SM_STAFF_KEY);
+    }
+
+    return membership;
+
+}
+
+async function loadStaffMembershipOnline(user) {
+
+
+    const { data, error } = await supabaseClient
+        .from("school_staff")
+        .select("owner_user_id, status, full_name")
+        .eq("staff_user_id", user.id)
+        .eq("website_id", WEBSITE_ID);
+
+    if (error) {
+        console.error("Staff membership lookup error:", error);
+        return { state: "owner" };
+    }
+
+    const rows = data || [];
+
+    if (rows.length === 0) return { state: "owner" };
+
+    const approved = rows.find(function (row) { return row.status === "approved"; });
+
+    if (approved) {
+
+        const assignmentResult = await supabaseClient
+            .from("staff_assignments")
+            .select("class_name, subject")
+            .eq("staff_user_id", user.id)
+            .eq("owner_user_id", approved.owner_user_id)
+            .eq("website_id", WEBSITE_ID);
+
+        if (assignmentResult.error) {
+            console.error("Staff assignments lookup error:", assignmentResult.error);
+        }
+
+        return {
+            state: "approved",
+            ownerId: approved.owner_user_id,
+            name: approved.full_name || "",
+            assignments: assignmentResult.data || []
+        };
+
+    }
+
+    if (rows.some(function (row) { return row.status === "pending"; })) {
+        return { state: "pending" };
+    }
+
+    return { state: "blocked", status: rows[0].status };
+
+}
+
+/* Subjects the Step 1B dropdown may offer. */
+function subjectOptionsForCurrentUser() {
+
+    const list = assignedSubjectOptions();
+    const className = getActiveClassName(false);
+
+    /* Form master of a Pre Basic / Basic class: every subject of the class's level. */
+    if (staffContext && staffCanEnterAllSubjects(className)) {
+        staffClassLevelSubjects(className).forEach(function (subject) {
+            if (list.indexOf(subject) === -1) list.push(subject);
+        });
+    }
+
+    return list;
+
+}
+
+/* The subjects a staff member is assigned (owner: the class's subjects). */
+function assignedSubjectOptions() {
+
+    if (!staffContext) {
+        const activeClass = getActiveClassName(false);
+        return activeClass ? subjectsForClass(activeClass) : schoolSubjects;
+    }
+
+    const className = getActiveClassName(false);
+    const list = [];
+
+    staffContext.assignments.forEach(function (a) {
+        if (!a.subject) return;
+        if (className && !sameText(a.class_name, className)) return;
+        if (list.indexOf(a.subject) === -1) list.push(a.subject);
+    });
+
+    return list;
+
+}
+
+function renderStaffBanner() {
+
+    const banner = srgById("staffRoleBanner");
+    if (!banner || !staffContext) return;
+
+    const masterOf = [];
+    const teaches = [];
+
+    staffContext.assignments.forEach(function (a) {
+        if (!a.subject) masterOf.push(escapeHTML(a.class_name));
+        else teaches.push(escapeHTML(a.subject) + " (" + escapeHTML(a.class_name) + ")");
+    });
+
+    let html = "<strong>👤 " + escapeHTML(staffContext.name || "Staff") + "</strong>";
+
+    if (masterOf.length) html += "<br>Form master: " + masterOf.join(", ");
+    if (teaches.length) html += "<br>Subject teacher: " + teaches.join(", ");
+
+    if (staffContext.notice) {
+        html += "<br><strong>⚠️ " + escapeHTML(staffContext.notice) + "</strong>";
+    }
+
+    html += "<br><small>You can only work on the classes and subjects assigned to you" +
+        (staffIsFormMasterOfBasicClass() ? ", and enter scores for every subject of your Pre Basic / Basic class" : "") +
+        ".</small>";
+
+    banner.innerHTML = html;
+    banner.style.display = "block";
+
+}
+
+async function enterStaffMode(user, membership) {
+
+    clearFreeTrialExpiryTimer();
+    currentSubscriptionPlan = "";
+    currentSubscription = null;
+    reportsGenerated = 0;
+
+    if (membership.assignments.length === 0) {
+        resetStaffMode();
+        showStaffStatus(
+            "Approved",
+            "Your access has been approved. The school owner has not assigned you a class or subject yet. Please check again later."
+        );
+        return;
+    }
+
+    staffContext = {
+        userId: user.id,
+        ownerId: membership.ownerId,
+        name: membership.name,
+        assignments: membership.assignments
+    };
+
+    /* From here on, every data query uses the school owner's id. */
+    currentUserId = membership.ownerId;
+
+    const isFormMaster = membership.assignments.some(function (a) { return !a.subject; });
+    const isSubjectTeacher = membership.assignments.some(function (a) { return !!a.subject; });
+
+    document.body.classList.add("srg-staff-mode");
+    document.body.classList.toggle("srg-role-formmaster", isFormMaster);
+    document.body.classList.toggle("srg-role-subject", isSubjectTeacher);
+
+    const nav = document.querySelector(".srg-topbar");
+    if (nav) nav.classList.add("srg-staff");
+
+    schoolSubjects = assignedSubjectOptions();
+
+    await fetchSchoolClasses();
+
+    await loadSchoolProfile(user.id);
+
+    staffContext.notice = "";
+
+    document.body.classList.remove("srg-no-allowance");
+
+    if (isFormMaster) {
+
+        const allowance = await loadOwnerSubscriptionForStaff(membership.ownerId);
+
+        if (!allowance.ok) {
+            document.body.classList.add("srg-no-allowance");
+            staffContext.notice = allowance.reason;
+        }
+
+        await refreshFormMasterSubjects();
+
+        updateReportStatus();
+
+    }
+
+    populateSubjectTemplateSelect();
+    renderStaffBanner();
+
+    hideStaffStatus();
+
+    ["authSection", "subscriptionPlans", "subscriptionStatus"].forEach(function (id) {
+        const el = srgById(id);
+        if (el) el.style.display = "none";
+    });
+
+    const app = srgById("appSection");
+    if (app) app.style.display = "block";
+
+}
+
+/* ---------------- Form master: owner's subscription + class subjects ----- */
+
+/* Loads the SCHOOL OWNER's subscription so a form master's report pages
+   use (and are limited by) the owner's allowance. */
+async function loadOwnerSubscriptionForStaff(ownerId) {
+
+    const { data, error } = await withTimeout(
+        supabaseClient
+            .from("subscriptions")
+            .select("*")
+            .eq("user_id", ownerId)
+            .eq("website_id", WEBSITE_ID)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+        8000,
+        { data: null, error: { message: "Request timed out" } }
+    );
+
+    if (error || !data) {
+        console.error("Owner subscription lookup error:", error);
+        return { ok: false, reason: "The school's subscription could not be loaded. Please try again later." };
+    }
+
+    currentSubscription = data;
+
+    currentSubscriptionPlan = String(
+        data.plan || data.subscription_plan || data.package || ""
+    ).trim().toLowerCase();
+
+    reportsGenerated = Number(data.reports_generated) || 0;
+
+    const status = String(data.status || "").trim().toLowerCase();
+
+    const paidStatuses = ["paid", "active", "success", "successful", "completed"];
+
+    const statusOk =
+        paidStatuses.indexOf(status) !== -1 ||
+        (currentSubscriptionPlan === FREE_TRIAL_PLAN && status === FREE_TRIAL_STATUS);
+
+    const expiry = data.expires_at ? new Date(data.expires_at) : null;
+    const notExpired = !!expiry && !isNaN(expiry.getTime()) && expiry > new Date();
+
+    const planOk = !!REPORT_LIMITS[currentSubscriptionPlan];
+
+    if (statusOk && notExpired && planOk) {
+        return { ok: true };
+    }
+
+    return {
+        ok: false,
+        reason: "The school's report subscription is not active, so reports cannot be generated yet. Please ask the school owner to renew it."
+    };
+
+}
+
+/* A form master's subject list = the subjects assigned to teachers in the class. */
+async function refreshFormMasterSubjects() {
+
+    if (!staffContext) return;
+
+    const isFormMaster = staffContext.assignments.some(function (a) { return !a.subject; });
+
+    if (!isFormMaster) return;
+
+    const className = getActiveClassName(false);
+
+    if (!className) return;
+
+    const { data, error } = await withTimeout(
+        supabaseClient
+            .from("staff_assignments")
+            .select("subject")
+            .eq("owner_user_id", staffContext.ownerId)
+            .eq("website_id", WEBSITE_ID)
+            .eq("class_name", className)
+            .not("subject", "is", null),
+        8000,
+        { data: null, error: { message: "Request timed out" } }
+    );
+
+    if (error) {
+        console.error("Class subjects lookup error:", error);
+        return;
+    }
+
+    const list = [];
+
+    (data || []).forEach(function (row) {
+        const subject = String(row.subject || "").trim();
+        if (subject && list.indexOf(subject) === -1) list.push(subject);
+    });
+
+    /* Pre Basic / Basic form master: scores may be entered for every subject
+       of the level, so the master sheet and reports include them all. */
+    if (staffCanEnterAllSubjects(className)) {
+        staffClassLevelSubjects(className).forEach(function (subject) {
+            if (list.indexOf(subject) === -1) list.push(subject);
+        });
+    }
+
+    list.sort(function (a, b) { return a.localeCompare(b); });
+
+    schoolSubjects = list;
+
+    try {
+        renderSubjectList();
+    } catch (renderError) { /* list box may not exist */ }
+
+}
+
+/* ---------------- Staff: sign up / sign in with school code -------------- */
+
+async function staffJoin(mode) {
+
+    const email = String((srgById("email") || {}).value || "").trim();
+    const password = String((srgById("password") || {}).value || "");
+    const fullName = String((srgById("staffFullName") || {}).value || "").trim();
+    const code = String((srgById("staffJoinCode") || {}).value || "").trim();
+
+    if (!email || !password) {
+        setAuthStatus("❌ Please enter your email and password above.");
+        return;
+    }
+
+    if (mode === "signup" && password.length < 6) {
+        setAuthStatus("❌ Password must contain at least 6 characters.");
+        return;
+    }
+
+    if (!fullName) {
+        setAuthStatus("❌ Please enter your full name.");
+        return;
+    }
+
+    if (!code) {
+        setAuthStatus("❌ Please enter the school code you were given.");
+        return;
+    }
+
+    /* Stops the normal login check from treating this person as a new
+       school owner while we are still sending the join request. */
+    staffJoinInProgress = true;
+
+    try {
+
+        setAuthStatus(mode === "signup" ? "Creating your staff account..." : "Signing in...");
+
+        if (mode === "signup") {
+
+            const { data, error } = await supabaseClient.auth.signUp({
+                email: email,
+                password: password,
+                options: {
+                    emailRedirectTo: WEBSITE_URL,
+                    /* Lets the database skip the free trial for staff. */
+                    data: { staff_join: true }
+                }
+            });
+
+            if (error) {
+                setAuthStatus("❌ " + error.message);
+                return;
+            }
+
+            if (data.user && !data.session) {
+                setAuthStatus(
+                    "✅ Account created. Please confirm your email, then come back here, " +
+                    "enter the same details and tap \"Sign in &amp; request access\"."
+                );
+                return;
+            }
+
+        } else {
+
+            const { error } = await supabaseClient.auth.signInWithPassword({
+                email: email,
+                password: password
+            });
+
+            if (error) {
+                setAuthStatus("❌ " + error.message);
+                return;
+            }
+
+        }
+
+        const joinResult = await supabaseClient.rpc("request_to_join_school", {
+            p_website_id: WEBSITE_ID,
+            p_code: code,
+            p_full_name: fullName
+        });
+
+        if (joinResult.error) {
+            console.error("Join request error:", joinResult.error);
+            await supabaseClient.auth.signOut();
+            setAuthStatus("❌ Could not send your request: " + joinResult.error.message);
+            return;
+        }
+
+        if (joinResult.data === "invalid_code") {
+            await supabaseClient.auth.signOut();
+            setAuthStatus("❌ That school code is not valid. Check it with your school owner and try again.");
+            return;
+        }
+
+        if (joinResult.data === "is_owner") {
+            setAuthStatus("ℹ️ This account owns a school, so it cannot join as staff. Use a different email.");
+        } else {
+            setAuthStatus("✅ Request sent.");
+        }
+
+    } catch (error) {
+
+        console.error("Staff join error:", error);
+        setAuthStatus("❌ Something went wrong. Please try again.");
+
+    } finally {
+
+        staffJoinInProgress = false;
+        await checkLogin();
+
+    }
+
+}
+
+/* ---------------- Owner: staff management card --------------------------- */
+
+function setStaffManagementStatus(message) {
+    const el = srgById("staffManagementStatus");
+    if (el) el.textContent = message || "";
+}
+
+async function refreshStaffManagement() {
+
+    const section = srgById("staffManagementSection");
+
+    if (!section || staffContext || !currentUserId) return;
+
+    try {
+
+        const codeResult = await supabaseClient.rpc("get_or_create_school_code", {
+            p_website_id: WEBSITE_ID
+        });
+
+        if (codeResult.error) throw codeResult.error;
+
+        const staffResult = await supabaseClient
+            .from("school_staff")
+            .select("id, staff_user_id, full_name, email, status, created_at")
+            .eq("owner_user_id", currentUserId)
+            .eq("website_id", WEBSITE_ID)
+            .order("created_at", { ascending: true });
+
+        if (staffResult.error) throw staffResult.error;
+
+        const assignmentResult = await supabaseClient
+            .from("staff_assignments")
+            .select("id, staff_user_id, class_name, subject")
+            .eq("owner_user_id", currentUserId)
+            .eq("website_id", WEBSITE_ID)
+            .order("class_name", { ascending: true });
+
+        if (assignmentResult.error) throw assignmentResult.error;
+
+        /* Who may post announcements. Not fatal if announcements.sql has
+           not been run yet - the rest of staff management still works. */
+        let posters = [];
+        let postersAvailable = true;
+
+        const posterResult = await supabaseClient
+            .from("announcement_posters")
+            .select("id, staff_user_id")
+            .eq("owner_user_id", currentUserId)
+            .eq("website_id", WEBSITE_ID);
+
+        if (posterResult.error) {
+            console.error("Announcement posters load error:", posterResult.error);
+            postersAvailable = false;
+        } else {
+            posters = posterResult.data || [];
+        }
+
+        staffManagementState = {
+            code: codeResult.data || "",
+            staff: staffResult.data || [],
+            assignments: assignmentResult.data || [],
+            posters: posters,
+            postersAvailable: postersAvailable
+        };
+
+        renderStaffManagement();
+
+    } catch (error) {
+
+        console.error("Staff management load error:", error);
+        setStaffManagementStatus("❌ Could not load staff information: " + (error.message || error));
+
+    }
+
+}
+
+function renderStaffManagement() {
+
+    const state = staffManagementState;
+
+    const codeEl = srgById("schoolJoinCode");
+    if (codeEl) codeEl.textContent = state.code || "…";
+
+    const pendingBox = srgById("pendingStaffList");
+    const approvedBox = srgById("approvedStaffList");
+    const removedBox = srgById("removedStaffList");
+
+    if (!pendingBox || !approvedBox || !removedBox) return;
+
+    const pending = state.staff.filter(function (s) { return s.status === "pending"; });
+    const approved = state.staff.filter(function (s) { return s.status === "approved"; });
+    const removed = state.staff.filter(function (s) { return s.status === "rejected" || s.status === "revoked"; });
+
+    function person(s) {
+        return "<strong>" + escapeHTML(s.full_name || "(no name)") + "</strong><br><small>" +
+               escapeHTML(s.email || "") + "</small>";
+    }
+
+    pendingBox.innerHTML = pending.length
+        ? pending.map(function (s) {
+            return '<div class="srg-staff-card">' + person(s) +
+                '<div class="srg-staff-actions">' +
+                '<button type="button" data-staff-action="approve" data-id="' + s.id + '">Approve</button> ' +
+                '<button type="button" data-staff-action="reject" data-id="' + s.id + '">Reject</button>' +
+                '</div></div>';
+        }).join("")
+        : "<p><em>No requests waiting.</em></p>";
+
+    const classOptions = schoolClasses.map(function (c) {
+        return '<option value="' + escapeHTML(c.class_name) + '">' + escapeHTML(c.class_name) + "</option>";
+    }).join("");
+
+    const subjectDatalist = '<datalist id="srgSubjectOptions">' +
+        schoolSubjects.map(function (s) { return '<option value="' + escapeHTML(s) + '">'; }).join("") +
+        "</datalist>";
+
+    approvedBox.innerHTML = subjectDatalist + (approved.length
+        ? approved.map(function (s) {
+
+            const mine = state.assignments.filter(function (a) { return a.staff_user_id === s.staff_user_id; });
+
+            const list = mine.length
+                ? "<ul>" + mine.map(function (a) {
+                    return "<li>" + (a.subject
+                            ? "Subject teacher: " + escapeHTML(a.subject) + " (" + escapeHTML(a.class_name) + ")"
+                            : "Form master: " + escapeHTML(a.class_name)) +
+                        ' <button type="button" data-staff-action="remove-assignment" data-id="' + a.id +
+                        '" aria-label="Remove">✕</button></li>';
+                }).join("") + "</ul>"
+                : "<p><em>No class or subject assigned yet.</em></p>";
+
+            const canPost = (state.posters || []).some(function (p) { return p.staff_user_id === s.staff_user_id; });
+
+            const posterRow = state.postersAvailable
+                ? '<div class="srg-staff-poster" style="margin:8px 0;">📢 <small>Announcements: ' +
+                  (canPost ? "<strong>allowed to post</strong>" : "cannot post") + "</small> " +
+                  '<button type="button" data-staff-action="' + (canPost ? "poster-off" : "poster-on") +
+                  '" data-id="' + s.id + '" data-staff-user="' + s.staff_user_id + '">' +
+                  (canPost ? "Stop allowing" : "Allow to post") + "</button></div>"
+                : '<div class="srg-staff-poster" style="margin:8px 0;"><small>📢 Announcement permission is not available yet (run announcements.sql in Supabase).</small></div>';
+
+            return '<div class="srg-staff-card">' + person(s) + list +
+                '<div class="srg-staff-add">' +
+                '<select data-field="role"><option value="subject">Subject teacher</option>' +
+                '<option value="form">Form master</option></select> ' +
+                '<select data-field="class">' + (classOptions || '<option value="">(add a class in Step 0)</option>') + "</select> " +
+                '<input type="text" data-field="subject" list="srgSubjectOptions" placeholder="Subject (for subject teachers)"> ' +
+                '<button type="button" data-staff-action="add-assignment" data-id="' + s.id +
+                '" data-staff-user="' + s.staff_user_id + '">Add</button>' +
+                "</div>" + posterRow +
+                '<div class="srg-staff-actions">' +
+                '<button type="button" data-staff-action="revoke" data-id="' + s.id + '">Remove access</button>' +
+                "</div></div>";
+
+        }).join("")
+        : "<p><em>No approved staff yet.</em></p>");
+
+    removedBox.innerHTML = removed.length
+        ? removed.map(function (s) {
+            return '<div class="srg-staff-card">' + person(s) + " <small>(" + escapeHTML(s.status) + ")</small>" +
+                '<div class="srg-staff-actions">' +
+                '<button type="button" data-staff-action="reapprove" data-id="' + s.id + '">Re-approve</button> ' +
+                '<button type="button" data-staff-action="delete-staff" data-id="' + s.id +
+                '" data-staff-user="' + s.staff_user_id + '">Delete permanently</button>' +
+                "</div></div>";
+        }).join("")
+        : "<p><em>None.</em></p>";
+
+}
+
+async function onStaffManagementClick(event) {
+
+    const button = event.target.closest("[data-staff-action]");
+
+    if (!button) return;
+
+    const action = button.getAttribute("data-staff-action");
+    const id = button.getAttribute("data-id");
+
+    try {
+
+        if (action === "copy-code") {
+            const code = staffManagementState.code;
+            if (navigator.clipboard && code) {
+                await navigator.clipboard.writeText(code);
+                setStaffManagementStatus("✅ Code copied.");
+            } else {
+                setStaffManagementStatus("Your school code: " + code);
+            }
+            return;
+        }
+
+        button.disabled = true;
+        setStaffManagementStatus("Working…");
+
+        if (action === "reset-code") {
+
+            if (!confirm("Create a new school code? The old code will stop working for new requests.")) {
+                button.disabled = false;
+                setStaffManagementStatus("");
+                return;
+            }
+
+            const result = await supabaseClient.rpc("reset_school_code", { p_website_id: WEBSITE_ID });
+            if (result.error) throw result.error;
+
+        } else if (action === "approve" || action === "reapprove") {
+
+            const result = await supabaseClient
+                .from("school_staff")
+                .update({ status: "approved", approved_at: new Date().toISOString() })
+                .eq("id", id)
+                .eq("owner_user_id", currentUserId);
+            if (result.error) throw result.error;
+
+        } else if (action === "reject" || action === "revoke") {
+
+            if (action === "revoke" && !confirm("Remove this person's access?")) {
+                button.disabled = false;
+                setStaffManagementStatus("");
+                return;
+            }
+
+            const result = await supabaseClient
+                .from("school_staff")
+                .update({ status: action === "reject" ? "rejected" : "revoked" })
+                .eq("id", id)
+                .eq("owner_user_id", currentUserId);
+            if (result.error) throw result.error;
+
+            if (action === "revoke") {
+                const staffRow = staffManagementState.staff.find(function (x) { return String(x.id) === String(id); });
+                if (staffRow) {
+                    const posterCleanup = await supabaseClient
+                        .from("announcement_posters")
+                        .delete()
+                        .eq("owner_user_id", currentUserId)
+                        .eq("website_id", WEBSITE_ID)
+                        .eq("staff_user_id", staffRow.staff_user_id);
+                    if (posterCleanup.error) console.error("Poster cleanup error:", posterCleanup.error);
+                }
+            }
+
+        } else if (action === "delete-staff") {
+
+            const person = staffManagementState.staff.find(function (s) { return String(s.id) === String(id); });
+            const personName = person ? (person.full_name || person.email || "this person") : "this person";
+
+            if (!confirm(
+                "Permanently delete " + personName + "?\n\n" +
+                "Their staff record and all their class and subject assignments will be removed. " +
+                "To use the site again they would have to request access with the school code and be approved again."
+            )) {
+                button.disabled = false;
+                setStaffManagementStatus("");
+                return;
+            }
+
+            /* Only people who are already removed can be deleted. */
+            const deleted = await supabaseClient
+                .from("school_staff")
+                .delete()
+                .eq("id", id)
+                .eq("owner_user_id", currentUserId)
+                .in("status", ["rejected", "revoked"])
+                .select("id");
+
+            if (deleted.error) throw deleted.error;
+
+            if (!deleted.data || deleted.data.length === 0) {
+                button.disabled = false;
+                setStaffManagementStatus("ℹ️ Only removed or rejected staff can be deleted permanently.");
+                return;
+            }
+
+            const cleanup = await supabaseClient
+                .from("staff_assignments")
+                .delete()
+                .eq("owner_user_id", currentUserId)
+                .eq("website_id", WEBSITE_ID)
+                .eq("staff_user_id", button.getAttribute("data-staff-user"));
+
+            if (cleanup.error) {
+                console.error("Assignment cleanup error:", cleanup.error);
+            }
+
+            const posterCleanup2 = await supabaseClient
+                .from("announcement_posters")
+                .delete()
+                .eq("owner_user_id", currentUserId)
+                .eq("website_id", WEBSITE_ID)
+                .eq("staff_user_id", button.getAttribute("data-staff-user"));
+
+            if (posterCleanup2.error) {
+                console.error("Poster cleanup error:", posterCleanup2.error);
+            }
+
+        } else if (action === "poster-on") {
+
+            const result = await supabaseClient
+                .from("announcement_posters")
+                .insert({
+                    owner_user_id: currentUserId,
+                    website_id: WEBSITE_ID,
+                    staff_user_id: button.getAttribute("data-staff-user")
+                });
+
+            /* 23505 = already allowed: nothing to do */
+            if (result.error && result.error.code !== "23505") throw result.error;
+
+        } else if (action === "poster-off") {
+
+            const result = await supabaseClient
+                .from("announcement_posters")
+                .delete()
+                .eq("owner_user_id", currentUserId)
+                .eq("website_id", WEBSITE_ID)
+                .eq("staff_user_id", button.getAttribute("data-staff-user"));
+            if (result.error) throw result.error;
+
+        } else if (action === "remove-assignment") {
+
+            const result = await supabaseClient
+                .from("staff_assignments")
+                .delete()
+                .eq("id", id)
+                .eq("owner_user_id", currentUserId);
+            if (result.error) throw result.error;
+
+        } else if (action === "add-assignment") {
+
+            const card = button.closest(".srg-staff-card");
+            const role = card.querySelector('[data-field="role"]').value;
+            const className = String(card.querySelector('[data-field="class"]').value || "").trim();
+            const subject = cleanStudentName(card.querySelector('[data-field="subject"]').value);
+
+            if (!className) {
+                button.disabled = false;
+                setStaffManagementStatus("❌ Choose a class first.");
+                return;
+            }
+
+            if (role === "subject" && !subject) {
+                button.disabled = false;
+                setStaffManagementStatus("❌ Enter the subject for a subject teacher.");
+                return;
+            }
+
+            const result = await supabaseClient
+                .from("staff_assignments")
+                .insert({
+                    website_id: WEBSITE_ID,
+                    owner_user_id: currentUserId,
+                    staff_user_id: button.getAttribute("data-staff-user"),
+                    class_name: className,
+                    subject: role === "form" ? null : subject
+                });
+
+            if (result.error) {
+                button.disabled = false;
+                setStaffManagementStatus(
+                    result.error.code === "23505"
+                        ? "ℹ️ That assignment already exists."
+                        : "❌ " + result.error.message
+                );
+                return;
+            }
+
+        }
+
+        await refreshStaffManagement();
+        setStaffManagementStatus("✅ Done.");
+
+    } catch (error) {
+
+        console.error("Staff management action error:", error);
+        button.disabled = false;
+        setStaffManagementStatus("❌ " + (error.message || "Something went wrong."));
+
+    }
+
+}
+
+function attachStaffEvents() {
+
+    const toggle = srgById("staffJoinToggle");
+    const panel = srgById("staffJoinPanel");
+
+    if (toggle && panel) {
+        toggle.addEventListener("click", function (event) {
+            event.preventDefault();
+            panel.style.display = panel.style.display === "none" ? "block" : "none";
+        });
+    }
+
+    const signUp = srgById("staffSignUpButton");
+    const signIn = srgById("staffSignInButton");
+
+    if (signUp) signUp.addEventListener("click", function () { staffJoin("signup"); });
+    if (signIn) signIn.addEventListener("click", function () { staffJoin("signin"); });
+
+    const signOut = srgById("staffStatusSignOut");
+
+    if (signOut) {
+        signOut.addEventListener("click", async function () {
+            if (await smBlockLogoutIfUnsynced()) return;
+            try {
+                await supabaseClient.auth.signOut();
+                localStorage.removeItem(STUDENT_DATA_STORAGE_KEY);
+                localStorage.removeItem(STUDENT_SUBJECTS_STORAGE_KEY);
+                localStorage.removeItem(REPORT_SETTINGS_STORAGE_KEY);
+                localStorage.removeItem(SCHOOL_PROFILE_OWNER_KEY);
+                smClearOfflineUser();
+                await Offline.clearAll();
+            } catch (error) {
+                console.error(error);
+            }
+            resetSchoolProfileState();
+            resetStaffMode();
+            await checkLogin();
+        });
+    }
+
+    const management = srgById("staffManagementSection");
+
+    if (management) management.addEventListener("click", onStaffManagementClick);
+
+}
+
+async function checkLogin() {
+
+    /* A staff join request is in progress: wait for it to finish. */
+    if (staffJoinInProgress) return;
+
+    hideStaffStatus();
+
+    try {
+
+        const offlineUser = smOfflineUser();
+
+        const {
+            data,
+            error
+        } = offlineUser
+            ? { data: { session: { user: offlineUser } }, error: null }
+            : await supabaseClient.auth.getSession();
+
+
+        if (error) {
+
+            console.error(
+                error
+            );
+
+            showLogin();
+
+            return;
+
+        }
+
+
+        if (!data.session) {
+            resetStaffMode();
+            resetSchoolProfileState();
+            currentSubscriptionPlan =
+                "";
+
+            reportsGenerated =
+                0;
+
+            currentUserId =
+                null;
+
+            schoolClasses =
+                [];
+
+            renderClassList();
+
+            populateClassNameSelect();
+
+            showLogin();
+
+            return;
+
+        }
+
+
+        const user =
+            data.session.user;
+
+        if (!offlineUser) smSaveOfflineUser(user);
+
+
+        /* Is this login an approved staff member (or waiting to be approved)? */
+        const membership = await loadStaffMembership(user);
+
+        if (membership.state === "approved") {
+            await enterStaffMode(user, membership);
+            return;
+        }
+
+        if (membership.state === "pending") {
+            resetStaffMode();
+            showStaffStatus(
+                "Waiting for approval",
+                "Your request to join the school has been sent. You can use the site as soon as the school owner approves you. Please check again later."
+            );
+            return;
+        }
+
+        if (membership.state === "blocked") {
+            resetStaffMode();
+            showStaffStatus(
+                "Access not available",
+                "Your access to this school is not active. Please contact the school owner."
+            );
+            return;
+        }
+
+        /* Normal school owner. */
+        resetStaffMode();
+
+        currentUserId =
+            user.id;
+        await fetchSchoolClasses();
+        await checkSubscription(
+            user
+        );
+
+        loadSchoolProfile(user.id);
+
+        refreshStaffManagement();
+
+
+    } catch (error) {
+
+        console.error(
+            error
+        );
+
+        showLogin();
+
+    }
+
+}
+
+
+/* =========================================================
+   CHECK SUBSCRIPTION
+   ========================================================= */
+
+async function checkSubscription(user) {
+
+    try {
+        console.log("Checking subscription:", {
+            user_id: user.id,
+            website_id: WEBSITE_ID
+        });
+
+        let { data: subscription, error } = await supabaseClient
+            .from("subscriptions")
+            .select("*")
+            .eq("user_id", user.id)
+            .eq("website_id", WEBSITE_ID)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+        /* Offline (or server unreachable): use the copy saved on this phone. */
+        if (error || (!subscription && smIsOffline())) {
+            const cachedSub = smReadJson(SM_SUB_KEY);
+            if (cachedSub && cachedSub.userId === user.id && cachedSub.subscription) {
+                subscription = cachedSub.subscription;
+                error = null;
+            }
+        } else if (subscription) {
+            localStorage.setItem(SM_SUB_KEY, JSON.stringify({ userId: user.id, subscription: subscription }));
+        }
+
+
+        if (error) {
+            console.error("Subscription database error:", error);
+            currentSubscriptionPlan = "";
+            reportsGenerated = 0;
+            currentSubscription = null;
+            clearFreeTrialExpiryTimer();
+            displaySubscriptionStatus(null, user);
+            showSubscription();
+            return;
+        }
+
+        currentSubscriptionPlan = "";
+        reportsGenerated = 0;
+        currentSubscription = null;
+        clearFreeTrialExpiryTimer();
+
+        if (!subscription) {
+            console.log("No subscription found for website:", WEBSITE_ID);
+            displaySubscriptionStatus(null, user);
+            showSubscription();
+            return;
+        }
+
+        currentSubscription = subscription;
+        currentSubscriptionPlan = String(
+            subscription.plan || subscription.subscription_plan || subscription.package || ""
+        ).trim().toLowerCase();
+        reportsGenerated = Number(subscription.reports_generated) || 0;
+
+        const subscriptionStatusValue = String(subscription.status || "").trim().toLowerCase();
+        const expiryDate = subscription.expires_at ? new Date(subscription.expires_at) : null;
+        const subscriptionIsActive = !!(
+            expiryDate && !isNaN(expiryDate.getTime()) && expiryDate > new Date()
+        );
+
+        /* FREE TRIAL ACCESS */
+        const trialIsActive =
+            currentSubscriptionPlan === FREE_TRIAL_PLAN &&
+            subscriptionStatusValue === FREE_TRIAL_STATUS &&
+            subscriptionIsActive;
+
+        if (trialIsActive) {
+            startFreeTrialExpiryTimer(subscription);
+            displaySubscriptionStatus(subscription, user);
+            showApp();
+            updateReportStatus();
+            return;
+        }
+
+        const validPaidStatuses = [
+            "paid", "active", "success", "successful", "completed"
+        ];
+        const paymentStatusIsValid = validPaidStatuses.includes(subscriptionStatusValue);
+
+        displaySubscriptionStatus(subscription, user);
+
+        if (
+            paymentStatusIsValid &&
+            subscriptionIsActive &&
+            currentSubscriptionPlan &&
+            REPORT_LIMITS[currentSubscriptionPlan]
+        ) {
+            console.log("ACTIVE SUBSCRIPTION:", {
+                website_id: WEBSITE_ID,
+                plan: currentSubscriptionPlan,
+                status: subscriptionStatusValue,
+                expires_at: subscription.expires_at
+            });
+            showApp();
+            updateReportStatus();
+            return;
+        }
+
+        console.log("Subscription is not active:", {
+            website_id: WEBSITE_ID,
+            status: subscriptionStatusValue,
+            plan: currentSubscriptionPlan,
+            expires_at: subscription.expires_at,
+            paymentStatusIsValid,
+            subscriptionIsActive,
+            planExists: !!REPORT_LIMITS[currentSubscriptionPlan]
+        });
+        showSubscription();
+
+    } catch (error) {
+        console.error("Subscription check failed:", error);
+        currentSubscriptionPlan = "";
+        reportsGenerated = 0;
+        currentSubscription = null;
+        clearFreeTrialExpiryTimer();
+        showSubscription();
+    }
+}
+
+/* =========================================================
+   AUTH STATE
+   ========================================================= */
+
+supabaseClient.auth.onAuthStateChange(
+    function (event, session) {
+
+        /* Token refreshes and tab-focus sign-ins for the user already
+           loaded do not need a full reload. */
+        if (event === "TOKEN_REFRESHED" || event === "INITIAL_SESSION") {
+            return;
+        }
+
+        if (
+            event === "SIGNED_IN" &&
+            session && session.user &&
+            session.user.id === (staffContext ? staffContext.userId : currentUserId)
+        ) {
+            return;
+        }
+
+        setTimeout(
+            function () {
+
+                checkLogin();
+
+            },
+            0
+        );
+
+    }
+);
+
+
+/* =========================================================
+   PASSWORD RECOVERY
+   ========================================================= */
+
+supabaseClient.auth.onAuthStateChange(
+    function (event) {
+
+        if (
+            event ===
+            "PASSWORD_RECOVERY"
+        ) {
+
+            const resetSection =
+                document.getElementById(
+                    "resetPasswordSection"
+                );
+
+
+            if (resetSection) {
+
+                resetSection.style.display =
+                    "block";
+
+            }
+
+        }
+
+    }
+);
+
+
+/* =========================================================
+   DISPLAY SUBSCRIPTION
+   ========================================================= */
+
+function displaySubscriptionStatus(
+    subscription,
+    user
+) {
+
+    if (
+        !elementExists(
+            subscriptionStatus
+        )
+    ) {
+
+        return;
+
+    }
+
+
+    subscriptionStatus.style.display =
+        "block";
+
+
+    /* =================================================
+       REMOVE OLD RENEW BUTTON
+    ================================================= */
+
+    const oldRenewButton =
+        document.getElementById(
+            "renewUpgradeButton"
+        );
+
+
+    if (oldRenewButton) {
+
+        oldRenewButton.remove();
+
+    }
+
+
+    /* =================================================
+       NO SUBSCRIPTION
+    ================================================= */
+
+    if (!subscription) {
+
+        subscriptionStatus.innerHTML = `
+
+            <strong>
+                Subscription Status:
+            </strong>
+
+            <span style="color:red;">
+                UNPAID
+            </span>
+
+            <br>
+
+            Account:
+            ${escapeHTML(
+                user?.email || ""
+            )}
+
+            <br><br>
+
+            Please choose a subscription plan
+            to access the Student Report Generator.
+
+        `;
+
+        return;
+
+    }
+
+
+    /* =================================================
+       PLAN
+    ================================================= */
+
+    const plan =
+        String(
+
+            subscription.plan ||
+
+            subscription.subscription_plan ||
+
+            subscription.package ||
+
+            ""
+
+        )
+            .trim()
+            .toLowerCase();
+
+
+    /* =================================================
+       STATUS
+    ================================================= */
+
+    const status =
+        String(
+            subscription.status ||
+            ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    /* =================================================
+       EXPIRY
+    ================================================= */
+
+    let expiryDate =
+        null;
+
+    let expiryText =
+        "Unknown";
+
+
+    if (
+        subscription.expires_at
+    ) {
+
+        expiryDate =
+            new Date(
+                subscription.expires_at
+            );
+
+
+        if (
+            !isNaN(
+                expiryDate.getTime()
+            )
+        ) {
+
+            expiryText =
+                expiryDate.toLocaleDateString();
+
+        }
+
+    }
+
+
+    /* =================================================
+       ACTIVE STATUS
+    ================================================= */
+
+    const validPaidStatuses = [
+
+        "paid",
+        "active",
+        "success",
+        "successful",
+        "completed"
+
+    ];
+
+
+    const statusIsPaid =
+        validPaidStatuses.includes(
+            status
+        );
+
+
+    const isExpired =
+        !expiryDate ||
+        isNaN(
+            expiryDate.getTime()
+        ) ||
+        expiryDate <= new Date();
+
+
+    const isActive =
+        statusIsPaid &&
+        !isExpired;
+
+
+    /* =================================================
+       REPORT LIMIT
+    ================================================= */
+
+    const limit =
+        REPORT_LIMITS[plan] ||
+        0;
+
+
+    const generated =
+        Number(
+            subscription.reports_generated
+        ) || 0;
+
+
+    /* =================================================
+       CARRY-OVER REPORTS
+    ================================================= */
+
+    const carriedOver =
+        Number(
+            subscription.carried_over_reports
+        ) || 0;
+
+
+    /* =================================================
+       TOTAL AVAILABLE REPORTS
+    ================================================= */
+
+    const totalAvailable =
+        limit +
+        carriedOver;
+
+
+    /* =================================================
+       REPORTS REMAINING
+    ================================================= */
+
+    const remaining =
+        Math.max(
+            totalAvailable -
+            generated,
+            0
+        );
+
+
+    /* =================================================
+       FREE TRIAL
+    ================================================= */
+    const trialIsActive =
+        plan === FREE_TRIAL_PLAN &&
+        status === FREE_TRIAL_STATUS &&
+        !isExpired;
+
+    if (trialIsActive) {
+        subscriptionStatus.innerHTML = `
+            <strong>Subscription Status:</strong>
+            <span style="color:green;"> FREE TRIAL / ACTIVE</span>
+            <br>
+            <strong>Plan:</strong> FREE 7-DAY TRIAL
+            <br>
+            <strong>Account:</strong> ${escapeHTML(user?.email || subscription.email_address || "")}
+            <br>
+            <strong>Expires:</strong> ${escapeHTML(expiryText)}
+            <br>
+            <strong>Reports Generated:</strong> ${generated} / ${FREE_TRIAL_REPORTS}
+            <br>
+            <strong>Trial Reports Remaining:</strong> ${remaining}
+            <br><br>
+            🎁 You have ${FREE_TRIAL_REPORTS} free reports for 7 days.
+        `;
+        return;
+    }
+
+
+    /* =================================================
+       ACTIVE SUBSCRIPTION
+    ================================================= */
+
+    if (isActive) {
+
+        subscriptionStatus.innerHTML = `
+
+            <strong>
+                Subscription Status:
+            </strong>
+
+            <span style="color:green;">
+                PAID / ACTIVE
+            </span>
+
+            <br>
+
+            <strong>
+                Plan:
+            </strong>
+
+            ${escapeHTML(
+                getPlanDisplayNameFromPlan(
+                    plan
+                )
+            )}
+
+            <br>
+
+            <strong>
+                Account:
+            </strong>
+
+            ${escapeHTML(
+                user?.email || ""
+            )}
+
+            <br>
+
+            <strong>
+                Expires:
+            </strong>
+
+            ${escapeHTML(
+                expiryText
+            )}
+
+            ${
+                limit
+                    ? `
+
+                        <br>
+
+                        <strong>
+                            Reports Generated:
+                        </strong>
+
+                        ${generated}
+
+                        /
+
+                        ${formatReportCount(totalAvailable)}
+
+                        <br>
+
+                        <strong>
+                            New Plan Reports:
+                        </strong>
+
+                        ${formatReportCount(limit)}
+
+                        <br>
+
+                        <strong>
+                            Carried-over Reports:
+                        </strong>
+
+                        ${carriedOver}
+
+                        <br>
+
+                        <strong>
+                            Reports Remaining:
+                        </strong>
+
+                        ${formatReportCount(remaining)}
+
+                    `
+                    : ""
+            }
+
+        `;
+
+
+        /* =================================================
+           ADD RENEW / UPGRADE BUTTON
+        ================================================= */
+
+        
+
+
+        return;
+
+    }
+
+
+    /* =================================================
+       EXPIRED FREE TRIAL
+    ================================================= */
+    if (
+        plan === FREE_TRIAL_PLAN &&
+        status === FREE_TRIAL_STATUS &&
+        isExpired
+    ) {
+        subscriptionStatus.innerHTML = `
+            <strong>Subscription Status:</strong>
+            <span style="color:red;"> FREE TRIAL EXPIRED</span>
+            <br>
+            <strong>Account:</strong> ${escapeHTML(user?.email || subscription.email_address || "")}
+            <br>
+            <strong>Trial Reports Used:</strong> ${generated} / ${FREE_TRIAL_REPORTS}
+            <br>
+            <strong>Expired:</strong> ${escapeHTML(expiryText)}
+            <br><br>
+            Your free trial has ended. Please choose a paid subscription plan to continue.
+        `;
+        return;
+    }
+
+
+    /* =================================================
+       EXPIRED
+    ================================================= */
+
+    if (
+        statusIsPaid &&
+        isExpired
+    ) {
+
+        subscriptionStatus.innerHTML = `
+
+            <strong>
+                Subscription Status:
+            </strong>
+
+            <span style="color:red;">
+                EXPIRED
+            </span>
+
+            <br>
+
+            <strong>
+                Plan:
+            </strong>
+
+            ${escapeHTML(
+                getPlanDisplayNameFromPlan(
+                    plan
+                )
+            )}
+
+            <br>
+
+            <strong>
+                Expired:
+            </strong>
+
+            ${escapeHTML(
+                expiryText
+            )}
+
+            <br><br>
+
+            Please renew your subscription
+            to continue using the system.
+
+        `;
+
+    
+
+    return;
+
+    }
+
+
+    /* =================================================
+       UNPAID / INVALID
+    ================================================= */
+
+    subscriptionStatus.innerHTML = `
+
+        <strong>
+            Subscription Status:
+        </strong>
+
+        <span style="color:red;">
+            UNPAID
+        </span>
+
+        <br>
+
+        Account:
+        ${escapeHTML(
+            user?.email || ""
+        )}
+
+        <br><br>
+
+        Please choose a subscription plan.
+
+    `;
+
+}
+
+
+
+/* =========================================================
+   GET PLAN DISPLAY NAME
+   ========================================================= */
+
+function getPlanDisplayNameFromPlan(
+    plan
+) {
+
+    const cleanPlan =
+        String(
+            plan || ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    if (
+        cleanPlan ===
+        "basic"
+    ) {
+
+        return "BASIC";
+
+    }
+
+
+    if (
+        cleanPlan ===
+        "standard"
+    ) {
+
+        return "STANDARD";
+
+    }
+
+
+    if (
+        cleanPlan ===
+        "premium"
+    ) {
+
+        return "PREMIUM";
+
+    }
+
+
+    if (
+        cleanPlan ===
+        "unlimited"
+    ) {
+
+        return "UNLIMITED";
+
+    }
+
+
+    if (cleanPlan === FREE_TRIAL_PLAN) {
+        return "FREE 7-DAY TRIAL";
+    }
+
+
+    return "UNKNOWN";
+
+}
+
+
+/* =========================================================
+   SCHOOL INFORMATION
+   ========================================================= */
+
+function loadSchoolInformation() {
+
+    if (
+        schoolNameInput
+    ) {
+
+        schoolNameInput.value =
+            reportSettings.schoolName ||
+            "";
+
+    }
+
+
+    if (
+        schoolAddressInput
+    ) {
+
+        schoolAddressInput.value =
+            reportSettings.schoolAddress ||
+            "";
+
+    }
+
+
+    displaySchoolLogoPreview();
+
+    renderReportOutlookPicker();
+
+    fillMarkingSettingsForm();
+
+    renderNextTermBlock();
+
+}
+
+
+/* =========================================================
+   SAVE SCHOOL INFORMATION
+   ========================================================= */
+
+function saveSchoolInformation() {
+
+    /* Marking & Grading: stop here when the form has a problem. */
+    if (!applyMarkingSettingsFromForm()) return;
+
+    /* Next term fees & resumption date: stop here when the form has a problem. */
+    if (!applyNextTermFromForm()) return;
+
+    const schoolName =
+        schoolNameInput
+            ? schoolNameInput.value.trim()
+            : "";
+
+    const schoolAddress =
+        schoolAddressInput
+            ? schoolAddressInput.value.trim()
+            : "";
+
+
+    reportSettings.schoolName =
+        schoolName ||
+        "YOUR SCHOOL NAME";
+
+
+    reportSettings.schoolAddress =
+        schoolAddress ||
+        "YOUR SCHOOL ADDRESS";
+
+
+    saveAppData();
+
+
+    if (
+        schoolInformationStatus
+    ) {
+
+        schoolInformationStatus.textContent =
+            "✓ School information saved successfully.";
+
+    }
+
+
+    setTimeout(
+        function () {
+
+            if (
+                schoolInformationStatus
+            ) {
+
+                schoolInformationStatus.textContent =
+                    "";
+
+            }
+
+        },
+        3000
+    );
+
+}
+
+
+
+/* =========================================================
+   REPORT OUTLOOK (TEMPLATES)
+
+   Classic is the original layout. The others are skins of the
+   same report markup (see "REPORT OUTLOOKS" in style.css).
+   The choice is saved inside reportSettings.reportTemplate, so it
+   is stored with the rest of the school profile and follows the
+   school to every device and staff login.
+   ========================================================= */
+
+const REPORT_TEMPLATES = [
+    {
+        id: "classic",
+        name: "Classic",
+        desc: "Your current navy and teal layout.",
+        swatches: ["#17324d", "#1f6f68", "#b28a3b"]
+    },
+    {
+        id: "modern",
+        name: "Modern",
+        desc: "Colour header band, rounded cards, clean headings.",
+        swatches: ["#17324d", "#1f6f68", "#e9f5f3"]
+    },
+    {
+        id: "elegant",
+        name: "Elegant",
+        desc: "Certificate style: centred crest, gold frame, ornamental dividers, ruled comment lines.",
+        swatches: ["#6b1e2e", "#b28a3b", "#fbf6ea"]
+    },
+    {
+        id: "minimal",
+        name: "Minimal",
+        desc: "Editorial layout: left-aligned header, big light numerals, hairline tables. Black and white, saves ink.",
+        swatches: ["#000000", "#999999", "#ffffff"]
+    }
+];
+
+function getReportTemplateId() {
+
+    const id = reportSettings && reportSettings.reportTemplate;
+
+    return REPORT_TEMPLATES.some(function (t) { return t.id === id; })
+        ? id
+        : "classic";
+
+}
+
+function renderReportOutlookPicker() {
+
+    const holder = document.getElementById("reportOutlookPicker");
+
+    if (!holder) return;
+
+    const current = getReportTemplateId();
+
+    holder.innerHTML =
+        '<div class="outlook-grid">' +
+        REPORT_TEMPLATES.map(function (t) {
+            return (
+                '<label class="outlook-card' + (t.id === current ? " selected" : "") + '">' +
+                    '<input type="radio" name="reportOutlook" value="' + t.id + '"' +
+                        (t.id === current ? " checked" : "") + '>' +
+                    '<strong>' + t.name + '</strong>' +
+                    '<small>' + t.desc + '</small>' +
+                    '<span class="outlook-swatches">' +
+                        t.swatches.map(function (c) {
+                            return '<i style="background:' + c + ';"></i>';
+                        }).join("") +
+                    '</span>' +
+                '</label>'
+            );
+        }).join("") +
+        '</div>';
+
+    holder.querySelectorAll('input[name="reportOutlook"]').forEach(function (input) {
+        input.addEventListener("change", function () {
+            selectReportTemplate(input.value);
+        });
+    });
+
+    renderReportOutlookPreview();
+
+}
+
+function selectReportTemplate(id) {
+
+    if (!REPORT_TEMPLATES.some(function (t) { return t.id === id; })) return;
+
+    /* Only the school owner can change the outlook (staff logins use it). */
+    if (typeof staffContext !== "undefined" && staffContext) {
+
+        renderReportOutlookPicker();
+
+        const note = document.getElementById("reportOutlookStatus");
+
+        if (note) note.textContent = "Only the school owner can change the report outlook.";
+
+        return;
+
+    }
+
+    reportSettings.reportTemplate = id;
+
+    saveAppData();
+
+    document.querySelectorAll("#reportOutlookPicker .outlook-card").forEach(function (card) {
+        const input = card.querySelector("input");
+        card.classList.toggle("selected", !!input && input.value === id);
+    });
+
+    renderReportOutlookPreview();
+
+    const status = document.getElementById("reportOutlookStatus");
+
+    if (status) {
+        status.textContent =
+            "✓ Outlook saved. Reports you generate from now on will use it. " +
+            "To change reports already generated, generate them again.";
+    }
+
+}
+
+function buildSampleStudentForPreview() {
+
+    const names = (Array.isArray(schoolSubjects) && schoolSubjects.length
+        ? schoolSubjects
+        : ["English Language", "Mathematics", "Basic Science", "Social Studies", "Civic Education"]
+    ).slice(0, 8);
+
+    const sample = {
+        "Student Name": "SAMPLE STUDENT",
+        "Admission No": "0001",
+        "Gender": "Female",
+        "Class": "JSS 1",
+        "Term": "First Term",
+        "Session": "2025/2026",
+        "House": "Blue",
+        "Position": 3
+    };
+
+    const firstCAMax = Number(reportSettings.firstCAMaximum) || 20;
+    const secondCAMax = Number(reportSettings.secondCAMaximum) || 20;
+    const examsMax = Number(reportSettings.examsMaximum) || 60;
+
+    names.forEach(function (name, i) {
+        sample[name + " 1st CA"] = Math.round(firstCAMax * (0.65 + (i % 4) * 0.08));
+        sample[name + " 2nd CA"] = Math.round(secondCAMax * (0.6 + (i % 3) * 0.1));
+        sample[name + " Exams"] = Math.round(examsMax * (0.55 + (i % 5) * 0.07));
+
+        getExtraAssessments().forEach(function (item, extraIndex) {
+            sample[name + " " + item.name] =
+                Math.round(item.max * (0.6 + ((i + extraIndex) % 4) * 0.08));
+        });
+    });
+
+    const behavior = {
+        "Class Teacher's Comment": "A hardworking and well-behaved student. Keep it up.",
+        "Principal's Comment": "An impressive result. Maintain the good work."
+    };
+
+    (Array.isArray(behavioralTraits) ? behavioralTraits : []).forEach(function (trait, i) {
+        behavior[trait] = 4 + (i % 2);
+    });
+
+    sample.__behavior = behavior;
+
+    return sample;
+
+}
+
+let outlookPreviewTimer = null;
+
+function renderReportOutlookPreview() {
+
+    const box = document.getElementById("reportOutlookPreview");
+
+    if (!box) return;
+
+    clearTimeout(outlookPreviewTimer);
+
+    outlookPreviewTimer = setTimeout(function () {
+
+        let reportHtml = "";
+
+        try {
+            reportHtml = createReport(buildSampleStudentForPreview());
+        } catch (error) {
+            console.error("Outlook preview error:", error);
+            box.innerHTML = '<p style="padding:12px;">Preview is not available right now.</p>';
+            return;
+        }
+
+        /* The preview lives in an iframe so it gets a real A4-width viewport
+           (phone media queries do not squeeze it) and uses the page's own CSS. */
+        const styles = Array.from(
+            document.querySelectorAll('style, link[rel="stylesheet"]')
+        ).map(function (el) { return el.outerHTML; }).join("");
+
+        const doc =
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" +
+            "<base href=\"" + document.baseURI + "\">" + styles +
+            "<style>html,body{margin:0;padding:0;background:#fff;}" +
+            ".report{margin:0 !important;box-shadow:none !important;}</style>" +
+            "</head><body>" + reportHtml + "</body></html>";
+
+        let frame = box.querySelector("iframe");
+
+        if (!frame) {
+            box.innerHTML = "";
+            frame = document.createElement("iframe");
+            frame.setAttribute("title", "Report outlook preview");
+            frame.setAttribute("scrolling", "no");
+            box.appendChild(frame);
+        }
+
+        frame.style.height = "1123px";
+        frame.srcdoc = doc;
+
+        const fit = function () {
+            const scale = Math.min(1, box.clientWidth / 794);
+            frame.style.transform = "scale(" + scale + ")";
+            box.style.height = Math.round(1123 * scale) + "px";
+        };
+
+        fit();
+
+        frame.onload = fit;
+
+    }, 120);
+
+}
+
+window.addEventListener("resize", function () {
+
+    const box = document.getElementById("reportOutlookPreview");
+    const frame = box && box.querySelector("iframe");
+
+    if (!frame) return;
+
+    const scale = Math.min(1, box.clientWidth / 794);
+    frame.style.transform = "scale(" + scale + ")";
+    box.style.height = Math.round(1123 * scale) + "px";
+
+});
+
+/* =========================================================
+   SCHOOL LOGO UPLOAD
+   ========================================================= */
+
+function handleSchoolLogoUpload(event) {
+
+    const file =
+        event.target.files &&
+        event.target.files[0];
+
+
+    if (!file) {
+
+        return;
+
+    }
+
+
+    const allowedTypes = [
+
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/webp"
+
+    ];
+
+
+    if (
+        !allowedTypes.includes(
+            file.type
+        )
+    ) {
+
+        alert(
+            "Please select a PNG, JPG or WEBP image."
+        );
+
+        event.target.value =
+            "";
+
+        return;
+
+    }
+
+
+    if (
+        file.size >
+        2 * 1024 * 1024
+    ) {
+
+        alert(
+            "Please choose a logo smaller than 2 MB."
+        );
+
+        event.target.value =
+            "";
+
+        return;
+
+    }
+
+
+    if (schoolInformationStatus) {
+        schoolInformationStatus.textContent = "Uploading logo...";
+    }
+
+    uploadSchoolLogoToStorage(file)
+        .then(function (url) {
+
+            reportSettings.schoolLogo = url;
+
+            saveAppData();
+
+            displaySchoolLogoPreview();
+
+            if (schoolInformationStatus) {
+                schoolInformationStatus.textContent = "✓ School logo uploaded.";
+            }
+
+        })
+        .catch(function (error) {
+
+            console.error("School logo upload error:", error);
+
+            if (schoolInformationStatus) {
+                schoolInformationStatus.textContent = "";
+            }
+
+            alert("Unable to upload the school logo. Check your internet connection and try again.");
+
+        });
+
+}
+
+
+/* =========================================================
+   DISPLAY SCHOOL LOGO PREVIEW
+   ========================================================= */
+
+function displaySchoolLogoPreview() {
+
+    if (
+        !schoolLogoPreview
+    ) {
+
+        return;
+
+    }
+
+
+    if (
+        !reportSettings.schoolLogo
+    ) {
+
+        schoolLogoPreview.innerHTML =
+            "";
+
+
+        if (
+            removeSchoolLogoButton
+        ) {
+
+            removeSchoolLogoButton.style.display =
+                "none";
+
+        }
+
+        return;
+
+    }
+
+
+    schoolLogoPreview.innerHTML = `
+
+        <div
+            style="
+                display:flex;
+                flex-direction:column;
+                align-items:flex-start;
+                gap:8px;
+            "
+        >
+
+            <strong>
+                Current Logo:
+            </strong>
+
+            <img
+                src="${reportSettings.schoolLogo}"
+                alt="School Logo"
+                style="
+                    width:120px;
+                    height:120px;
+                    object-fit:contain;
+                    border:1px solid #ccc;
+                    padding:5px;
+                    background:#fff;
+                    border-radius:6px;
+                "
+            >
+
+        </div>
+
+    `;
+
+
+    if (
+        removeSchoolLogoButton
+    ) {
+
+        removeSchoolLogoButton.style.display =
+            "inline-block";
+
+    }
+
+}
+
+
+/* =========================================================
+   REMOVE SCHOOL LOGO
+   ========================================================= */
+
+function removeSchoolLogo() {
+
+    reportSettings.schoolLogo =
+        "";
+
+
+    saveAppData();
+
+
+    if (
+        schoolLogoInput
+    ) {
+
+        schoolLogoInput.value =
+            "";
+
+    }
+
+
+    displaySchoolLogoPreview();
+
+
+    if (
+        schoolInformationStatus
+    ) {
+
+        schoolInformationStatus.textContent =
+            "School logo removed.";
+
+    }
+
+}
+
+
+/* =========================================================
+   APPLICATION EVENTS
+   ========================================================= */
+
+function attachApplicationEvents() {
+
+
+    if (
+        elementExists(
+            downloadTemplateButton
+        )
+    ) {
+
+        downloadTemplateButton.addEventListener(
+            "click",
+            downloadExcelTemplate
+        );
+
+    }
+
+
+    if (
+        elementExists(
+            excelFileInput
+        )
+    ) {
+
+        excelFileInput.addEventListener(
+            "change",
+            handleExcelUpload
+        );
+
+    }
+
+
+    if (
+        elementExists(
+            downloadSubjectTemplateButton
+        )
+    ) {
+
+        downloadSubjectTemplateButton.addEventListener(
+            "click",
+            downloadSubjectTemplate
+        );
+
+    }
+
+
+    if (
+        elementExists(
+            subjectTemplateFileInput
+        )
+    ) {
+
+        subjectTemplateFileInput.addEventListener(
+            "change",
+            handleSubjectTemplateUpload
+        );
+
+    }
+
+
+    if (
+        elementExists(
+            addClassButton
+        )
+    ) {
+
+        addClassButton.addEventListener(
+            "click",
+            async function () {
+
+                const name =
+                    elementExists(newClassNameInput)
+                        ? newClassNameInput.value
+                        : "";
+
+                const levelSelect =
+                    document.getElementById("newClassLevelSelect");
+
+                const level = levelSelect ? levelSelect.value : "";
+
+                if (levelSelect && name.trim() && !level) {
+                    alert("Please select the class level (Pre Basic, Basic or Post Basic).");
+                    return;
+                }
+
+                const added = await addSchoolClass(name, level);
+
+                if (added && elementExists(newClassNameInput)) {
+                    newClassNameInput.value = "";
+                    if (levelSelect) levelSelect.value = "";
+                }
+
+            }
+        );
+
+    }
+
+
+    if (
+        elementExists(
+            classListContainer
+        )
+    ) {
+
+        classListContainer.addEventListener(
+            "change",
+            function (event) {
+
+                const select = event.target.closest(
+                    "[data-class-level-for]"
+                );
+
+                if (!select) return;
+
+                const className = select.getAttribute("data-class-level-for");
+
+                setClassLevel(className, select.value);
+                saveAppData();
+
+                if (elementExists(classManagerStatus)) {
+                    classManagerStatus.textContent = select.value
+                        ? "✅ \"" + className + "\" is now " + select.value + "."
+                        : "Level cleared for \"" + className + "\" - it will use every subject.";
+                }
+
+                /* Refresh the class dropdown labels and the subject list. */
+                populateClassNameSelect();
+
+            }
+        );
+
+        classListContainer.addEventListener(
+            "click",
+            function (event) {
+
+                const button = event.target.closest(
+                    "[data-remove-class-id]"
+                );
+
+                if (!button) return;
+
+                deleteSchoolClass(
+                    button.getAttribute("data-remove-class-id"),
+                    button.getAttribute("data-remove-class-name")
+                );
+
+            }
+        );
+
+    }
+
+
+    /* =====================================================
+       GENERATE SINGLE / GENERATE ALL BUTTONS
+
+       Use delegated click handling so each button still works if
+       the application UI recreates or inserts it after startup.
+       Disable the button while the async call is in flight so a
+       double-click can't fire two overlapping requests, and catch
+       any error so a bad row (or any other unexpected failure)
+       shows the user an alert instead of failing silently with
+       nothing more than a console error.
+       ===================================================== */
+
+    function wireGenerateButton(elementId, handler, errorTitle) {
+
+        document.addEventListener(
+            "click",
+            function (event) {
+
+                const target =
+                    event.target &&
+                    event.target.closest
+                        ? event.target.closest("#" + elementId)
+                        : null;
+
+                if (!target) return;
+
+                event.preventDefault();
+                event.stopPropagation();
+
+                if (target.disabled) return;
+
+                target.disabled = true;
+
+                Promise.resolve(handler())
+                    .catch(function (error) {
+
+                        console.error(
+                            errorTitle + ":",
+                            error
+                        );
+
+                        alert(
+                            "❌ " + errorTitle + " could not be completed.\n\n" +
+                            (error && error.message
+                                ? error.message
+                                : String(error))
+                        );
+                    })
+                    .finally(function () {
+                        target.disabled = false;
+                    });
+            },
+            true
+        );
+    }
+
+    if (elementExists(generateReportButton)) {
+        wireGenerateButton(
+            "generateReport",
+            generateSingleReport,
+            "Generate Report"
+        );
+    }
+
+    if (elementExists(generateAllButton)) {
+        wireGenerateButton(
+            "generateAll",
+            generateAllReports,
+            "Generate All"
+        );
+    }
+
+    if (elementExists(generateMasterSheetButton)) {
+        wireGenerateButton(
+            "generateMasterSheet",
+            generateMasterSheet,
+            "Generate Master Sheet"
+        );
+    }
+
+    if (elementExists(publishSingleResultButton)) {
+        wireGenerateButton(
+            "publishSingleResult",
+            publishSelectedResult,
+            "Publish Result"
+        );
+    }
+
+    if (elementExists(publishAllResultsButton)) {
+        wireGenerateButton(
+            "publishAllResults",
+            publishAllResults,
+            "Publish All Results"
+        );
+    }
+  const backToAppButton = document.getElementById("backToAppButton");
+
+if (backToAppButton) {
+    backToAppButton.addEventListener("click", () => {
+        document.getElementById("subscriptionPlans").style.display = "none";
+        document.getElementById("appSection").style.display = "block";
+    });
+}
+
+
+    /* =====================================================
+       SCHOOL INFORMATION EVENTS
+       ===================================================== */
+
+    if (
+        elementExists(
+            saveSchoolInformationButton
+        )
+    ) {
+
+        saveSchoolInformationButton.addEventListener(
+            "click",
+            saveSchoolInformation
+        );
+
+    }
+
+
+    if (
+        elementExists(
+            schoolLogoInput
+        )
+    ) {
+
+        schoolLogoInput.addEventListener(
+            "change",
+            handleSchoolLogoUpload
+        );
+
+    }
+
+
+    if (
+        elementExists(
+            removeSchoolLogoButton
+        )
+    ) {
+
+        removeSchoolLogoButton.addEventListener(
+            "click",
+            removeSchoolLogo
+        );
+
+    }
+
+
+    attachPaystackButtons();
+
+}
+
+
+/* =========================================================
+   SUBJECT MANAGER
+   ========================================================= */
+
+function createSubjectManager() {
+
+    if (
+        !elementExists(
+            appSection
+        )
+    ) {
+
+        return;
+
+    }
+
+
+    const existing =
+        document.getElementById(
+            "subjectManager"
+        );
+
+
+    if (existing) {
+
+        return;
+
+    }
+
+
+    const manager =
+        document.createElement(
+            "section"
+        );
+
+
+    manager.id =
+        "subjectManager";
+
+
+    manager.className =
+        "card";
+
+
+    manager.innerHTML = `
+
+        <h2>
+            School Subjects
+        </h2>
+
+        <p>
+            Pick a level (Pre Basic, Basic or Post Basic), then add the
+            subjects taught at that level. Each class uses the subjects of
+            its own level, which you choose in Manage Classes. A subject
+            taught at more than one level can be added to each of them, and
+            renaming it renames it in every level.
+        </p>
+
+        <div id="subjectList"></div>
+
+        <div style="margin-top:10px; display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+
+            <select id="newSubjectLevelSelect">
+                ${SUBJECT_LEVELS.map(function (level) {
+                    return '<option value="' + level + '">' + level + '</option>';
+                }).join("")}
+            </select>
+
+            <input
+                type="text"
+                id="newSubjectInput"
+                placeholder="Enter subject name"
+            >
+
+            <button
+                type="button"
+                id="addSubjectButton"
+            >
+                Add Subject
+            </button>
+
+        </div>
+
+    `;
+
+
+    const firstCard =
+        appSection.querySelector(
+            ".card"
+        );
+
+
+    if (firstCard) {
+
+        firstCard.parentNode.insertBefore(
+            manager,
+            firstCard
+        );
+
+    } else {
+
+        appSection.prepend(
+            manager
+        );
+
+    }
+
+
+    renderSubjectList();
+
+
+    const addButton =
+        document.getElementById(
+            "addSubjectButton"
+        );
+
+
+    const input =
+        document.getElementById(
+            "newSubjectInput"
+        );
+
+
+    if (addButton) {
+
+        addButton.addEventListener(
+            "click",
+            function () {
+
+                const subject =
+                    input.value.trim();
+
+
+                if (!subject) {
+
+                    alert(
+                        "Please enter a subject name."
+                    );
+
+                    return;
+
+                }
+
+
+                const levelSelect =
+                    document.getElementById(
+                        "newSubjectLevelSelect"
+                    );
+
+
+                addSubject(
+                    subject,
+                    levelSelect ? levelSelect.value : ""
+                );
+
+
+                input.value =
+                    "";
+
+            }
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   RENDER SUBJECT LIST
+   ========================================================= */
+
+function renderSubjectList() {
+
+    const list =
+        document.getElementById(
+            "subjectList"
+        );
+
+    if (!list) {
+
+        return;
+
+    }
+
+    const rowHtml = function (subject, level) {
+
+        const assignButtons = level
+            ? ""
+            : SUBJECT_LEVELS.map(function (target) {
+                return (
+                    '<button type="button" data-assign-subject="' + escapeHTML(subject) +
+                    '" data-assign-level="' + escapeHTML(target) + '">' +
+                    escapeHTML(target) + '</button>'
+                );
+            }).join("");
+
+        return (
+            '<div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap;">' +
+            '<input type="text" class="subject-name-input" style="flex:1; min-width:140px;" value="' +
+            escapeHTML(subject) + '" data-subject-name="' + escapeHTML(subject) + '">' +
+            assignButtons +
+            '<button type="button" data-remove-subject="' + escapeHTML(subject) +
+            '" data-remove-level="' + escapeHTML(level) + '">Remove</button>' +
+            '</div>'
+        );
+
+    };
+
+    const groupHtml = function (title, note, rows) {
+
+        return (
+            '<div style="margin:12px 0;">' +
+            '<div style="font-weight:700; margin-bottom:6px;">' + escapeHTML(title) +
+            ' <span style="font-weight:400; opacity:0.7;">(' + rows.length + ')</span></div>' +
+            (note ? '<p style="opacity:0.7; margin:0 0 6px;">' + escapeHTML(note) + '</p>' : "") +
+            (rows.length
+                ? rows.join("")
+                : '<p style="opacity:0.7; margin:0 0 6px;">No subjects added for this level yet.</p>') +
+            '</div>'
+        );
+
+    };
+
+    let html = "";
+
+    SUBJECT_LEVELS.forEach(function (level) {
+
+        const rows = schoolSubjects
+            .filter(function (subject) {
+                return getSubjectLevels(subject).indexOf(level) !== -1;
+            })
+            .map(function (subject) {
+                return rowHtml(subject, level);
+            });
+
+        html += groupHtml(level, "", rows);
+
+    });
+
+    const unassigned = schoolSubjects.filter(function (subject) {
+        return getSubjectLevels(subject).length === 0;
+    });
+
+    if (unassigned.length > 0) {
+
+        html += groupHtml(
+            "Not assigned to a level yet",
+            "These are offered to every class until you tap a level to assign them.",
+            unassigned.map(function (subject) {
+                return rowHtml(subject, "");
+            })
+        );
+
+    }
+
+    list.innerHTML = html;
+
+    list.querySelectorAll(
+        ".subject-name-input"
+    )
+        .forEach(
+            function (input) {
+
+                input.addEventListener(
+                    "change",
+                    function () {
+
+                        renameSubject(
+                            input.getAttribute("data-subject-name"),
+                            input.value.trim()
+                        );
+
+                    }
+                );
+
+            }
+        );
+
+    list.querySelectorAll(
+        "[data-remove-subject]"
+    )
+        .forEach(
+            function (button) {
+
+                button.addEventListener(
+                    "click",
+                    function () {
+
+                        removeSubjectFromLevel(
+                            button.getAttribute("data-remove-subject"),
+                            button.getAttribute("data-remove-level")
+                        );
+
+                    }
+                );
+
+            }
+        );
+
+    list.querySelectorAll(
+        "[data-assign-subject]"
+    )
+        .forEach(
+            function (button) {
+
+                button.addEventListener(
+                    "click",
+                    function () {
+
+                        assignSubjectToLevel(
+                            button.getAttribute("data-assign-subject"),
+                            button.getAttribute("data-assign-level")
+                        );
+
+                    }
+                );
+
+            }
+        );
+
+    populateSubjectTemplateSelect();
+
+}
+
+function subjectListEdited() {
+
+    renderSubjectList();
+
+    markSubjectListChanged();
+    saveAppData();
+
+}
+
+function renameSubject(oldName, newName) {
+
+    if (!newName) {
+
+        alert(
+            "Subject name cannot be empty."
+        );
+
+        renderSubjectList();
+
+        return;
+
+    }
+
+    if (newName === oldName) {
+
+        return;
+
+    }
+
+    const duplicate =
+        schoolSubjects.some(
+            function (subject) {
+
+                return (
+                    subject !== oldName &&
+                    subject.toLowerCase() === newName.toLowerCase()
+                );
+
+            }
+        );
+
+    if (duplicate) {
+
+        alert(
+            "This subject already exists."
+        );
+
+        renderSubjectList();
+
+        return;
+
+    }
+
+    const index = schoolSubjects.indexOf(oldName);
+
+    if (index === -1) {
+
+        renderSubjectList();
+
+        return;
+
+    }
+
+    schoolSubjects[index] = newName;
+
+    const map = getSubjectLevelMap();
+
+    if (Object.prototype.hasOwnProperty.call(map, oldName)) {
+
+        map[newName] = map[oldName];
+
+        delete map[oldName];
+
+    }
+
+    subjectListEdited();
+
+}
+
+function removeSubjectFromLevel(subject, level) {
+
+    const remaining = level
+        ? getSubjectLevels(subject).filter(function (existing) {
+            return existing !== level;
+        })
+        : [];
+
+    if (remaining.length > 0) {
+
+        /* Still taught at another level: only leave this one. */
+        setSubjectLevels(subject, remaining);
+
+    } else {
+
+        const index = schoolSubjects.indexOf(subject);
+
+        if (index !== -1) schoolSubjects.splice(index, 1);
+
+        delete getSubjectLevelMap()[subject];
+
+    }
+
+    subjectListEdited();
+
+}
+
+function assignSubjectToLevel(subject, level) {
+
+    if (SUBJECT_LEVELS.indexOf(level) === -1) return;
+
+    setSubjectLevels(
+        subject,
+        getSubjectLevels(subject).concat([level])
+    );
+
+    subjectListEdited();
+
+}
+
+
+/* =========================================================
+   SUBJECT TEMPLATE SELECT (Step 1B dropdown)
+   ========================================================= */
+
+function populateSubjectTemplateSelect() {
+
+    if (!elementExists(subjectTemplateSelect)) return;
+
+    const previousValue = subjectTemplateSelect.value;
+
+    subjectTemplateSelect.innerHTML = "";
+
+    const availableSubjects = subjectOptionsForCurrentUser();
+
+    availableSubjects.forEach(function (subject) {
+        const option = document.createElement("option");
+        option.value = subject;
+        option.textContent = subject;
+        subjectTemplateSelect.appendChild(option);
+    });
+
+    if (availableSubjects.includes(previousValue)) {
+        subjectTemplateSelect.value = previousValue;
+    }
+
+    applySubjectEntryAccess();
+
+}
+
+
+/* =========================================================
+   ADD SUBJECT
+   ========================================================= */
+
+function addSubject(
+    subject,
+    level
+) {
+
+    const chosenLevel =
+        SUBJECT_LEVELS.indexOf(level) !== -1 ? level : "";
+
+    const existing =
+        schoolSubjects.find(
+            function (name) {
+
+                return (
+                    name.toLowerCase() ===
+                    subject.toLowerCase()
+                );
+
+            }
+        );
+
+    if (existing) {
+
+        const levels = getSubjectLevels(existing);
+
+        if (!chosenLevel || levels.indexOf(chosenLevel) !== -1) {
+
+            alert(
+                chosenLevel
+                    ? "\"" + existing + "\" is already in " + chosenLevel + "."
+                    : "This subject already exists."
+            );
+
+            return;
+
+        }
+
+        /* Same subject taught at another level: just tag it. */
+        setSubjectLevels(existing, levels.concat([chosenLevel]));
+
+    } else {
+
+        schoolSubjects.push(
+            subject
+        );
+
+        if (chosenLevel) {
+
+            setSubjectLevels(subject, [chosenLevel]);
+
+        }
+
+    }
+
+    subjectListEdited();
+
+}
+
+
+/* =========================================================
+   SAFE SUBJECT SHEET NAME
+   ========================================================= */
+
+function getSubjectSheetName(
+    subject,
+    workbook
+) {
+
+    let clean =
+        String(subject)
+            .replace(
+                /[:\/?*\[\]]/g,
+                ""
+            )
+            .trim();
+
+
+    if (!clean) {
+
+        clean =
+            "Subject";
+
+    }
+
+
+    clean =
+        clean.substring(
+            0,
+            31
+        );
+
+
+    let finalName =
+        clean;
+
+
+    let counter =
+        2;
+
+
+    while (
+        workbook.SheetNames.some(
+            function (name) {
+
+                return (
+
+                    name.toLowerCase() ===
+                    finalName.toLowerCase()
+
+                );
+
+            }
+        )
+    ) {
+
+        const suffix =
+            " " +
+            counter;
+
+
+        finalName =
+            clean.substring(
+                0,
+                31 -
+                suffix.length
+            ) +
+            suffix;
+
+
+        counter++;
+
+    }
+
+
+    return finalName;
+
+}
+
+
+/* =========================================================
+   SCHOOL CLASSES (SUPABASE)
+
+   A single, school-wide list of classes/arms, entered once and
+   picked from a dropdown everywhere else. This is what stops two
+   teachers on two devices from splitting one class's data into
+   two ("SS2 Science 1" vs "SS 2 SCIENCE1") by typing it differently.
+   ========================================================= */
+
+const SCHOOL_CLASSES_TABLE = "school_classes";
+
+let schoolClasses = [];
+
+/* Used only for de-duplication (so re-adding "SS2  Science 1" with
+   extra spaces or different case doesn't create a second class).
+   The class's display spelling — whatever was typed first — is
+   what's actually shown and stored as class_name everywhere else. */
+function normalizeClassKey(name) {
+    return String(name || "")
+        .toUpperCase()
+        .replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+async function fetchSchoolClasses() {
+
+    if (!currentUserId) {
+        schoolClasses = [];
+        renderClassList();
+        populateClassNameSelect();
+        return;
+    }
+
+    const { data, error } = await supabaseClient
+        .from(SCHOOL_CLASSES_TABLE)
+        .select("id, class_name")
+        .eq("user_id", currentUserId)
+        .eq("website_id", WEBSITE_ID)
+        .order("class_name", { ascending: true });
+
+    let classRows = data;
+
+    if (error) {
+        console.error("Fetch school classes error:", error);
+
+
+        /* Offline (or server unreachable): use the copy saved on this phone. */
+        classRows = (await Offline.list(SCHOOL_CLASSES_TABLE, function (r) {
+            return r.user_id === currentUserId && r.website_id === WEBSITE_ID;
+        })).sort(function (a, b) {
+            return String(a.class_name).localeCompare(String(b.class_name));
+        });
+
+        if (!classRows.length) return;
+
+        if (!classRows.length) return;
+    }
+
+    schoolClasses = classRows || [];
+
+    renderClassList();
+    populateClassNameSelect();
+
+}
+
+async function addSchoolClass(rawName, level) {
+
+    const cleaned = cleanStudentName(rawName);
+
+    if (!cleaned) {
+        alert("Please enter a class name.");
+        return false;
+    }
+
+    if (!currentUserId) {
+        alert("You must be signed in to add a class.");
+        return false;
+    }
+
+    const classKey = normalizeClassKey(cleaned);
+
+    const alreadyExists = schoolClasses.some(function (schoolClass) {
+        return normalizeClassKey(schoolClass.class_name) === classKey;
+    });
+
+    if (alreadyExists) {
+        if (elementExists(classManagerStatus)) {
+            classManagerStatus.textContent =
+                "That class already exists (matched an existing entry).";
+        }
+        return false;
+    }
+
+    const { error } = await supabaseClient
+        .from(SCHOOL_CLASSES_TABLE)
+        .insert({
+            user_id: currentUserId,
+            website_id: WEBSITE_ID,
+            class_name: cleaned,
+            class_key: classKey
+        });
+
+    if (error) {
+        console.error("Add school class error:", error);
+        if (elementExists(classManagerStatus)) {
+            classManagerStatus.textContent =
+                "❌ " + (error.message || "Could not add that class.");
+        }
+        return false;
+    }
+
+    if (SUBJECT_LEVELS.indexOf(level) !== -1) {
+        setClassLevel(cleaned, level);
+        saveAppData();
+    }
+
+    if (elementExists(classManagerStatus)) {
+        classManagerStatus.textContent =
+            "✅ Added \"" + cleaned + "\"" + (level ? " (" + level + ")." : ".");
+    }
+
+    await fetchSchoolClasses();
+
+    if (elementExists(classNameInput)) {
+        classNameInput.value = cleaned;
+        onClassContextChanged();
+    }
+
+    return true;
+
+}
+
+async function deleteSchoolClass(id, className) {
+
+    if (!id) return;
+
+    if (!confirm("Remove \"" + (className || "this class") + "\"? Scores already saved for it are not deleted.")) {
+        return;
+    }
+
+    const { error } = await supabaseClient
+        .from(SCHOOL_CLASSES_TABLE)
+        .delete()
+        .eq("id", id);
+
+    if (error) {
+        console.error("Delete school class error:", error);
+        if (elementExists(classManagerStatus)) {
+            classManagerStatus.textContent =
+                "❌ " + (error.message || "Could not remove that class.");
+        }
+        return;
+    }
+
+    if (elementExists(classManagerStatus)) {
+        classManagerStatus.textContent = "Removed \"" + className + "\".";
+    }
+
+    await fetchSchoolClasses();
+
+}
+
+function renderClassList() {
+
+    try { renderNextTermBlock(); } catch (e) { /* never block the class list */ }
+
+    if (!elementExists(classListContainer)) return;
+
+    if (schoolClasses.length === 0) {
+        classListContainer.innerHTML =
+            "<p style=\"opacity:0.7;\">No classes added yet.</p>";
+        return;
+    }
+
+    classListContainer.innerHTML = schoolClasses.map(function (schoolClass) {
+        const currentLevel = getClassLevel(schoolClass.class_name);
+        const levelOptions =
+            "<option value=\"\">Level not set</option>" +
+            SUBJECT_LEVELS.map(function (level) {
+                return "<option value=\"" + escapeHTML(level) + "\"" +
+                    (level === currentLevel ? " selected" : "") + ">" +
+                    escapeHTML(level) + "</option>";
+            }).join("");
+        return (
+            "<div style=\"display:flex; align-items:center; gap:8px; margin-top:4px; flex-wrap:wrap;\">" +
+            "<span>" + escapeHTML(schoolClass.class_name) + "</span>" +
+            "<select data-class-level-for=\"" + escapeHTML(schoolClass.class_name) + "\">" +
+            levelOptions + "</select>" +
+            "<button type=\"button\" data-remove-class-id=\"" + escapeHTML(String(schoolClass.id)) +
+            "\" data-remove-class-name=\"" + escapeHTML(schoolClass.class_name) + "\">Remove</button>" +
+            "</div>"
+        );
+    }).join("");
+
+}
+
+function populateClassNameSelect() {
+
+    if (!elementExists(classNameInput)) return;
+
+    const previousValue = classNameInput.value;
+
+    classNameInput.innerHTML =
+        "<option value=\"\">-- Select Class --</option>";
+
+    schoolClasses.forEach(function (schoolClass) {
+        const option = document.createElement("option");
+        const classLevel = getClassLevel(schoolClass.class_name);
+        option.value = schoolClass.class_name;
+        option.textContent =
+            schoolClass.class_name + (classLevel ? " (" + classLevel + ")" : "");
+        classNameInput.appendChild(option);
+    });
+
+    const stillExists = schoolClasses.some(function (schoolClass) {
+        return schoolClass.class_name === previousValue;
+    });
+
+    if (stillExists) {
+        classNameInput.value = previousValue;
+    }
+
+    restoreSavedClassSelection();
+    onClassContextChanged();
+
+    if (typeof promotionRefresh === "function") promotionRefresh();
+
+}
+
+
+/* =========================================================
+   ACADEMIC CONTEXT  (Session + Term + Class)
+
+   Step 1A sets the working context. Everything else follows it:
+     - the master class list belongs to  Class + Session
+       (the same students carry through First/Second/Third Term)
+     - subject scores belong to          Class + Session + Term
+       so switching to Third Term loads Third Term data and never
+       overwrites First or Second Term.
+   ========================================================= */
+
+const CLASS_ROSTER_TABLE = "class_students";
+const ACADEMIC_TERMS = ["First Term", "Second Term", "Third Term"];
+const ACADEMIC_CONTEXT_STORAGE_KEY = "reportgen1_academic_context";
+
+let academicSessionSelect;
+let academicTermSelect;
+let downloadClassListTemplateButton;
+let classListFileInput;
+let uploadClassListButton;
+let rosterStatus;
+let studentPreviewContainer;
+let studentPhotoManager;
+let studentPhotoStatus;
+let cumulativeStudentSelect;
+let showCumulativeButton;
+let downloadCumulativeButton;
+let cumulativeStatus;
+let cumulativeResult;
+
+let classRoster = [];
+let rosterFetchFailed = false;
+let cumulativeModel = null;
+
+/* =========================================================
+   STUDENT PASSPORT PHOTOS — SAVED IN SUPABASE (table student_photos)
+   Photos now follow the school account, so they appear in the Android
+   app as well as in the browser. Each photo is resized on the phone
+   (max 400 px, JPEG) before it is saved. A small in-memory cache keeps
+   report generation synchronous.
+   The old browser-only store (IndexedDB) is only READ, once, to move
+   photos that were saved there earlier into the account.
+   ========================================================= */
+const STUDENT_PHOTO_TABLE = "student_photos";
+/* Passport size: 4:5 portrait, matching how the report shows it (72 x 90).
+   200 x 250 px at JPEG quality 0.72 is about 8-14 KB per photo. */
+const STUDENT_PHOTO_WIDTH = 200;
+const STUDENT_PHOTO_HEIGHT = 250;
+const STUDENT_PHOTO_QUALITY = 0.72;
+const STUDENT_PHOTO_SHRINK_ABOVE = 20000;   /* characters; bigger saved photos get shrunk once */
+const STUDENT_PHOTO_MAX_FILE_BYTES = 8 * 1024 * 1024;
+const STUDENT_PHOTO_DB_NAME = "StudentReportGeneratorPhotos";
+const STUDENT_PHOTO_DB_VERSION = 1;
+const STUDENT_PHOTO_STORE = "photos";
+const studentPhotoCache = new Map();
+let studentPhotoDB = null;
+let studentPhotosLoadedFor = "";
+let studentPhotosLoading = null;
+let studentPhotoNotice = "";
+
+function studentPhotoKey(admissionNo, studentName) {
+    const admission = normalizeStudentAdmissionNo(admissionNo);
+    if (admission) return "adm:" + admission;
+    return "name:" + normalizeStudentName(studentName);
+}
+
+/* Owner, or a form master, may add / change / remove photos. */
+function canEditStudentPhotos() {
+    if (!staffContext) return true;
+    return staffContext.assignments.some(function (a) { return !a.subject; });
+}
+
+function resetStudentPhotoState() {
+    studentPhotoCache.clear();
+    studentPhotosLoadedFor = "";
+    studentPhotosLoading = null;
+    studentPhotoNotice = "";
+}
+
+/* ---- legacy browser store (read only, used once for moving photos) ---- */
+function openStudentPhotoDB() {
+    if (!window.indexedDB) return Promise.resolve(null);
+    if (studentPhotoDB) return Promise.resolve(studentPhotoDB);
+    return new Promise(function (resolve) {
+        try {
+            const request = indexedDB.open(STUDENT_PHOTO_DB_NAME, STUDENT_PHOTO_DB_VERSION);
+            request.onupgradeneeded = function () {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(STUDENT_PHOTO_STORE)) {
+                    db.createObjectStore(STUDENT_PHOTO_STORE);
+                }
+            };
+            request.onsuccess = function () {
+                studentPhotoDB = request.result;
+                resolve(studentPhotoDB);
+            };
+            request.onerror = function () { resolve(null); };
+        } catch (e) { resolve(null); }
+    });
+}
+
+async function readBrowserOnlyStudentPhotos() {
+    const found = new Map();
+    const db = await openStudentPhotoDB();
+    if (!db) return found;
+    await new Promise(function (resolve) {
+        try {
+            const tx = db.transaction(STUDENT_PHOTO_STORE, "readonly");
+            const request = tx.objectStore(STUDENT_PHOTO_STORE).openCursor();
+            request.onsuccess = function (event) {
+                const cursor = event.target.result;
+                if (!cursor) { resolve(); return; }
+                if (typeof cursor.value === "string" && cursor.value) {
+                    found.set(String(cursor.key), cursor.value);
+                }
+                cursor.continue();
+            };
+            request.onerror = function () { resolve(); };
+        } catch (e) { resolve(); }
+    });
+    return found;
+}
+
+/* ---- picture resizing ---- */
+function resizeStudentPhoto(source) {
+    return new Promise(function (resolve, reject) {
+        const isFile = typeof source !== "string";
+        const url = isFile ? URL.createObjectURL(source) : source;
+        const img = new Image();
+        img.onload = function () {
+            try {
+                const srcW = img.naturalWidth || img.width;
+                const srcH = img.naturalHeight || img.height;
+                const canvas = document.createElement("canvas");
+                canvas.width = STUDENT_PHOTO_WIDTH;
+                canvas.height = STUDENT_PHOTO_HEIGHT;
+                const ctx = canvas.getContext("2d");
+                ctx.fillStyle = "#ffffff";
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                /* centre-crop to the passport shape (same as object-fit: cover) */
+                const scale = Math.max(canvas.width / srcW, canvas.height / srcH);
+                const drawW = srcW * scale;
+                const drawH = srcH * scale;
+                ctx.imageSmoothingQuality = "high";
+                ctx.drawImage(img, (canvas.width - drawW) / 2, (canvas.height - drawH) / 2, drawW, drawH);
+                if (isFile) URL.revokeObjectURL(url);
+                resolve(canvas.toDataURL("image/jpeg", STUDENT_PHOTO_QUALITY));
+            } catch (error) {
+                if (isFile) URL.revokeObjectURL(url);
+                reject(error);
+            }
+        };
+        img.onerror = function () {
+            if (isFile) URL.revokeObjectURL(url);
+            reject(new Error("Could not read that image."));
+        };
+        img.src = url;
+    });
+}
+
+/* ---- Supabase (pictures live in the private Storage bucket) ---- */
+const STUDENT_PHOTO_BUCKET = "student-photos";
+
+function studentPhotoPath(key) {
+    const hex = Array.from(new TextEncoder().encode(String(key)))
+        .map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+    return currentUserId + "/" + WEBSITE_ID + "/" + hex + ".jpg";
+}
+
+function studentPhotoDataUrlToBlob(dataUrl) {
+    const parts = String(dataUrl).split(",");
+    const mime = (parts[0].match(/data:([^;]+)/) || [])[1] || "image/jpeg";
+    const bin = atob(parts[1] || "");
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+}
+
+function studentPhotoBlobToDataUrl(blob) {
+    return new Promise(function (resolve, reject) {
+        const reader = new FileReader();
+        reader.onload = function () { resolve(String(reader.result)); };
+        reader.onerror = function () { reject(reader.error || new Error("Could not read the photo.")); };
+        reader.readAsDataURL(blob);
+    });
+}
+
+/* Uploads the file, then records its path in the table. Returns an error or null. */
+async function persistStudentPhoto(key, dataUrl) {
+    const path = studentPhotoPath(key);
+    const up = await supabaseClient.storage
+        .from(STUDENT_PHOTO_BUCKET)
+        .upload(path, studentPhotoDataUrlToBlob(dataUrl), { contentType: "image/jpeg", upsert: true });
+    if (up.error) return up.error;
+    const { error } = await supabaseClient
+        .from(STUDENT_PHOTO_TABLE)
+        .upsert([{
+            owner_user_id: currentUserId,
+            website_id: WEBSITE_ID,
+            photo_key: key,
+            photo_path: path,
+            photo_data: null,
+            updated_by: staffContext ? staffContext.userId : currentUserId,
+            updated_at: new Date().toISOString()
+        }], { onConflict: "owner_user_id,website_id,photo_key" });
+    return error || null;
+}
+
+async function persistStudentPhotoSafe(key, dataUrl) {
+    try { return await persistStudentPhoto(key, dataUrl); }
+    catch (e) { return e; }
+}
+
+async function fetchStudentPhotosFromCloud() {
+    const photos = new Map();
+    const legacy = [];
+    const withPath = [];
+    const pageSize = 100;
+    for (let from = 0; ; from += pageSize) {
+        const { data, error } = await supabaseClient
+            .from(STUDENT_PHOTO_TABLE)
+            .select("photo_key, photo_path, photo_data")
+            .eq("owner_user_id", currentUserId)
+            .eq("website_id", WEBSITE_ID)
+            .order("photo_key", { ascending: true })
+            .range(from, from + pageSize - 1);
+        if (error) return { error: error, photos: photos, legacy: legacy };
+        (data || []).forEach(function (row) {
+            if (!row.photo_key) return;
+            const key = String(row.photo_key);
+            if (row.photo_path) {
+                withPath.push({ key: key, path: row.photo_path, fallback: row.photo_data || "" });
+            } else if (row.photo_data) {
+                photos.set(key, row.photo_data);
+                legacy.push(key);
+            }
+        });
+        if (!data || data.length < pageSize) break;
+    }
+    for (let i = 0; i < withPath.length; i += 8) {
+        await Promise.all(withPath.slice(i, i + 8).map(async function (item) {
+            try {
+                const { data, error } = await supabaseClient.storage
+                    .from(STUDENT_PHOTO_BUCKET).download(item.path);
+                if (error || !data) throw error || new Error("empty");
+                photos.set(item.key, await studentPhotoBlobToDataUrl(data));
+            } catch (e) {
+                console.error("Photo download error:", item.path, e);
+                if (item.fallback) photos.set(item.key, item.fallback);
+            }
+        }));
+    }
+    return { error: null, photos: photos, legacy: legacy };
+}
+
+/* One-time move of photos that were saved in this browser only. */
+async function moveBrowserPhotosToAccount(cloudPhotos) {
+    if (!canEditStudentPhotos()) return 0;
+    const local = await readBrowserOnlyStudentPhotos();
+    const pending = [];
+    local.forEach(function (value, key) {
+        if (!cloudPhotos.has(key)) pending.push([key, value]);
+    });
+    let moved = 0;
+    for (const pair of pending) {
+        try {
+            const small = await resizeStudentPhoto(pair[1]);
+            const error = await persistStudentPhotoSafe(pair[0], small);
+            if (error) { console.error("Moving browser photos error:", error); break; }
+            studentPhotoCache.set(pair[0], small);
+            moved++;
+        } catch (e) { /* skip a damaged picture */ }
+    }
+    return moved;
+}
+
+/* Photos still stored inside the table are moved into Storage (made smaller first if large). */
+async function moveLegacyStudentPhotosToStorage(keys) {
+    if (!canEditStudentPhotos() || !keys.length) return 0;
+    let done = 0;
+    for (const key of keys) {
+        try {
+            let data = studentPhotoCache.get(key);
+            if (!data) continue;
+            if (data.length > STUDENT_PHOTO_SHRINK_ABOVE) {
+                try {
+                    const small = await resizeStudentPhoto(data);
+                    if (small.length < data.length) data = small;
+                } catch (e) { /* keep the original */ }
+            }
+            const error = await persistStudentPhotoSafe(key, data);
+            if (error) { console.error("Moving photo to storage error:", error); break; }
+            studentPhotoCache.set(key, data);
+            done++;
+        } catch (e) { /* leave this photo as it is */ }
+    }
+    return done;
+}
+
+/* Loads this school's photos once per login. Safe to call many times. */
+function ensureStudentPhotosLoaded(force) {
+    if (!currentUserId) return Promise.resolve();
+    if (!force && studentPhotosLoadedFor === currentUserId) return Promise.resolve();
+    if (studentPhotosLoading) return studentPhotosLoading;
+
+    const userAtStart = currentUserId;
+
+    studentPhotosLoading = (async function () {
+        try {
+            const result = await fetchStudentPhotosFromCloud();
+
+            if (userAtStart !== currentUserId) return;
+
+            if (result.error) {
+                console.error("Load student photos error:", result.error);
+                studentPhotoNotice = "⚠ Student photos could not be loaded (has the student_photos SQL been run in Supabase?).";
+                return;
+            }
+
+            studentPhotoCache.clear();
+            result.photos.forEach(function (value, key) { studentPhotoCache.set(key, value); });
+            studentPhotosLoadedFor = userAtStart;
+            studentPhotoNotice = "";
+
+            const moved = await moveBrowserPhotosToAccount(result.photos);
+            if (moved > 0) {
+                studentPhotoNotice = "✅ " + moved + " photo(s) that were saved only on this browser have been moved to your account.";
+            }
+
+            const shifted = await moveLegacyStudentPhotosToStorage(result.legacy);
+            if (shifted > 0) {
+                studentPhotoNotice = (studentPhotoNotice ? studentPhotoNotice + " " : "") +
+                    "✅ " + shifted + " saved photo(s) were moved to file storage to save space.";
+            }
+        } catch (error) {
+            console.error("Student photos error:", error);
+        } finally {
+            studentPhotosLoading = null;
+        }
+    })();
+
+    return studentPhotosLoading;
+}
+
+async function saveStudentPhoto(key, dataUrl) {
+    if (!currentUserId) return { ok: false, message: "Please sign in first." };
+    try {
+        const error = await persistStudentPhoto(key, dataUrl);
+        if (error) {
+            console.error("Save student photo error:", error);
+            return { ok: false, message: error.message || "The photo was not saved." };
+        }
+        studentPhotoCache.set(key, dataUrl);
+        return { ok: true };
+    } catch (error) {
+        return { ok: false, message: (error && error.message) || "The photo was not saved." };
+    }
+}
+
+async function deleteStudentPhoto(key) {
+    if (!currentUserId) return { ok: false, message: "Please sign in first." };
+    try {
+        const { error } = await supabaseClient
+            .from(STUDENT_PHOTO_TABLE)
+            .delete()
+            .eq("owner_user_id", currentUserId)
+            .eq("website_id", WEBSITE_ID)
+            .eq("photo_key", key);
+        if (error) {
+            console.error("Delete student photo error:", error);
+            return { ok: false, message: error.message || "The photo was not removed." };
+        }
+        try {
+            const rm = await supabaseClient.storage.from(STUDENT_PHOTO_BUCKET).remove([studentPhotoPath(key)]);
+            if (rm.error) console.error("Remove photo file error:", rm.error);
+        } catch (e) { console.error("Remove photo file error:", e); }
+        studentPhotoCache.delete(key);
+        return { ok: true };
+    } catch (error) {
+        return { ok: false, message: (error && error.message) || "The photo was not removed." };
+    }
+}
+
+function getStudentPhoto(student) {
+    if (!student) return "";
+    const admission = student["Admission No"] ?? student.admission_no ?? "";
+    const name = student["Student Name"] ?? student.student_name ?? "";
+    return studentPhotoCache.get(studentPhotoKey(admission, name)) || "";
+}
+
+function renderStudentPhotoManager() {
+    if (!studentPhotoManager) return;
+    if (!classRoster.length) {
+        studentPhotoManager.innerHTML = "<em>Upload a class list first. Photos are saved to your school account.</em>";
+        return;
+    }
+    const canEdit = canEditStudentPhotos();
+    let html = "";
+    if (studentPhotoNotice) html += "<p style=\"margin:0 0 8px;\"><small>" + escapeHTML(studentPhotoNotice) + "</small></p>";
+    html += "<div style=\"display:grid;gap:10px;\">";
+    classRoster.forEach(function (student, index) {
+        const key = studentPhotoKey(student.admission_no, student.student_name);
+        const photo = studentPhotoCache.get(key) || "";
+        html += "<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px;border:1px solid #e2e2e2;border-radius:7px;background:#fff;\">";
+        html += "<div style=\"width:48px;height:60px;display:flex;align-items:center;justify-content:center;border:1px solid #ccc;border-radius:4px;overflow:hidden;background:#f5f5f5;\">";
+        html += photo ? "<img src=\"" + escapeHTML(photo) + "\" alt=\"Student photo\" style=\"width:100%;height:100%;object-fit:cover;\">" : "<span style=\"font-size:22px;\">👤</span>";
+        html += "</div><div style=\"flex:1;min-width:180px;\"><strong>" + escapeHTML(student.student_name) + "</strong>";
+        if (student.admission_no) html += "<br><small>" + escapeHTML(student.admission_no) + "</small>";
+        html += "</div>";
+        if (canEdit) {
+            html += "<label style=\"margin:0;\"><span style=\"display:inline-block;padding:7px 10px;border:1px solid #bbb;border-radius:5px;cursor:pointer;background:#f8f8f8;\">📷 " + (photo ? "Change Photo" : "Add Photo") + "</span><input type=\"file\" accept=\"image/jpeg,image/png,image/webp\" data-student-photo-index=\"" + index + "\" style=\"display:none;\"></label>";
+            if (photo) html += "<button type=\"button\" data-remove-student-photo=\"" + index + "\">Remove</button>";
+        }
+        html += "</div>";
+    });
+    html += "</div>";
+    studentPhotoManager.innerHTML = html;
+}
+
+function attachStudentPhotoEvents() {
+    if (!studentPhotoManager) return;
+    studentPhotoManager.addEventListener("change", async function (event) {
+        const input = event.target.closest("input[data-student-photo-index]");
+        if (!input || !input.files || !input.files[0]) return;
+        const index = Number(input.getAttribute("data-student-photo-index"));
+        const student = classRoster[index];
+        if (!student) return;
+        const file = input.files[0];
+        input.value = "";
+        if (!canEditStudentPhotos()) {
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ Only the school owner or the form master can change student photos.";
+            return;
+        }
+        if (!/^image\/(jpeg|png|webp)$/i.test(file.type)) {
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ Please select a JPG, PNG or WebP image.";
+            return;
+        }
+        if (file.size > STUDENT_PHOTO_MAX_FILE_BYTES) {
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ Please use a photo smaller than 8 MB.";
+            return;
+        }
+        if (studentPhotoStatus) studentPhotoStatus.textContent = "⏳ Saving photo…";
+        try {
+            const small = await resizeStudentPhoto(file);
+            const result = await saveStudentPhoto(studentPhotoKey(student.admission_no, student.student_name), small);
+            renderStudentPhotoManager();
+            if (studentPhotoStatus) {
+                studentPhotoStatus.textContent = result.ok
+                    ? "✅ Photo saved to your school account."
+                    : "❌ " + result.message;
+            }
+        } catch (error) {
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ " + ((error && error.message) || "Could not process that photo.");
+        }
+    });
+    studentPhotoManager.addEventListener("click", async function (event) {
+        const button = event.target.closest("[data-remove-student-photo]");
+        if (!button) return;
+        const student = classRoster[Number(button.getAttribute("data-remove-student-photo"))];
+        if (!student) return;
+        if (!canEditStudentPhotos()) return;
+        const result = await deleteStudentPhoto(studentPhotoKey(student.admission_no, student.student_name));
+        renderStudentPhotoManager();
+        if (studentPhotoStatus) {
+            studentPhotoStatus.textContent = result.ok
+                ? "✅ Photo removed."
+                : "❌ " + result.message;
+        }
+    });
+}
+
+function defaultAcademicSession() {
+    const now = new Date();
+    const startYear = now.getMonth() >= 8 ? now.getFullYear() : now.getFullYear() - 1;
+    return startYear + "/" + (startYear + 1);
+}
+
+/* First academic session shown in the Session dropdown (2020/2021).
+   Change this year to start the list earlier or later. */
+const SESSION_LIST_START_YEAR = 2020;
+
+function buildSessionOptions(selected) {
+
+    if (!elementExists(academicSessionSelect)) return;
+
+    const defaultStart = Number(defaultAcademicSession().split("/")[0]);
+    const sessions = [];
+
+    /* Every session from the first one the site supports up to next
+       session, so records from past sessions can always be opened. */
+    for (let year = SESSION_LIST_START_YEAR; year <= defaultStart + 1; year++) {
+        sessions.push(year + "/" + (year + 1));
+    }
+
+    if (selected && sessions.indexOf(selected) === -1) sessions.push(selected);
+
+    academicSessionSelect.innerHTML = "";
+
+    sessions.forEach(function (session) {
+        const option = document.createElement("option");
+        option.value = session;
+        option.textContent = session;
+        academicSessionSelect.appendChild(option);
+    });
+
+    academicSessionSelect.value = selected || defaultAcademicSession();
+
+}
+
+function getSelectedSession() {
+    return elementExists(academicSessionSelect)
+        ? String(academicSessionSelect.value || "").trim()
+        : "";
+}
+
+function getSelectedTerm() {
+    return elementExists(academicTermSelect)
+        ? String(academicTermSelect.value || "").trim()
+        : "";
+}
+
+/* Returns { className, session, term } or null (with an alert) when
+   the teacher has not chosen everything yet. */
+function getWorkflowContext(required) {
+
+    const className = getActiveClassName(false);
+    const session = getSelectedSession();
+    const term = getSelectedTerm();
+
+    if (required && (!className || !session || !term)) {
+        alert("Please select the Academic Session, Term and Class in Step 1A or Step 1B first.");
+        return null;
+    }
+
+    return { className: className, session: session, term: term };
+
+}
+
+function contextLabel(context, includeTerm) {
+
+    if (!context || !context.className) {
+        return "Select the Academic Session, Term and Class in Step 1A or Step 1B";
+    }
+
+    const parts = [context.className, context.session];
+    if (includeTerm !== false) parts.push(context.term);
+
+    return parts.join(" | ");
+
+}
+
+function updateContextBanners() {
+
+    const context = getWorkflowContext(false);
+
+    document.querySelectorAll(".context-banner").forEach(function (banner) {
+        const annual = banner.getAttribute("data-context") === "annual";
+        const bannerLevel =
+            context && context.className ? getClassLevel(context.className) : "";
+        banner.textContent =
+            contextLabel(context, !annual) + (bannerLevel ? " | " + bannerLevel : "");
+    });
+
+}
+
+function saveAcademicContext() {
+    try {
+        localStorage.setItem(
+            ACADEMIC_CONTEXT_STORAGE_KEY,
+            JSON.stringify({
+                session: getSelectedSession(),
+                term: getSelectedTerm(),
+                className: getActiveClassName(false)
+            })
+        );
+    } catch (error) {
+        console.error("Unable to save academic context:", error);
+    }
+}
+
+/* Runs whenever Session, Term or Class changes (and after the class
+   list of Step 0 is (re)loaded). */
+function onClassContextChanged() {
+    syncStep1bContextSelectors();
+    refreshFormMasterSubjects();
+    populateSubjectTemplateSelect();
+    updateContextBanners();
+    saveAcademicContext();
+    loadClassRosterForContext();
+    resetCumulativeView();
+}
+
+function initializeAcademicWorkflow() {
+
+    academicSessionSelect = document.getElementById("academicSessionSelect");
+    academicTermSelect = document.getElementById("academicTermSelect");
+    downloadClassListTemplateButton = document.getElementById("downloadClassListTemplate");
+    classListFileInput = document.getElementById("classListFile");
+    uploadClassListButton = document.getElementById("uploadClassListButton");
+    rosterStatus = document.getElementById("rosterStatus");
+    studentPreviewContainer = document.getElementById("studentPreviewContainer");
+    studentPhotoManager = document.getElementById("studentPhotoManager");
+    studentPhotoStatus = document.getElementById("studentPhotoStatus");
+    attachStudentPhotoEvents();
+    ensureStudentPhotosLoaded().then(function () { renderStudentPhotoManager(); });
+    cumulativeStudentSelect = document.getElementById("cumulativeStudentSelect");
+    showCumulativeButton = document.getElementById("showCumulativeButton");
+    downloadCumulativeButton = document.getElementById("downloadCumulativeButton");
+    cumulativeStatus = document.getElementById("cumulativeStatus");
+    cumulativeResult = document.getElementById("cumulativeResult");
+
+    let saved = {};
+    try {
+        saved = JSON.parse(localStorage.getItem(ACADEMIC_CONTEXT_STORAGE_KEY) || "{}") || {};
+    } catch (error) {
+        saved = {};
+    }
+
+    buildSessionOptions(saved.session);
+
+    if (elementExists(academicTermSelect)) {
+        academicTermSelect.innerHTML = "";
+        ACADEMIC_TERMS.forEach(function (term) {
+            const option = document.createElement("option");
+            option.value = term;
+            option.textContent = term;
+            academicTermSelect.appendChild(option);
+        });
+        academicTermSelect.value =
+            ACADEMIC_TERMS.indexOf(saved.term) !== -1 ? saved.term : ACADEMIC_TERMS[0];
+    }
+
+    [academicSessionSelect, academicTermSelect, classNameInput].forEach(function (select) {
+        if (elementExists(select)) select.addEventListener("change", onClassContextChanged);
+    });
+
+    if (elementExists(downloadClassListTemplateButton)) {
+        downloadClassListTemplateButton.addEventListener("click", downloadClassListTemplate);
+    }
+
+    if (elementExists(classListFileInput)) {
+        classListFileInput.addEventListener("change", function () {
+            const file = classListFileInput.files && classListFileInput.files[0];
+            setRosterStatus(
+                file
+                    ? "📄 Selected: " + file.name + ". Click \"Upload Class List\" to save it."
+                    : ""
+            );
+        });
+    }
+
+    if (elementExists(uploadClassListButton)) {
+        uploadClassListButton.addEventListener("click", handleClassListUploadButton);
+    }
+
+    if (elementExists(showCumulativeButton)) {
+        showCumulativeButton.addEventListener("click", showCumulativePerformance);
+    }
+
+    if (elementExists(downloadCumulativeButton)) {
+        downloadCumulativeButton.addEventListener("click", downloadCumulativeWorkbook);
+    }
+
+    const cumulativeReportOneButton = document.getElementById("generateCumulativeReportButton");
+    const cumulativeReportAllButton = document.getElementById("generateAllCumulativeReportsButton");
+
+    if (elementExists(cumulativeReportOneButton)) {
+        cumulativeReportOneButton.addEventListener("click", function () {
+            generateCumulativeReports("one");
+        });
+    }
+
+    if (elementExists(cumulativeReportAllButton)) {
+        cumulativeReportAllButton.addEventListener("click", function () {
+            generateCumulativeReports("all");
+        });
+    }
+    const publishCumulativeOneButton = document.getElementById("publishCumulativeResultButton");
+    const publishCumulativeAllButton = document.getElementById("publishAllCumulativeResultsButton");
+    if (elementExists(publishCumulativeOneButton)) {
+        publishCumulativeOneButton.addEventListener("click", function () {
+            publishCumulativeResults("one");
+        });
+    }
+    if (elementExists(publishCumulativeAllButton)) {
+        publishCumulativeAllButton.addEventListener("click", function () {
+            publishCumulativeResults("all");
+        });
+    }
+
+    if (elementExists(cumulativeStudentSelect)) {
+        cumulativeStudentSelect.addEventListener("change", renderCumulativeStudent);
+    }
+
+    initializeStep1bContextSelectors();
+
+    updateContextBanners();
+
+    initializeAttendanceSection();
+
+}
+
+/* =========================================================
+   STEP 1B: SESSION / TERM / CLASS SELECTORS
+
+   Step 1B (subject template) now has its own Academic Session,
+   Term and Class dropdowns, so a teacher can pick them right above
+   the subject without scrolling back to Step 1A. They are mirrored
+   with the Step 1A dropdowns: changing either set updates the other,
+   and everything else in the app keeps reading the one shared
+   context (getWorkflowContext).
+   ========================================================= */
+
+const STEP1B_CONTEXT_IDS = {
+    session: "step1bSessionSelect",
+    term: "step1bTermSelect",
+    className: "step1bClassSelect"
+};
+
+/* Copy the options of a Step 1A select into its Step 1B twin and
+   keep the same value selected. */
+function mirrorSelectOptions(source, target) {
+
+    if (!elementExists(source) || !target) return;
+
+    target.innerHTML = "";
+
+    Array.prototype.forEach.call(source.options, function (sourceOption) {
+        const option = document.createElement("option");
+        option.value = sourceOption.value;
+        option.textContent = sourceOption.textContent;
+        target.appendChild(option);
+    });
+
+    target.value = source.value;
+
+}
+
+/* Brings the Step 1B dropdowns in line with Step 1A. */
+function syncStep1bContextSelectors() {
+
+    const session = document.getElementById(STEP1B_CONTEXT_IDS.session);
+    const term = document.getElementById(STEP1B_CONTEXT_IDS.term);
+    const className = document.getElementById(STEP1B_CONTEXT_IDS.className);
+
+    mirrorSelectOptions(academicSessionSelect, session);
+    mirrorSelectOptions(academicTermSelect, term);
+    mirrorSelectOptions(classNameInput, className);
+
+}
+
+/* A change in Step 1B is copied to Step 1A, then the whole app is
+   told the context changed (same path as changing it in Step 1A). */
+function handleStep1bContextChange(event) {
+
+    const id = event.target.id;
+
+    if (id === STEP1B_CONTEXT_IDS.session && elementExists(academicSessionSelect)) {
+        academicSessionSelect.value = event.target.value;
+    }
+
+    if (id === STEP1B_CONTEXT_IDS.term && elementExists(academicTermSelect)) {
+        academicTermSelect.value = event.target.value;
+    }
+
+    if (id === STEP1B_CONTEXT_IDS.className && elementExists(classNameInput)) {
+        classNameInput.value = event.target.value;
+    }
+
+    onClassContextChanged();
+
+}
+
+function initializeStep1bContextSelectors() {
+
+    if (document.getElementById("step1bContextRow")) return;
+    if (!elementExists(subjectTemplateSelect)) return;
+
+    /* Put the row above the Subject dropdown (and its label, if any). */
+    let anchor = subjectTemplateSelect;
+    const label = document.querySelector('label[for="subjectTemplateSelect"]');
+    if (label) anchor = label;
+
+    const field = function (labelText, id) {
+        return (
+            '<label for="' + id + '" style="display:flex;flex-direction:column;' +
+            'gap:3px;font-weight:600;font-size:13px;min-width:140px;flex:1;">' +
+            labelText +
+            '<select id="' + id + '" style="font-weight:400;"></select></label>'
+        );
+    };
+
+    const row = document.createElement("div");
+    row.id = "step1bContextRow";
+    row.style.cssText =
+        "display:flex;flex-wrap:wrap;gap:10px;margin:0 0 12px;";
+    row.innerHTML =
+        field("Academic Session", STEP1B_CONTEXT_IDS.session) +
+        field("Term", STEP1B_CONTEXT_IDS.term) +
+        field("Class", STEP1B_CONTEXT_IDS.className);
+
+    anchor.insertAdjacentElement("beforebegin", row);
+
+    Object.keys(STEP1B_CONTEXT_IDS).forEach(function (key) {
+        document
+            .getElementById(STEP1B_CONTEXT_IDS[key])
+            .addEventListener("change", handleStep1bContextChange);
+    });
+
+    syncStep1bContextSelectors();
+
+}
+
+/* Remember the last class after Step 0's list has loaded. */
+function restoreSavedClassSelection() {
+
+    if (!elementExists(classNameInput) || classNameInput.value) return;
+
+    try {
+        const saved = JSON.parse(localStorage.getItem(ACADEMIC_CONTEXT_STORAGE_KEY) || "{}") || {};
+        const exists = schoolClasses.some(function (schoolClass) {
+            return schoolClass.class_name === saved.className;
+        });
+        if (exists) classNameInput.value = saved.className;
+    } catch (error) {
+        /* ignore */
+    }
+
+}
+
+
+/* =========================================================
+   NOTIFICATIONS  (pop-up at the top of the screen)
+   ========================================================= */
+function showRosterNotification(message, isError) {
+
+    let box = document.getElementById("rosterNotification");
+
+    if (!box) {
+
+        box = document.createElement("div");
+        box.id = "rosterNotification";
+        box.setAttribute("role", "status");
+        box.setAttribute("aria-live", "polite");
+        box.style.cssText =
+            "position:fixed;top:16px;left:50%;transform:translateX(-50%);" +
+            "z-index:100000;max-width:90vw;width:420px;padding:14px 40px 14px 16px;" +
+            "border-radius:10px;font-weight:600;font-size:15px;line-height:1.4;" +
+            "box-shadow:0 6px 24px rgba(0,0,0,.25);color:#fff;display:none;";
+
+        const text = document.createElement("span");
+        text.id = "rosterNotificationText";
+
+        const close = document.createElement("button");
+        close.type = "button";
+        close.textContent = "×";
+        close.setAttribute("aria-label", "Dismiss notification");
+        close.style.cssText =
+            "position:absolute;top:6px;right:10px;background:none;border:none;" +
+            "color:#fff;font-size:22px;line-height:1;cursor:pointer;padding:0;";
+        close.addEventListener("click", function () { box.style.display = "none"; });
+
+        box.appendChild(text);
+        box.appendChild(close);
+        document.body.appendChild(box);
+
+    }
+
+    box.style.background = isError ? "#b00020" : "#0b6b62";
+    document.getElementById("rosterNotificationText").textContent = message;
+    box.style.display = "block";
+
+    clearTimeout(showRosterNotification._timer);
+    showRosterNotification._timer = setTimeout(function () {
+        box.style.display = "none";
+    }, isError ? 9000 : 6000);
+
+}
+
+function setRosterStatus(message, isError) {
+
+    if (rosterStatus) {
+        rosterStatus.textContent = message || "";
+        rosterStatus.style.color = isError ? "#b00020" : "#0b6b62";
+    }
+
+    /* Pop up only for finished results, not progress or file-picked hints. */
+    const text = String(message || "");
+
+    if (text.indexOf("✅") === 0 || text.indexOf("❌") === 0 || isError) {
+        showRosterNotification(text, !!isError || text.indexOf("❌") === 0);
+    }
+
+}
+
+
+/* =========================================================
+   ATTENDANCE
+   ---------------------------------------------------------
+   1. Download the attendance template (main_Attendance.xlsx).
+   2. The form master marks P / L / A / E for each morning (AM)
+      and afternoon (PM) roll call.
+   3. Upload it here. For every student we save the TOTAL DAYS
+      PRESENT, and for the class the TOTAL DAYS SCHOOL OPENED,
+      in Supabase (table class_attendance) for the selected
+      Class + Session + Term.
+   4. Every report (and published result) prints them in the
+      Attendance box of the Behavioral Traits section as
+      "present/opened", e.g.  54/60.
+
+   Counting rules - identical to the template's own formulas:
+     P and L count as present, A and E count as absent.
+     Each AM / PM roll call is half a day.
+     A roll call counts as "held" once at least one student is
+     marked P, L, A or E in that column.
+   ========================================================= */
+
+const ATTENDANCE_TABLE = "class_attendance";
+const ATTENDANCE_TEMPLATE_FILE = "main_Attendance.xlsx";
+const ATTENDANCE_CACHE_MS = 60000;
+
+let attendanceCache = new Map();
+let attendanceFileInput;
+let attendanceUploadButton;
+let attendanceDownloadButton;
+let attendanceStatusElement;
+let attendanceSummaryElement;
+
+/* ---------- small helpers ---------- */
+
+function attendanceTermName(text) {
+
+    const value = String(text || "").toLowerCase();
+
+    if (/\b(1st|first)\b|term\s*1\b|\bone\b/.test(value)) return "First Term";
+    if (/\b(2nd|second)\b|term\s*2\b|\btwo\b/.test(value)) return "Second Term";
+    if (/\b(3rd|third)\b|term\s*3\b|\bthree\b/.test(value)) return "Third Term";
+
+    return "";
+
+}
+
+function attendanceSessionKey(text) {
+
+    const value = String(text || "");
+    const match = value.match(/(\d{4})\s*[\/\\\-\u2013]\s*(\d{2,4})/);
+
+    if (!match) return value.replace(/\s+/g, "").toLowerCase();
+
+    let end = match[2];
+    if (end.length === 2) end = match[1].slice(0, 2) + end;
+
+    return match[1] + "/" + end;
+
+}
+
+function formatAttendanceDays(value) {
+
+    const rounded = Math.round(Number(value) * 2) / 2;
+
+    if (!isFinite(rounded)) return "";
+
+    return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+
+}
+
+function formatAttendanceValue(present, opened) {
+    return "(" + formatAttendanceDays(present) + "/" + formatAttendanceDays(opened) + ") days";
+
+}
+
+function setAttendanceStatus(message, isError) {
+
+    if (attendanceStatusElement) {
+        attendanceStatusElement.textContent = message || "";
+        attendanceStatusElement.style.color = isError ? "#b00020" : "#0b6b62";
+    }
+
+    const text = String(message || "");
+
+    if (text.indexOf("\u2705") === 0 || text.indexOf("\u274C") === 0 || isError) {
+        showRosterNotification(text, !!isError || text.indexOf("\u274C") === 0);
+    }
+
+}
+
+function attendanceDatabaseHint(error) {
+
+    const text = String((error && error.message) || "");
+
+    if (
+        (error && (error.code === "42P01" || error.code === "PGRST205")) ||
+        /class_attendance/i.test(text) && /(does not exist|schema cache|not found)/i.test(text)
+    ) {
+        return " (Has attendance_setup.sql been run in Supabase?)";
+    }
+
+    return "";
+
+}
+
+/* ---------- reading the template ---------- */
+
+/* aoa = the Attendance sheet as an array of rows (arrays of cells). */
+function parseAttendanceSheetRows(aoa) {
+
+    let headerRow = -1;
+    let nameCol = -1;
+    let admCol = -1;
+
+    const searchLimit = Math.min(aoa.length, 60);
+
+    for (let r = 0; r < searchLimit && headerRow < 0; r++) {
+
+        const row = aoa[r] || [];
+
+        for (let c = 0; c < row.length; c++) {
+            if (/^full\s*name$/i.test(String(row[c] === null || row[c] === undefined ? "" : row[c]).trim())) {
+                headerRow = r;
+                nameCol = c;
+                break;
+            }
+        }
+
+    }
+
+    if (headerRow < 0) {
+        throw new Error(
+            "This does not look like the attendance template (no FULL NAME column found). " +
+            "Please download the template again."
+        );
+    }
+
+    const headerCells = aoa[headerRow] || [];
+    const sessionColumns = [];
+    const sessionKeys = [];
+    const sessionKeyCounts = {};
+
+    headerCells.forEach(function (cell, c) {
+
+        const text = String(cell === null || cell === undefined ? "" : cell).trim();
+
+        if (admCol < 0 && c !== nameCol && /^adm(ission)?\s*(no|number|num)?\.?$/i.test(text)) {
+            admCol = c;
+        }
+
+        if (c > nameCol && /^day\s*\d+\s*(am|pm|morning|afternoon)$/i.test(text)) {
+            sessionColumns.push(c);
+            sessionKeys.push(attendanceWeekAwareKey(text, sessionKeyCounts));
+        }
+
+    });
+
+    if (sessionColumns.length === 0) {
+        throw new Error(
+            "No DAY1 AM / DAY1 PM columns were found. " +
+            "Please use the attendance template from this page."
+        );
+    }
+
+    /* SESSION: / TERM: typed at the top of the template (optional) */
+    const meta = { session: "", term: "" };
+
+    for (let r = 0; r < headerRow; r++) {
+
+        const row = aoa[r] || [];
+        const label = String(row[0] === null || row[0] === undefined ? "" : row[0]).trim();
+        const value = String(row[1] === null || row[1] === undefined ? "" : row[1]).trim();
+
+        if (/^session\b/i.test(label) && value) meta.session = value;
+        if (/^term\b/i.test(label) && value) meta.term = value;
+
+    }
+
+    const held = new Array(sessionColumns.length).fill(false);
+    const students = [];
+    const seenKeys = new Set();
+    const invalidMarks = [];
+    let markedRowsWithoutName = 0;
+
+    for (let r = headerRow + 1; r < aoa.length; r++) {
+
+        const row = aoa[r] || [];
+
+        const name = cleanStudentName(row[nameCol]);
+        const admission = admCol >= 0
+            ? String(row[admCol] === null || row[admCol] === undefined ? "" : row[admCol]).trim()
+            : "";
+
+        let presentSessions = 0;
+        let absentSessions = 0;
+        let hasAnyMark = false;
+        const marks = {};
+
+        sessionColumns.forEach(function (c, index) {
+
+            const mark = String(row[c] === null || row[c] === undefined ? "" : row[c]).trim().toUpperCase();
+
+            if (mark === "" || mark === ".") return;
+
+            hasAnyMark = true;
+
+            if (mark === "P" || mark === "L") {
+                presentSessions++;
+                if (name) { held[index] = true; marks[sessionKeys[index]] = mark; }
+            } else if (mark === "A" || mark === "E") {
+                absentSessions++;
+                if (name) { held[index] = true; marks[sessionKeys[index]] = mark; }
+            } else if (name && invalidMarks.length < 5) {
+                invalidMarks.push({ row: r + 1, name: name, mark: mark });
+            }
+
+        });
+
+        if (!name) {
+            if (hasAnyMark) markedRowsWithoutName++;
+            continue;
+        }
+
+        const key = computeMatchKey(admission, name);
+
+        if (seenKeys.has(key)) {
+            throw new Error(
+                "\"" + name + "\" appears twice in the file" +
+                (admission ? "." : " - add an Adm No to tell them apart.")
+            );
+        }
+
+        seenKeys.add(key);
+
+        students.push({
+            admission_no: admission,
+            student_name: name,
+            match_key: key,
+            presentSessions: presentSessions,
+            absentSessions: absentSessions,
+            days_present: presentSessions / 2,
+            marks: marks
+        });
+
+    }
+
+    if (students.length === 0) {
+        throw new Error("No student names were found in the FULL NAME column.");
+    }
+
+    const sessionsHeld = held.filter(Boolean).length;
+
+    /* (A file with no marks is checked after it is merged with the saved marks.) */
+
+    const daysOpened = sessionsHeld / 2;
+
+    students.forEach(function (student) {
+        student.days_opened = daysOpened;
+    });
+
+    return {
+        students: students,
+        sessionsHeld: sessionsHeld,
+        daysOpened: daysOpened,
+        meta: meta,
+        invalidMarks: invalidMarks,
+        markedRowsWithoutName: markedRowsWithoutName
+    };
+
+}
+
+function attendanceMetaMismatch(meta, context) {
+
+    const problems = [];
+
+    const fileSession = attendanceSessionKey(meta.session);
+    const chosenSession = attendanceSessionKey(context.session);
+
+    if (fileSession && chosenSession && fileSession !== chosenSession) {
+        problems.push("session \"" + meta.session + "\" (you selected " + context.session + ")");
+    }
+
+    const fileTerm = attendanceTermName(meta.term);
+    const chosenTerm = attendanceTermName(context.term);
+
+    if (fileTerm && chosenTerm && fileTerm !== chosenTerm) {
+        problems.push("term \"" + meta.term + "\" (you selected " + context.term + ")");
+    }
+
+    return problems.join(" and ");
+
+}
+
+/* ---------- Supabase ---------- */
+
+/* ---------- the saved day-by-day marks ----------
+   Besides the totals (days present / days opened) every student's individual
+   P / L / A / E marks are saved in the "marks" column, e.g.
+   { "1AM": "P", "1PM": "P", "2AM": "A" }.
+   That is what puts yesterday's marks back into the template the next time it
+   is downloaded. */
+
+let attendanceMarksColumnMissing = false;
+
+/* The same DAY1 AM ... DAY5 PM headings usually repeat under every week of the
+   template. The first time a heading appears it keeps the plain key (e.g. "1AM");
+   the 2nd, 3rd ... time it gets a week prefix ("W2_1AM", "W3_1AM" ...), so each
+   week's marks are saved and restored in their own column. */
+function attendanceWeekAwareKey(text, counts) {
+
+    const base = attendanceSessionColumnKey(text);
+
+    if (!base) return "";
+
+    counts[base] = (counts[base] || 0) + 1;
+
+    return counts[base] === 1 ? base : "W" + counts[base] + "_" + base;
+
+}
+
+function attendanceSessionColumnKey(text) {
+
+    const match = String(text || "").trim().match(/^day\s*(\d+)\s*(am|pm|morning|afternoon)$/i);
+
+    if (!match) return "";
+
+    return parseInt(match[1], 10) + (/^(am|morning)$/i.test(match[2]) ? "AM" : "PM");
+
+}
+
+function cleanAttendanceMarks(value) {
+
+    const clean = {};
+
+    if (!value || typeof value !== "object" || Array.isArray(value)) return clean;
+
+    Object.keys(value).forEach(function (key) {
+
+        const mark = String(value[key] === null || value[key] === undefined ? "" : value[key]).trim().toUpperCase();
+
+        if (/^(W\d+_)?\d+(AM|PM)$/.test(key) && /^[PLAE]$/.test(mark)) clean[key] = mark;
+
+    });
+
+    return clean;
+
+}
+
+function isMissingAttendanceMarksColumn(error) {
+
+    if (!error) return false;
+
+    const text = String(error.message || "");
+
+    return (
+        error.code === "42703" ||
+        error.code === "PGRST204" ||
+        (/marks/i.test(text) && /(column|schema cache)/i.test(text))
+    );
+
+}
+
+/* Combines the marks in an uploaded file with the marks already saved.
+   A cell that is filled in the file wins; a cell left blank keeps the saved
+   mark, so uploading an old copy of the template can never wipe out marks
+   that were saved later. Totals are then counted again from ALL the marks. */
+function mergeAttendanceWithSaved(students, savedRows) {
+
+    const lookup = buildAttendanceLookup(savedRows || []);
+    const heldKeys = new Set();
+
+    students.forEach(function (student) {
+
+        const saved = findAttendanceRecord(lookup, {
+            "Admission No": student.admission_no,
+            "Student Name": student.student_name
+        });
+
+        const merged = Object.assign({}, saved ? cleanAttendanceMarks(saved.marks) : {}, student.marks || {});
+
+        let present = 0;
+
+        Object.keys(merged).forEach(function (key) {
+            heldKeys.add(key);
+            if (merged[key] === "P" || merged[key] === "L") present++;
+        });
+
+        student.marks = merged;
+        student.presentSessions = present;
+        student.days_present = present / 2;
+
+    });
+
+    const daysOpened = heldKeys.size / 2;
+
+    students.forEach(function (student) {
+        student.days_opened = daysOpened;
+    });
+
+    return { sessionsHeld: heldKeys.size, daysOpened: daysOpened };
+
+}
+
+/* Returns an array of rows, or null when the query failed. */
+async function fetchAttendanceRows(className, session, term) {
+
+    if (!currentUserId || !className || !session || !term) return [];
+
+    /* Read the copy saved on this phone first (works offline). */
+    const localAttendance = await Offline.list(ATTENDANCE_TABLE, function (r) {
+        return r.owner_user_id === currentUserId &&
+            r.website_id === WEBSITE_ID &&
+            r.class_name === className &&
+            r.session === session &&
+            r.term === term;
+    });
+
+    if (localAttendance.length || smIsOffline()) {
+        return localAttendance.map(function (row) {
+            return {
+                admission_no: String(row.admission_no || "").trim(),
+                student_name: cleanStudentName(row.student_name),
+                match_key: row.match_key,
+                days_present: Number(row.days_present),
+                days_opened: Number(row.days_opened),
+                updated_at: row.updated_at,
+                marks: cleanAttendanceMarks(row.marks)
+            };
+        });
+    }
+
+
+    const baseColumns = "admission_no, student_name, match_key, days_present, days_opened, updated_at";
+
+    function run(columns) {
+        return supabaseClient
+            .from(ATTENDANCE_TABLE)
+            .select(columns)
+            .eq("owner_user_id", currentUserId)
+            .eq("website_id", WEBSITE_ID)
+            .eq("class_name", className)
+            .eq("session", session)
+            .eq("term", term)
+            .range(0, 1999);
+    }
+
+    let result = await run(attendanceMarksColumnMissing ? baseColumns : baseColumns + ", marks");
+
+    /* The database was set up before day-by-day marks existed. */
+    if (result.error && !attendanceMarksColumnMissing && isMissingAttendanceMarksColumn(result.error)) {
+        attendanceMarksColumnMissing = true;
+        result = await run(baseColumns);
+    }
+
+    if (result.error) {
+        console.error("Fetch attendance error:", result.error);
+        return null;
+    }
+
+    return (result.data || []).map(function (row) {
+        return {
+            admission_no: String(row.admission_no || "").trim(),
+            student_name: cleanStudentName(row.student_name),
+            match_key: row.match_key,
+            days_present: Number(row.days_present),
+            days_opened: Number(row.days_opened),
+            updated_at: row.updated_at,
+            marks: cleanAttendanceMarks(row.marks)
+        };
+    });
+
+}
+
+function buildAttendanceLookup(rows) {
+
+    const lookup = { byKey: new Map(), byAdm: new Map(), byName: new Map() };
+
+    rows.forEach(function (row) {
+
+        const key = computeMatchKey(row.admission_no, row.student_name);
+        if (!lookup.byKey.has(key)) lookup.byKey.set(key, row);
+
+        const adm = normalizeStudentAdmissionNo(row.admission_no);
+        if (adm && !lookup.byAdm.has(adm)) lookup.byAdm.set(adm, row);
+
+        const name = normalizeStudentName(row.student_name);
+        if (name && !lookup.byName.has(name)) lookup.byName.set(name, row);
+
+    });
+
+    return lookup;
+
+}
+
+function findAttendanceRecord(lookup, student) {
+
+    const admissionRaw = student["Admission No"];
+    const adm = normalizeStudentAdmissionNo(admissionRaw);
+    const name = normalizeStudentName(student["Student Name"]);
+
+    let hit = lookup.byKey.get(computeMatchKey(admissionRaw, student["Student Name"]));
+
+    if (!hit && adm) hit = lookup.byAdm.get(adm);
+
+    if (!hit && name) {
+        const candidate = lookup.byName.get(name);
+        if (candidate && (!adm || !normalizeStudentAdmissionNo(candidate.admission_no))) {
+            hit = candidate;
+        }
+    }
+
+    return hit || null;
+
+}
+
+/* The Class / Session / Term a report belongs to (its own Scores row first,
+   then whatever is selected in Step 1A). */
+function attendanceContextForStudent(student) {
+
+    const selected = getWorkflowContext(false) || {};
+
+    const className = cleanStudentName(student && student["Class"]) || selected.className || "";
+    const session = String((student && student["Session"]) || "").trim() || selected.session || "";
+    const term =
+        attendanceTermName(student && student["Term"]) ||
+        attendanceTermName(selected.term) ||
+        "";
+
+    if (!className || !session || !term) return null;
+
+    const fallback =
+        selected.className && selected.session && selected.term
+            ? { className: selected.className, session: selected.session, term: selected.term }
+            : null;
+
+    return {
+        className: className,
+        session: session,
+        term: term,
+        fallback: fallback,
+        key: [normalizeClassKey(className), attendanceSessionKey(session), term].join("|")
+    };
+
+}
+
+/* Called before reports / results are built so the (synchronous) report
+   builder can read the saved attendance. Never throws. */
+async function preloadAttendanceForStudents(list) {
+
+    try {
+
+        if (!currentUserId || !Array.isArray(list)) return;
+
+        const wanted = new Map();
+
+        list.forEach(function (student) {
+            const context = attendanceContextForStudent(student);
+            if (context && !wanted.has(context.key)) wanted.set(context.key, context);
+        });
+
+        for (const context of wanted.values()) {
+
+            const cached = attendanceCache.get(context.key);
+            if (cached && Date.now() - cached.fetchedAt < ATTENDANCE_CACHE_MS) continue;
+
+            let rows = await fetchAttendanceRows(context.className, context.session, context.term);
+
+            if (rows && rows.length === 0 && context.fallback) {
+                rows = await fetchAttendanceRows(
+                    context.fallback.className,
+                    context.fallback.session,
+                    context.fallback.term
+                );
+            }
+
+            if (rows === null) continue;
+
+            attendanceCache.set(context.key, {
+                fetchedAt: Date.now(),
+                lookup: buildAttendanceLookup(rows)
+            });
+
+        }
+
+    } catch (error) {
+
+        console.error("Attendance preload error:", error);
+
+    }
+
+}
+
+/* "present/opened" for the report's Attendance box, or "" when nothing is saved. */
+function getStoredAttendanceText(student) {
+
+    try {
+
+        if (!student) return "";
+
+        const context = attendanceContextForStudent(student);
+        if (!context) return "";
+
+        const cached = attendanceCache.get(context.key);
+        if (!cached) return "";
+
+        const record = findAttendanceRecord(cached.lookup, student);
+        if (!record || !isFinite(record.days_present) || !isFinite(record.days_opened)) return "";
+
+        return formatAttendanceValue(record.days_present, record.days_opened);
+
+    } catch (error) {
+
+        console.error("Attendance lookup error:", error);
+        return "";
+
+    }
+
+}
+
+/* The student's behavior ratings, with the Attendance box replaced by the saved
+   "present/opened" text when attendance has been uploaded for the term. */
+function withStoredAttendance(student, behavior) {
+
+    const text = getStoredAttendanceText(student);
+
+    if (!text) return behavior;
+
+    return Object.assign({}, behavior, { Attendance: text });
+
+}
+
+/* ---------- filling the template with the class list ----------
+   The template has colours, merged cells, comments and formulas that the
+   browser's Excel library would lose if it re-saved the file. So the .xlsx
+   (a zip) is opened, only the Attendance sheet's XML is edited (session,
+   term, Adm No, Full Name) and the zip is written back. Every other file
+   inside the template is copied across untouched. */
+
+function attendanceCrc32(bytes) {
+
+    if (!attendanceCrc32.table) {
+        const table = new Uint32Array(256);
+        for (let n = 0; n < 256; n++) {
+            let c = n;
+            for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+            table[n] = c >>> 0;
+        }
+        attendanceCrc32.table = table;
+    }
+
+    const table = attendanceCrc32.table;
+    let crc = 0xFFFFFFFF;
+
+    for (let i = 0; i < bytes.length; i++) {
+        crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+    }
+
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+
+}
+
+async function attendanceTransformBytes(bytes, stream) {
+
+    const response = new Response(new Blob([bytes]).stream().pipeThrough(stream));
+
+    return new Uint8Array(await response.arrayBuffer());
+
+}
+
+function readAttendanceZipEntries(bytes) {
+
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+    let eocd = -1;
+
+    for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i--) {
+        if (view.getUint32(i, true) === 0x06054B50) { eocd = i; break; }
+    }
+
+    if (eocd < 0) throw new Error("The attendance template is not a valid Excel file.");
+
+    const count = view.getUint16(eocd + 10, true);
+    let position = view.getUint32(eocd + 16, true);
+    const decoder = new TextDecoder();
+    const entries = [];
+
+    for (let n = 0; n < count; n++) {
+
+        if (view.getUint32(position, true) !== 0x02014B50) {
+            throw new Error("The attendance template is damaged.");
+        }
+
+        const entry = {
+            versionMade: view.getUint16(position + 4, true),
+            versionNeeded: view.getUint16(position + 6, true),
+            flags: view.getUint16(position + 8, true),
+            method: view.getUint16(position + 10, true),
+            time: view.getUint16(position + 12, true),
+            date: view.getUint16(position + 14, true),
+            crc: view.getUint32(position + 16, true),
+            compSize: view.getUint32(position + 20, true),
+            size: view.getUint32(position + 24, true),
+            intAttr: view.getUint16(position + 36, true),
+            extAttr: view.getUint32(position + 38, true),
+            offset: view.getUint32(position + 42, true)
+        };
+
+        const nameLength = view.getUint16(position + 28, true);
+        const extraLength = view.getUint16(position + 30, true);
+        const commentLength = view.getUint16(position + 32, true);
+
+        if (entry.compSize === 0xFFFFFFFF || entry.offset === 0xFFFFFFFF) {
+            throw new Error("ZIP64 files are not supported.");
+        }
+
+        entry.nameBytes = bytes.slice(position + 46, position + 46 + nameLength);
+        entry.name = decoder.decode(entry.nameBytes);
+
+        const local = entry.offset;
+
+        if (view.getUint32(local, true) !== 0x04034B50) {
+            throw new Error("The attendance template is damaged.");
+        }
+
+        const dataStart = local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true);
+        entry.data = bytes.slice(dataStart, dataStart + entry.compSize);
+
+        entries.push(entry);
+        position += 46 + nameLength + extraLength + commentLength;
+
+    }
+
+    return entries;
+
+}
+
+function writeAttendanceZip(entries) {
+
+    const parts = [];
+    let offset = 0;
+
+    entries.forEach(function (entry) {
+
+        const header = new Uint8Array(30 + entry.nameBytes.length);
+        const view = new DataView(header.buffer);
+
+        view.setUint32(0, 0x04034B50, true);
+        view.setUint16(4, entry.versionNeeded || 20, true);
+        view.setUint16(6, entry.flags & ~0x0008, true);
+        view.setUint16(8, entry.method, true);
+        view.setUint16(10, entry.time, true);
+        view.setUint16(12, entry.date, true);
+        view.setUint32(14, entry.crc, true);
+        view.setUint32(18, entry.compSize, true);
+        view.setUint32(22, entry.size, true);
+        view.setUint16(26, entry.nameBytes.length, true);
+        view.setUint16(28, 0, true);
+        header.set(entry.nameBytes, 30);
+
+        entry.newOffset = offset;
+        parts.push(header, entry.data);
+        offset += header.length + entry.data.length;
+
+    });
+
+    const directoryStart = offset;
+
+    entries.forEach(function (entry) {
+
+        const record = new Uint8Array(46 + entry.nameBytes.length);
+        const view = new DataView(record.buffer);
+
+        view.setUint32(0, 0x02014B50, true);
+        view.setUint16(4, entry.versionMade || 20, true);
+        view.setUint16(6, entry.versionNeeded || 20, true);
+        view.setUint16(8, entry.flags & ~0x0008, true);
+        view.setUint16(10, entry.method, true);
+        view.setUint16(12, entry.time, true);
+        view.setUint16(14, entry.date, true);
+        view.setUint32(16, entry.crc, true);
+        view.setUint32(20, entry.compSize, true);
+        view.setUint32(24, entry.size, true);
+        view.setUint16(28, entry.nameBytes.length, true);
+        view.setUint16(30, 0, true);
+        view.setUint16(32, 0, true);
+        view.setUint16(34, 0, true);
+        view.setUint16(36, entry.intAttr, true);
+        view.setUint32(38, entry.extAttr, true);
+        view.setUint32(42, entry.newOffset, true);
+        record.set(entry.nameBytes, 46);
+
+        parts.push(record);
+        offset += record.length;
+
+    });
+
+    const end = new Uint8Array(22);
+    const endView = new DataView(end.buffer);
+
+    endView.setUint32(0, 0x06054B50, true);
+    endView.setUint16(8, entries.length, true);
+    endView.setUint16(10, entries.length, true);
+    endView.setUint32(12, offset - directoryStart, true);
+    endView.setUint32(16, directoryStart, true);
+    parts.push(end);
+
+    let total = 0;
+    parts.forEach(function (part) { total += part.length; });
+
+    const output = new Uint8Array(total);
+    let at = 0;
+    parts.forEach(function (part) { output.set(part, at); at += part.length; });
+
+    return output;
+
+}
+
+async function inflateAttendanceEntry(entry) {
+
+    if (entry.method === 0) return entry.data;
+
+    if (entry.method === 8) {
+        return attendanceTransformBytes(entry.data, new DecompressionStream("deflate-raw"));
+    }
+
+    throw new Error("Unsupported compression in the attendance template.");
+
+}
+
+/* Which file inside the zip is the "Attendance" sheet. */
+async function findAttendanceSheetPath(entries) {
+
+    const fallback = "xl/worksheets/sheet1.xml";
+
+    try {
+
+        const decoder = new TextDecoder();
+        const workbookEntry = entries.find(function (e) { return e.name === "xl/workbook.xml"; });
+        const relsEntry = entries.find(function (e) { return e.name === "xl/_rels/workbook.xml.rels"; });
+
+        if (!workbookEntry || !relsEntry) return fallback;
+
+        const workbookXml = decoder.decode(await inflateAttendanceEntry(workbookEntry));
+        const relsXml = decoder.decode(await inflateAttendanceEntry(relsEntry));
+
+        const sheetTags = workbookXml.match(/<sheet\b[^>]*>/g) || [];
+        const tag = sheetTags.find(function (t) { return /name="Attendance"/i.test(t); }) || sheetTags[0];
+        if (!tag) return fallback;
+
+        const idMatch = tag.match(/r:id="([^"]+)"/);
+        if (!idMatch) return fallback;
+
+        const relTags = relsXml.match(/<Relationship\b[^>]*>/g) || [];
+        const rel = relTags.find(function (t) { return t.indexOf('Id="' + idMatch[1] + '"') !== -1; });
+        if (!rel) return fallback;
+
+        const target = (rel.match(/Target="([^"]+)"/) || [])[1];
+        if (!target) return fallback;
+
+        return target.charAt(0) === "/" ? target.slice(1) : "xl/" + target.replace(/^\.\//, "");
+
+    } catch (error) {
+
+        return fallback;
+
+    }
+
+}
+
+function attendanceXmlEscape(text) {
+    return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+}
+
+function attendanceColumnNumber(letters) {
+    let n = 0;
+    for (let i = 0; i < letters.length; i++) n = n * 26 + (letters.charCodeAt(i) - 64);
+    return n;
+}
+
+/* Text cells to write: edits = Map(rowNumber -> [{ col: "B", text: "..." }]).
+   Existing cells keep their style; missing cells are inserted in column order.
+   Returns { xml, editedRows }. One pass over the sheet, so 2000 rows is fast. */
+function setAttendanceSheetTexts(xml, edits) {
+
+    const rowNumbers = Array.from(edits.keys()).sort(function (a, b) { return a - b; });
+
+    const pieces = [];
+    let cursor = 0;
+    const editedRows = [];
+
+    rowNumbers.forEach(function (rowNumber) {
+
+        const startTag = new RegExp("<row r=\"" + rowNumber + "\"(?=[\\s>/])[^>]*>", "g");
+        startTag.lastIndex = cursor;
+
+        const found = startTag.exec(xml);
+
+        if (!found) return;
+
+        const tagStart = found.index;
+        const tagEnd = tagStart + found[0].length;
+
+        let openTag = found[0];
+        let inner = "";
+        let rowEnd;
+
+        if (/\/>$/.test(openTag)) {
+            openTag = openTag.replace(/\/>$/, ">");
+            rowEnd = tagEnd;
+        } else {
+            const close = xml.indexOf("</row>", tagEnd);
+            if (close < 0) return;
+            inner = xml.slice(tagEnd, close);
+            rowEnd = close + 6;
+        }
+
+        openTag = openTag.replace(/\sspans="[^"]*"/, "");
+
+        const cellPattern = /<c r="([A-Z]+)\d+"[^>]*?(?:\/>|>[\s\S]*?<\/c>)/g;
+        const cells = [];
+        let match;
+
+        while ((match = cellPattern.exec(inner)) !== null) {
+            cells.push({
+                col: attendanceColumnNumber(match[1]),
+                xml: match[0],
+                style: (match[0].match(/^<c\b[^>]*?\ss="(\d+)"/) || [])[1]
+            });
+        }
+
+        edits.get(rowNumber).forEach(function (edit) {
+
+            const col = attendanceColumnNumber(edit.col);
+            const existing = cells.find(function (c) { return c.col === col; });
+            const style = existing && existing.style ? existing.style : (edit.style || "1");
+
+            const cellXml =
+                "<c r=\"" + edit.col + rowNumber + "\" s=\"" + style + "\" t=\"inlineStr\"><is><t xml:space=\"preserve\">" +
+                attendanceXmlEscape(edit.text) + "</t></is></c>";
+
+            if (existing) {
+                existing.xml = cellXml;
+            } else {
+                cells.push({ col: col, xml: cellXml, style: style });
+            }
+
+        });
+
+        cells.sort(function (a, b) { return a.col - b.col; });
+
+        pieces.push(xml.slice(cursor, tagStart));
+        pieces.push(openTag + cells.map(function (c) { return c.xml; }).join("") + "</row>");
+        cursor = rowEnd;
+        editedRows.push(rowNumber);
+
+    });
+
+    pieces.push(xml.slice(cursor));
+
+    return { xml: pieces.join(""), editedRows: editedRows };
+
+}
+
+/* ---------- finding the DAY columns inside the template ---------- */
+
+function attendanceDecodeXml(text) {
+    return String(text)
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, "\"")
+        .replace(/&apos;/g, "'")
+        .replace(/&#(\d+);/g, function (all, code) { return String.fromCharCode(Number(code)); })
+        .replace(/&amp;/g, "&");
+}
+
+function readAttendanceSharedStrings(xml) {
+
+    const list = [];
+    const items = xml.match(/<si\b[^>]*?\/>|<si\b[\s\S]*?<\/si>/g) || [];
+
+    items.forEach(function (item) {
+
+        const parts = item.match(/<t\b[^>]*>[\s\S]*?<\/t>/g) || [];
+
+        list.push(attendanceDecodeXml(parts.map(function (part) {
+            return part.replace(/^<t\b[^>]*>/, "").replace(/<\/t>$/, "");
+        }).join("")));
+
+    });
+
+    return list;
+
+}
+
+/* Looks at the top rows of the sheet XML, finds the header row (the one with
+   FULL NAME) and returns { columns: { "1AM": "D", "1PM": "E", ... } }. */
+function readAttendanceDayColumns(sheetXml, sharedStrings) {
+
+    const result = { headerRow: 0, columns: {} };
+    const dayKeyCounts = {};
+    const rowPattern = /<row\b[^>]*?\sr="(\d+)"[^>]*?(?:\/>|>([\s\S]*?)<\/row>)/g;
+    let rowMatch;
+
+    while ((rowMatch = rowPattern.exec(sheetXml)) !== null) {
+
+        const rowNumber = Number(rowMatch[1]);
+
+        if (rowNumber > 60) break;
+        if (!rowMatch[2]) continue;
+
+        const cellPattern = /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
+        const cells = [];
+        let cellMatch;
+
+        while ((cellMatch = cellPattern.exec(rowMatch[2])) !== null) {
+
+            const attributes = cellMatch[1] || "";
+            const inner = cellMatch[2] || "";
+            const ref = attributes.match(/\sr="([A-Z]+)\d+"/) || attributes.match(/^r="([A-Z]+)\d+"/);
+            const type = (attributes.match(/\st="(\w+)"/) || [])[1] || "";
+
+            if (!ref) continue;
+
+            let text = "";
+
+            if (type === "s") {
+                const index = Number((inner.match(/<v>(\d+)<\/v>/) || [])[1]);
+                text = sharedStrings[index] || "";
+            } else if (type === "inlineStr") {
+                text = attendanceDecodeXml((inner.match(/<t\b[^>]*>[\s\S]*?<\/t>/g) || []).map(function (part) {
+                    return part.replace(/^<t\b[^>]*>/, "").replace(/<\/t>$/, "");
+                }).join(""));
+            } else {
+                text = attendanceDecodeXml((inner.match(/<v>([\s\S]*?)<\/v>/) || [])[1] || "");
+            }
+
+            cells.push({ col: ref[1], text: text.trim() });
+
+        }
+
+        if (cells.some(function (cell) { return /^full\s*name$/i.test(cell.text); })) {
+
+            result.headerRow = rowNumber;
+
+            cells.forEach(function (cell) {
+                const key = attendanceWeekAwareKey(cell.text, dayKeyCounts);
+                if (key) result.columns[key] = cell.col;
+            });
+
+            break;
+
+        }
+
+    }
+
+    return result;
+
+}
+
+/* info = { session, term, students: [{ admission_no, student_name, marks }] }
+   Resolves { bytes, placed } - placed = how many students were written. */
+async function buildPrefilledAttendanceTemplate(bytes, info) {
+
+    if (typeof DecompressionStream === "undefined") {
+        throw new Error("This browser cannot fill in the template.");
+    }
+
+    const entries = readAttendanceZipEntries(bytes);
+    const sheetPath = await findAttendanceSheetPath(entries);
+    const target = entries.find(function (e) { return e.name === sheetPath; });
+
+    if (!target) throw new Error("The Attendance sheet was not found in the template.");
+
+    const xml = new TextDecoder().decode(await inflateAttendanceEntry(target));
+
+    /* Where the DAY1 AM / DAY1 PM ... columns are, so saved marks can be put back. */
+    let sharedStrings = [];
+    const sharedEntry = entries.find(function (e) { return e.name === "xl/sharedStrings.xml"; });
+
+    if (sharedEntry) {
+        try {
+            sharedStrings = readAttendanceSharedStrings(
+                new TextDecoder().decode(await inflateAttendanceEntry(sharedEntry))
+            );
+        } catch (error) {
+            sharedStrings = [];
+        }
+    }
+
+    const dayLayout = readAttendanceDayColumns(xml, sharedStrings);
+    let marksPlaced = 0;
+
+    const FIRST_STUDENT_ROW = 13;
+    const MAX_STUDENTS = 2000;
+
+    const edits = new Map();
+
+    if (info.session) edits.set(2, [{ col: "B", text: info.session }]);
+    if (info.term) edits.set(3, [{ col: "B", text: info.term }]);
+
+    const students = (info.students || []).slice(0, MAX_STUDENTS);
+
+    students.forEach(function (student, index) {
+
+        const cellEdits = [];
+
+        if (String(student.admission_no || "").trim()) {
+            cellEdits.push({ col: "B", text: String(student.admission_no).trim() });
+        }
+
+        cellEdits.push({ col: "C", text: student.student_name });
+
+        /* The marks saved on earlier days. */
+        const savedMarks = student.marks || {};
+
+        Object.keys(savedMarks).forEach(function (key) {
+            const column = dayLayout.columns[key];
+            if (column && savedMarks[key]) {
+                cellEdits.push({ col: column, text: savedMarks[key] });
+                marksPlaced++;
+            }
+        });
+
+        edits.set(FIRST_STUDENT_ROW + index, cellEdits);
+
+    });
+
+    const edited = setAttendanceSheetTexts(xml, edits);
+
+    let newXml = edited.xml;
+
+    /* Wider FULL NAME column so the names can be read. */
+    newXml = newXml.replace(
+        /(<col min="3" max="3"[^>]*?\swidth=")([\d.]+)(")/,
+        function (all, before, width, after) {
+            return Number(width) < 17 ? before + "17" + after : all;
+        }
+    );
+
+    const rawBytes = new TextEncoder().encode(newXml);
+
+    let data = rawBytes;
+    let method = 0;
+
+    if (typeof CompressionStream !== "undefined") {
+        try {
+            data = await attendanceTransformBytes(rawBytes, new CompressionStream("deflate-raw"));
+            method = 8;
+        } catch (error) {
+            data = rawBytes;
+            method = 0;
+        }
+    }
+
+    target.data = data;
+    target.method = method;
+    target.compSize = data.length;
+    target.size = rawBytes.length;
+    target.crc = attendanceCrc32(rawBytes);
+
+    const placed = edited.editedRows.filter(function (row) { return row >= FIRST_STUDENT_ROW; }).length;
+
+    return { bytes: writeAttendanceZip(entries), placed: placed, marksPlaced: marksPlaced };
+
+}
+
+/* ---------- download ---------- */
+
+async function downloadAttendanceTemplate() {
+
+    try {
+
+        const context = getWorkflowContext(false) || {};
+
+        setAttendanceStatus("\u23F3 Preparing the attendance template\u2026");
+
+        const response = await fetch(
+            new URL(ATTENDANCE_TEMPLATE_FILE, document.baseURI).href + "?v=" + Date.now(),
+            { cache: "no-store" }
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                "The attendance template (" + ATTENDANCE_TEMPLATE_FILE +
+                ") was not found on this website. Upload it to the same folder as the website's main page."
+            );
+        }
+
+        const bytes = new Uint8Array(await response.arrayBuffer());
+
+        /* An .xlsx is a zip file: it starts with "PK". */
+        if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4B) {
+            throw new Error("The attendance template on the website is not a valid Excel file.");
+        }
+
+        /* Names from the saved class list, plus the session and term. */
+        let roster = [];
+        let rosterProblem = "";
+
+        if (context.className && context.session && currentUserId) {
+
+            roster = await fetchClassRoster(context.className, context.session);
+
+            if (rosterFetchFailed) {
+                roster = [];
+                rosterProblem = "the saved class list could not be loaded";
+            }
+
+        }
+
+        /* Attendance (and marks) already saved for this Class + Session + Term. */
+        let savedRows = [];
+
+        if (context.className && context.session && context.term && currentUserId) {
+            const fetched = await fetchAttendanceRows(context.className, context.session, context.term);
+            if (fetched) savedRows = fetched;
+        }
+
+        const savedLookup = buildAttendanceLookup(savedRows);
+        const usedSaved = new Set();
+
+        const templateStudents = roster.map(function (student) {
+
+            const record = findAttendanceRecord(savedLookup, {
+                "Admission No": student.admission_no,
+                "Student Name": student.student_name
+            });
+
+            if (record) usedSaved.add(record);
+
+            return {
+                admission_no: student.admission_no,
+                student_name: student.student_name,
+                marks: record ? record.marks : {}
+            };
+
+        });
+
+        /* Students with saved attendance who are not on the class list are kept too. */
+        savedRows.forEach(function (record) {
+            if (!usedSaved.has(record)) {
+                templateStudents.push({
+                    admission_no: record.admission_no,
+                    student_name: record.student_name,
+                    marks: record.marks
+                });
+            }
+        });
+
+        let savedMarkCount = 0;
+        templateStudents.forEach(function (student) {
+            savedMarkCount += Object.keys(student.marks || {}).length;
+        });
+
+        let outputBytes = bytes;
+        let placed = 0;
+        let marksPlaced = 0;
+        let fillProblem = "";
+
+        if (context.session || context.term || templateStudents.length > 0) {
+
+            try {
+
+                const result = await buildPrefilledAttendanceTemplate(bytes, {
+                    session: context.session || "",
+                    term: context.term || "",
+                    students: templateStudents
+                });
+
+                outputBytes = result.bytes;
+                placed = result.placed;
+                marksPlaced = result.marksPlaced;
+
+            } catch (fillError) {
+
+                console.error("Attendance template fill error:", fillError);
+                outputBytes = bytes;
+                placed = 0;
+                fillProblem = "this browser could not fill in the template";
+
+            }
+
+        }
+
+        const nameParts = [context.className, context.session, context.term]
+            .filter(Boolean)
+            .map(safeFilePart)
+            .filter(Boolean);
+
+        const fileName = (nameParts.length ? nameParts.join("_") + "_" : "") + "Attendance_Template.xlsx";
+
+        const blob = new Blob([outputBytes], {
+            type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        });
+
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+
+        link.href = url;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        showManualDownloadLink(url, fileName);
+
+        setTimeout(function () {
+            URL.revokeObjectURL(url);
+            if (link.parentNode) link.parentNode.removeChild(link);
+        }, 300000);
+
+        let message;
+
+        if (placed > 0) {
+            message =
+                "\u2705 Attendance template downloaded with the " + placed + " student(s) of " +
+                contextLabel(context, true) + " already filled in. Mark P / L / A / E for every morning (AM) " +
+                "and afternoon (PM) roll call, then upload it here.";
+        } else {
+            const why =
+                fillProblem ||
+                rosterProblem ||
+                (!context.className || !context.session
+                    ? "no Class and Session are selected in Step 1A"
+                    : "no class list is saved yet for " + contextLabel(context, false));
+            message =
+                "\u2705 Attendance template downloaded, but the names are blank because " + why +
+                ". Type or paste the names, or save the class list in Step 1A and download again.";
+        }
+
+        if (marksPlaced > 0) {
+            message += " The marks saved on earlier days are already filled in - just add the new days.";
+        } else if (savedMarkCount > 0) {
+            message += " Note: the saved marks could not be placed because the DAY columns were not found in the template.";
+        }
+
+        setAttendanceStatus(message);
+
+    } catch (error) {
+
+        console.error("Attendance template download error:", error);
+        setAttendanceStatus("\u274C " + (error.message || "Could not download the attendance template."), true);
+
+    }
+
+}
+
+/* ---------- upload ---------- */
+
+async function handleAttendanceUploadButton() {
+
+    const file = attendanceFileInput && attendanceFileInput.files
+        ? attendanceFileInput.files[0]
+        : null;
+
+    if (!file) {
+        setAttendanceStatus("\u274C Please select the completed attendance Excel file first.", true);
+        return;
+    }
+
+    await uploadAttendanceToDatabase(file);
+
+}
+
+async function uploadAttendanceToDatabase(file) {
+
+    if (typeof XLSX === "undefined") {
+        setAttendanceStatus("\u274C Excel library has not loaded. Please refresh the page.", true);
+        return;
+    }
+
+    if (!currentUserId) {
+        setAttendanceStatus("\u274C Please sign in before uploading attendance.", true);
+        return;
+    }
+
+    const context = getWorkflowContext(true);
+    if (!context) return;
+
+    if (attendanceUploadButton) attendanceUploadButton.disabled = true;
+    setAttendanceStatus("\u23F3 Reading the attendance file\u2026");
+
+    try {
+
+        const workbook = XLSX.read(new Uint8Array(await file.arrayBuffer()), { type: "array" });
+
+        const sheet =
+            workbook.Sheets["Attendance"] ||
+            workbook.Sheets[workbook.SheetNames[0]];
+
+        if (!sheet) throw new Error("No worksheet was found in the uploaded file.");
+
+        const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+        const parsed = parseAttendanceSheetRows(aoa);
+
+        /* Wrong term / session is the easiest mistake to make - ask first. */
+        const mismatch = attendanceMetaMismatch(parsed.meta, context);
+
+        if (
+            mismatch &&
+            !confirm(
+                "This file says " + mismatch + ".\n\nSave it as the attendance for " +
+                contextLabel(context, true) + " anyway?"
+            )
+        ) {
+            setAttendanceStatus("Upload cancelled. Nothing was changed.");
+            return;
+        }
+
+        /* Reports match students by Adm No / name, so warn about names not on the class list. */
+        const roster = await fetchClassRoster(context.className, context.session);
+
+        if (roster.length > 0) {
+
+            const rosterLookup = buildAttendanceLookup(roster);
+
+            const unmatched = parsed.students.filter(function (student) {
+                return !findAttendanceRecord(rosterLookup, {
+                    "Admission No": student.admission_no,
+                    "Student Name": student.student_name
+                });
+            });
+
+            if (unmatched.length > 0) {
+
+                const shown = unmatched.slice(0, 6).map(function (s) { return s.student_name; }).join(", ");
+
+                if (!confirm(
+                    unmatched.length + " student(s) in this file are not on the saved class list for " +
+                    contextLabel(context, false) + ":\n" + shown +
+                    (unmatched.length > 6 ? ", \u2026" : "") +
+                    "\n\nThey will still be saved, but their reports will only pick up the attendance if " +
+                    "the name / Adm No matches the report. Continue?"
+                )) {
+                    setAttendanceStatus("Upload cancelled. Nothing was changed.");
+                    return;
+                }
+
+            }
+
+        }
+
+        const existing = await fetchAttendanceRows(context.className, context.session, context.term);
+
+        if (existing === null) {
+            throw new Error("Could not reach the attendance table." + attendanceDatabaseHint({ code: "42P01" }));
+        }
+
+        /* Blank cells keep the marks saved earlier; totals are counted from all marks. */
+        const combined = mergeAttendanceWithSaved(parsed.students, existing);
+
+        if (combined.sessionsHeld === 0) {
+            throw new Error(
+                "No attendance marks were found. Mark P, A, L or E for at least one roll call, then upload again."
+            );
+        }
+
+        parsed.sessionsHeld = combined.sessionsHeld;
+        parsed.daysOpened = combined.daysOpened;
+
+        const newKeys = new Set(parsed.students.map(function (s) { return s.match_key; }));
+        const removed = existing.filter(function (row) {
+            return !newKeys.has(computeMatchKey(row.admission_no, row.student_name));
+        });
+
+        if (
+            removed.length > 0 &&
+            !confirm(
+                removed.length + " student(s) with saved attendance for " + contextLabel(context, true) +
+                " are not in this file and will be removed from it.\n\nContinue?"
+            )
+        ) {
+            setAttendanceStatus("Upload cancelled. The saved attendance was not changed.");
+            return;
+        }
+
+        setAttendanceStatus("\u23F3 Saving attendance for " + parsed.students.length + " student(s)\u2026");
+
+        const now = new Date().toISOString();
+
+        const payload = parsed.students.map(function (student) {
+            return {
+                owner_user_id: currentUserId,
+                website_id: WEBSITE_ID,
+                class_name: context.className,
+                session: context.session,
+                term: context.term,
+                admission_no: student.admission_no,
+                student_name: student.student_name,
+                match_key: student.match_key,
+                days_present: student.days_present,
+                days_opened: student.days_opened,
+                marks: student.marks,
+                updated_at: now
+            };
+        });
+
+        /* Saved on this phone first; it syncs to Supabase when online. */
+        const marksSaved = true;
+
+        await Offline.upsertManyByKey(
+            ATTENDANCE_TABLE,
+            ["owner_user_id", "website_id", "class_name", "session", "term", "match_key"],
+            payload
+        );
+
+        const removedKeys = removed.map(function (row) {
+            return computeMatchKey(row.admission_no, row.student_name);
+        });
+
+        await Offline.removeWhere(ATTENDANCE_TABLE, function (r) {
+            return r.owner_user_id === currentUserId &&
+                r.website_id === WEBSITE_ID &&
+                r.class_name === context.className &&
+                r.session === context.session &&
+                r.term === context.term &&
+                removedKeys.indexOf(r.match_key) !== -1;
+        });
+
+        attendanceCache.clear();
+
+        let message =
+            "\u2705 Attendance saved for " + contextLabel(context, true) + ": " +
+            parsed.students.length + " student(s), school opened " +
+            formatAttendanceDays(parsed.daysOpened) + " day(s). " +
+            "It will print in the Attendance box of each report (for example " +
+            formatAttendanceValue(parsed.students[0].days_present, parsed.daysOpened) + ").";
+
+        if (marksSaved) {
+            message += " Every P / L / A / E mark was saved too, so the next template you download shows them.";
+        } else {
+            message +=
+                " Note: the day-by-day marks were NOT saved because the database table has no 'marks' column yet. " +
+                "Run attendance_marks_migration.sql in Supabase, refresh this page and upload again.";
+        }
+
+        if (parsed.invalidMarks.length > 0) {
+            const sample = parsed.invalidMarks.slice(0, 3).map(function (m) {
+                return m.name + " (row " + m.row + ": \"" + m.mark + "\")";
+            }).join(", ");
+            message += " Note: some cells were ignored because they are not P, L, A or E: " + sample + ".";
+        }
+
+        if (parsed.markedRowsWithoutName > 0) {
+            message += " Note: " + parsed.markedRowsWithoutName +
+                " row(s) had marks but no name and were skipped.";
+        }
+
+        setAttendanceStatus(message);
+        refreshAttendanceSummary();
+
+    } catch (error) {
+
+        console.error("Attendance upload error:", error);
+        setAttendanceStatus("\u274C " + (error.message || "Could not upload the attendance."), true);
+
+    } finally {
+
+        if (attendanceUploadButton) attendanceUploadButton.disabled = false;
+
+    }
+
+}
+
+/* ---------- what is already saved ---------- */
+
+async function refreshAttendanceSummary() {
+
+    try {
+
+        if (!attendanceSummaryElement) return;
+
+        const context = getWorkflowContext(false);
+
+        if (!context || !context.className || !context.session || !context.term || !currentUserId) {
+            attendanceSummaryElement.innerHTML = "";
+            return;
+        }
+
+        const rows = await fetchAttendanceRows(context.className, context.session, context.term);
+
+        /* The teacher may have changed class / term while we were loading. */
+        const now = getWorkflowContext(false);
+        if (
+            !now ||
+            now.className !== context.className ||
+            now.session !== context.session ||
+            now.term !== context.term
+        ) return;
+
+        if (rows === null) {
+            attendanceSummaryElement.innerHTML =
+                "<p style=\"color:#b00020;\">\u26A0 Saved attendance could not be loaded." +
+                escapeHTML(attendanceDatabaseHint({ code: "42P01" })) + "</p>";
+            return;
+        }
+
+        if (rows.length === 0) {
+            attendanceSummaryElement.innerHTML =
+                "<p><em>No attendance saved yet for " + escapeHTML(contextLabel(context, true)) + ".</em></p>";
+            return;
+        }
+
+        const opened = rows[0].days_opened;
+        const cell = "border:1px solid #ccc;padding:5px;";
+
+        let html =
+            "<details><summary><strong>" + rows.length + " student(s) saved &mdash; school opened " +
+            escapeHTML(formatAttendanceDays(opened)) + " day(s)</strong></summary>" +
+            "<table style=\"border-collapse:collapse;width:100%;margin-top:8px;\">" +
+            "<tr><th style=\"" + cell + "\">#</th>" +
+            "<th style=\"" + cell + "\">Adm No</th>" +
+            "<th style=\"" + cell + "text-align:left;\">Student Name</th>" +
+            "<th style=\"" + cell + "\">Days Present</th>" +
+            "<th style=\"" + cell + "\">Days Opened</th></tr>";
+
+        rows.forEach(function (row, index) {
+            html +=
+                "<tr><td style=\"" + cell + "text-align:center;\">" + (index + 1) + "</td>" +
+                "<td style=\"" + cell + "text-align:center;\">" + escapeHTML(row.admission_no) + "</td>" +
+                "<td style=\"" + cell + "\">" + escapeHTML(row.student_name) + "</td>" +
+                "<td style=\"" + cell + "text-align:center;\">" + escapeHTML(formatAttendanceDays(row.days_present)) + "</td>" +
+                "<td style=\"" + cell + "text-align:center;\">" + escapeHTML(formatAttendanceDays(row.days_opened)) + "</td></tr>";
+        });
+
+        html += "</table></details>";
+
+        attendanceSummaryElement.innerHTML = html;
+
+    } catch (error) {
+
+        console.error("Attendance summary error:", error);
+
+    }
+
+}
+
+/* ---------- the Attendance section on the page ---------- */
+
+/* The section is built here, right after the Step 1A card, so no change
+   to the page's HTML is needed. */
+function initializeAttendanceSection() {
+
+    let section = document.getElementById("attendanceSection");
+
+    if (section && section.getAttribute("data-attendance-ready") === "1") return;
+
+    const classListButton = document.getElementById("uploadClassListButton");
+    const classListTemplateButton = document.getElementById("downloadClassListTemplate");
+
+    const placeholderExists = !!section;
+    let anchor = null;
+
+    if (!section) {
+
+        if (classListButton) {
+            anchor =
+                classListButton.closest("section, fieldset, .card, .step-card, .panel, details") ||
+                classListButton.parentElement;
+        }
+
+        section = document.createElement("section");
+        section.id = "attendanceSection";
+        if (anchor && anchor.className) section.className = anchor.className;
+
+    }
+
+    /* Only build the content when the page's HTML does not already contain it. */
+    if (!section.querySelector("#downloadAttendanceTemplate")) {
+
+        const headingSource = anchor || classListButton;
+        const heading = headingSource && headingSource.closest
+            ? (anchor || headingSource).querySelector("h1, h2, h3")
+            : null;
+        const headingTag = heading ? heading.tagName.toLowerCase() : "h2";
+
+        section.innerHTML =
+            "<style>" +
+            "body.srg-role-subject:not(.srg-role-formmaster) #attendanceSection{display:none !important;}" +
+            "#attendanceSection .attendance-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:10px 0;}" +
+            "</style>" +
+            "<" + headingTag + ">Attendance</" + headingTag + ">" +
+            "<p class=\"context-banner\" style=\"font-weight:600;\"></p>" +
+            "<p>Download the attendance template, mark <strong>P</strong> (present), <strong>L</strong> (late), " +
+            "<strong>A</strong> (absent) or <strong>E</strong> (excused) for each morning and afternoon roll call, " +
+            "then upload it. Each student's <strong>total days present</strong> and the <strong>total days school " +
+            "opened</strong> are saved and printed in the Attendance box of every report for the selected " +
+            "Class, Session and Term.</p>" +
+            "<div class=\"attendance-row\"><button type=\"button\" id=\"downloadAttendanceTemplate\">" +
+            "Download Attendance Template</button></div>" +
+            "<div class=\"attendance-row\"><input type=\"file\" id=\"attendanceFile\" accept=\".xlsx,.xls\">" +
+            "<button type=\"button\" id=\"uploadAttendanceButton\">Upload Attendance</button></div>" +
+            "<p id=\"attendanceStatus\" role=\"status\" style=\"min-height:1.2em;font-weight:600;\"></p>" +
+            "<div id=\"attendanceSummary\"></div>";
+
+        /* Buttons look like the Step 1A buttons. */
+        const downloadButton = section.querySelector("#downloadAttendanceTemplate");
+        const uploadButton = section.querySelector("#uploadAttendanceButton");
+
+        if (classListTemplateButton && classListTemplateButton.className) {
+            downloadButton.className = classListTemplateButton.className;
+        }
+        if (classListButton && classListButton.className) {
+            uploadButton.className = classListButton.className;
+        }
+
+    }
+
+    if (!placeholderExists) {
+        if (anchor && anchor.parentNode) {
+            anchor.parentNode.insertBefore(section, anchor.nextSibling);
+        } else {
+            (document.querySelector("main") || document.body).appendChild(section);
+        }
+    }
+
+    attendanceDownloadButton = document.getElementById("downloadAttendanceTemplate");
+    attendanceFileInput = document.getElementById("attendanceFile");
+    attendanceUploadButton = document.getElementById("uploadAttendanceButton");
+    attendanceStatusElement = document.getElementById("attendanceStatus");
+    attendanceSummaryElement = document.getElementById("attendanceSummary");
+
+    if (attendanceDownloadButton) attendanceDownloadButton.addEventListener("click", downloadAttendanceTemplate);
+    if (attendanceUploadButton) attendanceUploadButton.addEventListener("click", handleAttendanceUploadButton);
+
+    if (attendanceFileInput) {
+        attendanceFileInput.addEventListener("change", function () {
+            const file = attendanceFileInput.files && attendanceFileInput.files[0];
+            setAttendanceStatus(
+                file ? "\uD83D\uDCC4 Selected: " + file.name + ". Click \"Upload Attendance\" to save it." : ""
+            );
+        });
+    }
+
+    section.setAttribute("data-attendance-ready", "1");
+
+    updateContextBanners();
+    refreshAttendanceSummary();
+
+}
+
+
+/* =========================================================
+   MASTER CLASS LIST  (STEP 1A)
+   ========================================================= */
+function rosterKey(admissionNo, studentName) {
+    return computeMatchKey(admissionNo, studentName);
+}
+
+async function fetchClassRoster(className, session) {
+
+    rosterFetchFailed = false;
+
+    if (!currentUserId || !className || !session) return [];
+
+    /* Read the copy saved on this phone first (works offline). */
+    const localRoster = (await Offline.list(CLASS_ROSTER_TABLE, function (r) {
+        return r.owner_user_id === currentUserId &&
+            r.website_id === WEBSITE_ID &&
+            r.class_name === className &&
+            r.session === session;
+    })).sort(function (a, b) {
+        return (a.sort_order || 0) - (b.sort_order || 0);
+    });
+
+    if (localRoster.length || smIsOffline()) {
+        return localRoster.map(function (row) {
+            return {
+                admission_no: String(row.admission_no || "").trim(),
+                student_name: cleanStudentName(row.student_name),
+                gender: String(row.gender || "").trim(),
+                house: String(row.house || "").trim()
+            };
+        });
+    }
+
+
+    const { data, error } = await supabaseClient
+        .from(CLASS_ROSTER_TABLE)
+        .select("admission_no, student_name, gender, house, sort_order")
+        .eq("owner_user_id", currentUserId)
+        .eq("website_id", WEBSITE_ID)
+        .eq("class_name", className)
+        .eq("session", session)
+        .order("sort_order", { ascending: true });
+
+    if (error) {
+        /* Non-fatal: templates fall back to blank name cells. */
+        console.error("Fetch class list error:", error);
+        rosterFetchFailed = true;
+        return [];
+    }
+
+    return (data || []).map(function (row) {
+        return {
+            admission_no: String(row.admission_no || "").trim(),
+            student_name: cleanStudentName(row.student_name),
+            gender: String(row.gender || "").trim(),
+            house: String(row.house || "").trim()
+        };
+    });
+
+}
+
+/* Step 1B: show the students of the selected class. */
+function renderStudentPreview() {
+
+    if (!elementExists(studentPreviewContainer)) return;
+
+    const context = getWorkflowContext(false);
+
+    if (!context.className) {
+        studentPreviewContainer.innerHTML = "";
+        renderStudentPhotoManager();
+        return;
+    }
+
+    if (classRoster.length === 0) {
+        studentPreviewContainer.innerHTML =
+            "<p><em>No class list has been uploaded for " +
+            escapeHTML(context.className) + " (" + escapeHTML(context.session) +
+            ") yet. Upload it in Step 1A.</em></p>";
+        return;
+    }
+
+    let html =
+        "<details><summary><strong>" + classRoster.length +
+        " student(s) in the class list</strong></summary>" +
+        "<table style=\"border-collapse:collapse;width:100%;margin-top:8px;\">" +
+        "<tr><th style=\"border:1px solid #ccc;padding:5px;\">#</th>" +
+        "<th style=\"border:1px solid #ccc;padding:5px;\">Adm No</th>" +
+        "<th style=\"border:1px solid #ccc;padding:5px;text-align:left;\">Student Name</th>" +
+        "<th style=\"border:1px solid #ccc;padding:5px;\">Gender</th></tr>";
+
+    classRoster.forEach(function (student, index) {
+        html +=
+            "<tr><td style=\"border:1px solid #ccc;padding:5px;text-align:center;\">" + (index + 1) + "</td>" +
+            "<td style=\"border:1px solid #ccc;padding:5px;text-align:center;\">" + escapeHTML(student.admission_no) + "</td>" +
+            "<td style=\"border:1px solid #ccc;padding:5px;\">" + escapeHTML(student.student_name) + "</td>" +
+            "<td style=\"border:1px solid #ccc;padding:5px;text-align:center;\">" + escapeHTML(student.gender) + "</td></tr>";
+    });
+
+    html += "</table></details>";
+
+    studentPreviewContainer.innerHTML = html;
+    renderStudentPhotoManager();
+
+}
+
+async function loadClassRosterForContext() {
+
+    refreshAttendanceSummary();
+
+    const context = getWorkflowContext(false);
+
+    if (!context.className || !context.session || !currentUserId) {
+        classRoster = [];
+        renderStudentPreview();
+        return;
+    }
+
+    classRoster = await fetchClassRoster(context.className, context.session);
+    await withTimeout(ensureStudentPhotosLoaded(), 20000, null);
+    renderStudentPreview();
+
+    if (rosterFetchFailed) {
+        if (rosterStatus) {
+            rosterStatus.textContent =
+                "⚠ The saved class list could not be loaded (has the class_students SQL been run in Supabase?).";
+            rosterStatus.style.color = "#b00020";
+        }
+        return;
+    }
+
+    if (rosterStatus) {
+        rosterStatus.textContent = classRoster.length
+            ? classRoster.length + " student(s) saved for " + contextLabel(context, false) + "."
+            : "No class list saved yet for " + contextLabel(context, false) + ".";
+        rosterStatus.style.color = "#0b6b62";
+    }
+
+}
+
+/* Merge the master class list with the scores already saved for a
+   subject. Class-list order wins. A saved score row is matched by
+   Adm No + name, then by Adm No alone, then by name alone when one
+   of the two sides has no Adm No - so adding an Adm No later, or
+   correcting a spelling, does not orphan scores that were saved. */
+function mergeRosterWithSavedScores(roster, savedRows) {
+
+    if (!roster || roster.length === 0) return savedRows || [];
+
+    const byKey = new Map();
+    const byAdmission = new Map();
+    const byName = new Map();
+
+    (savedRows || []).forEach(function (saved) {
+
+        const key = computeMatchKey(saved.admission_no, saved.student_name);
+        if (!byKey.has(key)) byKey.set(key, saved);
+
+        const adm = normalizeStudentAdmissionNo(saved.admission_no);
+        if (adm && !byAdmission.has(adm)) byAdmission.set(adm, saved);
+
+        const name = normalizeStudentName(saved.student_name);
+        if (name && !byName.has(name)) byName.set(name, saved);
+
+    });
+
+    return roster.map(function (student) {
+
+        const adm = normalizeStudentAdmissionNo(student.admission_no);
+
+        let saved =
+            byKey.get(rosterKey(student.admission_no, student.student_name)) ||
+            (adm ? byAdmission.get(adm) : null) ||
+            null;
+
+        if (!saved) {
+            const candidate = byName.get(normalizeStudentName(student.student_name));
+            if (
+                candidate &&
+                (!adm || !normalizeStudentAdmissionNo(candidate.admission_no))
+            ) {
+                saved = candidate;
+            }
+        }
+
+        return {
+            admission_no: student.admission_no,
+            student_name: student.student_name,
+            first_ca: saved ? saved.first_ca : null,
+            second_ca: saved ? saved.second_ca : null,
+            exams: saved ? saved.exams : null,
+            extras: saved ? cleanExtrasObject(saved.extras) : {}
+        };
+
+    });
+
+}
+
+/* Writes the master list into the Scores sheet of the general template
+   (Admission No, Name, Gender, Class, Term, Session, House). */
+function applyRosterToScoresSheet(scoresSheet, roster, context) {
+
+    const text = function (value) {
+        return { t: "s", v: String(value ?? ""), z: "@" };
+    };
+
+    if (!roster || roster.length === 0) {
+        /* No class list: keep the example row, but with the chosen term/session. */
+        scoresSheet["D2"] = text(context.className);
+        scoresSheet["E2"] = text(context.term);
+        scoresSheet["F2"] = text(context.session);
+        return 0;
+    }
+
+    const limit = Math.min(roster.length, TEMPLATE_STUDENT_ROWS);
+
+    for (let i = 0; i < limit; i++) {
+        const row = i + 2;
+        scoresSheet["A" + row] = text(roster[i].admission_no);
+        scoresSheet["B" + row] = text(roster[i].student_name);
+        scoresSheet["C" + row] = text(roster[i].gender);
+        scoresSheet["D" + row] = text(context.className);
+        scoresSheet["E" + row] = text(context.term);
+        scoresSheet["F" + row] = text(context.session);
+        scoresSheet["G" + row] = text(roster[i].house);
+    }
+
+    return limit;
+
+}
+
+/* ---------------------------------------------------------
+   showManualDownloadLink
+   Chrome treats a download started several seconds after the tap
+   (after waiting on the server) as an "automatic" download. It
+   allows the first one, then blocks the rest silently until the
+   page is refreshed. A real tap on a link is always allowed, so
+   every generated file also gets this "tap to save" banner.
+   --------------------------------------------------------- */
+
+/* ---------------------------------------------------------
+   Android app (Capacitor) support.
+   The Android WebView ignores blob / a[download] links, so inside
+   the app the file is written with the Filesystem plugin and then
+   handed to the share sheet (Save to Files, Drive, WhatsApp, Excel).
+   In a normal browser nothing here runs.
+   --------------------------------------------------------- */
+
+/* ---------------------------------------------------------
+   printReportsPage
+   window.print() does nothing in the Android WebView, so inside the
+   app the custom PrintPlugin (PrintPlugin.java) opens Android's
+   print dialog (Save as PDF / printer). Browsers use window.print().
+   --------------------------------------------------------- */
+
+function printReportsPage() {
+
+    const plugin = isNativeApp() && window.Capacitor.Plugins && window.Capacitor.Plugins.PrintPlugin;
+
+    if (!plugin) {
+        if (isNativeApp()) {
+            alert("\u274C Printing is not available in this version of the app. Please install the latest version.");
+            return;
+        }
+
+        /* Phone browsers: build the same fitted, fill-the-page print layout
+           the app uses, then open the browser's print dialog. Desktop
+           browsers keep the normal print path. */
+        const phoneBrowser = !!(window.matchMedia &&
+            (window.matchMedia("(pointer: coarse)").matches || window.innerWidth <= 820));
+
+        if (phoneBrowser) {
+            prepareReportsForPrintInApp().catch(function (error) {
+                console.error("Print preparation error:", error);
+            }).then(function () {
+                setTimeout(function () { window.print(); }, 250);
+            });
+            return;
+        }
+
+        window.print();
+        return;
+    }
+
+    /* The Android WebView never fires "beforeprint", so the report-only
+       print layer and the shrink-to-one-page logic must be started by hand.
+       The layer is removed again when the app regains focus after the
+       print dialog closes (see the focus / visibilitychange handlers). */
+    prepareReportsForPrintInApp().catch(function (error) {
+        console.error("Print preparation error:", error);
+    }).then(function () {
+        setTimeout(function () {
+            plugin.print({ name: "Student_Reports" }).catch(function (error) {
+                console.error("Native print error:", error);
+                restoreReportsAfterPrint();
+                alert("\u274C Could not open the print dialog: " + (error && error.message ? error.message : error));
+            });
+        }, 250);
+    });
+
+}
+
+function isNativeApp() {
+    try {
+        return !!(window.Capacitor &&
+            typeof window.Capacitor.isNativePlatform === "function" &&
+            window.Capacitor.isNativePlatform());
+    } catch (e) {
+        return false;
+    }
+}
+
+function blobToBase64(blob) {
+    return new Promise(function (resolve, reject) {
+        const reader = new FileReader();
+        reader.onloadend = function () {
+            const result = String(reader.result || "");
+            resolve(result.substring(result.indexOf(",") + 1));
+        };
+        reader.onerror = function () { reject(reader.error || new Error("Could not read file")); };
+        reader.readAsDataURL(blob);
+    });
+}
+
+async function saveAndShareNative(url, fileName) {
+
+    const plugins = window.Capacitor && window.Capacitor.Plugins;
+    const Filesystem = plugins && plugins.Filesystem;
+    const Share = plugins && plugins.Share;
+
+    if (!Filesystem || !Share) {
+        throw new Error("Save plugins are missing from this app. Please install the latest version of the app.");
+    }
+
+    const response = await fetch(url);
+    const blob = await response.blob();
+    const data = await blobToBase64(blob);
+
+    const written = await Filesystem.writeFile({
+        path: fileName,
+        data: data,
+        directory: "CACHE"
+    });
+
+    await Share.share({
+        title: fileName,
+        url: written.uri,
+        dialogTitle: "Save or open " + fileName
+    });
+
+}
+
+/* ---------------------------------------------------------
+   showManualDownloadLink
+   Chrome treats a download started several seconds after the tap
+   (after waiting on the server) as an "automatic" download. It
+   allows the first one, then blocks the rest silently until the
+   page is refreshed. A real tap on a link is always allowed, so
+   every generated file also gets this "tap to save" banner.
+
+   In the Android app the banner button opens the share sheet
+   instead (and the sheet is also opened automatically once).
+   --------------------------------------------------------- */
+
+function showManualDownloadLink(url, fileName) {
+
+    const native = isNativeApp();
+
+    const old = document.getElementById("manualDownloadBanner");
+    if (old) old.remove();
+
+    const box = document.createElement("div");
+    box.id = "manualDownloadBanner";
+    box.style.cssText =
+        "position:fixed;left:50%;bottom:16px;transform:translateX(-50%);" +
+        "z-index:99999;display:flex;align-items:center;gap:12px;" +
+        "max-width:92vw;padding:10px 14px;border-radius:10px;" +
+        "background:#1f2937;color:#fff;font-size:14px;" +
+        "box-shadow:0 6px 20px rgba(0,0,0,.35);";
+
+    const link = document.createElement("a");
+    link.href = native ? "#" : url;
+    if (!native) link.download = fileName;
+    link.textContent = (native ? "\u2B07 Tap here to save / share " : "\u2B07 Tap here to save ") + fileName;
+    link.style.cssText = "color:#ffd54f;font-weight:700;text-decoration:underline;word-break:break-all;";
+
+    if (native) {
+        link.addEventListener("click", function (event) {
+            event.preventDefault();
+            saveAndShareNative(url, fileName).catch(function (error) {
+                console.error("Native save error:", error);
+                alert("\u274C Could not save the file: " + (error && error.message ? error.message : error));
+            });
+        });
+    }
+
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "\u2715";
+    close.setAttribute("aria-label", "Close");
+    close.style.cssText = "background:none;border:0;color:#fff;font-size:18px;cursor:pointer;";
+    close.addEventListener("click", function () { box.remove(); });
+
+    box.appendChild(link);
+    box.appendChild(close);
+    document.body.appendChild(box);
+
+    setTimeout(function () { if (box.parentNode) box.remove(); }, 240000);
+
+    if (native) {
+        saveAndShareNative(url, fileName).catch(function (error) {
+            console.error("Native save error:", error);
+            alert("\u274C Could not save the file: " + (error && error.message ? error.message : error));
+        });
+    }
+
+}
+
+function downloadWorkbook(workbook, fileName) {
+
+    const bytes = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
+
+    const blob = new Blob([bytes], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    });
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+        showManualDownloadLink(url, link.download);
+
+    setTimeout(function () {
+        URL.revokeObjectURL(url);
+        if (link.parentNode) link.parentNode.removeChild(link);
+    }, 300000);
+
+}
+
+function safeFilePart(text) {
+    return String(text || "").replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "");
+}
+
+async function downloadClassListTemplate() {
+
+    try {
+
+        if (typeof XLSX === "undefined") {
+            throw new Error("Excel library has not loaded. Please refresh the page.");
+        }
+
+        const context = getWorkflowContext(true);
+        if (!context) return;
+
+        /* Already-saved students are pre-filled so the form master can add to the list. */
+        const existing = await fetchClassRoster(context.className, context.session);
+
+        const classLevelName = getClassLevel(context.className);
+
+        const data = [["Admission No", "Student Name", "Gender", "House", "Class", "Session", "Level"]];
+
+        for (let i = 0; i < TEMPLATE_STUDENT_ROWS; i++) {
+            const student = existing[i];
+            data.push([
+                student ? student.admission_no : "",
+                student ? student.student_name : "",
+                student ? student.gender : "",
+                student ? student.house : "",
+                context.className,
+                context.session,
+                classLevelName
+            ]);
+        }
+
+        const sheet = XLSX.utils.aoa_to_sheet(data);
+
+        for (let row = 2; row <= TEMPLATE_STUDENT_ROWS + 1; row++) {
+            const cell = sheet["A" + row];
+            if (cell) { cell.t = "s"; cell.z = "@"; cell.v = String(cell.v ?? ""); }
+        }
+
+        sheet["!cols"] = [
+            { wch: 9 }, { wch: 13 }, { wch: 8 }, { wch: 9 }, { wch: 11 }, { wch: 9 }, { wch: 11 }
+        ];
+        sheet["!freeze"] = { xSplit: 2, ySplit: 1 };
+
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, sheet, "Class List");
+
+        downloadWorkbook(
+            workbook,
+            safeFilePart(context.className) + "_" + safeFilePart(context.session) +
+            "_Class_List_Template.xlsx"
+        );
+
+        setRosterStatus(
+            "✅ Class List Template downloaded for " + contextLabel(context, false) +
+            ". Enter each student's name (Admission No is optional), then upload it here."
+        );
+
+    } catch (error) {
+
+        console.error("Class list template error:", error);
+        setRosterStatus("❌ " + (error.message || "Could not create the Class List Template."), true);
+
+    }
+
+}
+
+async function handleClassListUploadButton() {
+
+    const file = classListFileInput && classListFileInput.files
+        ? classListFileInput.files[0]
+        : null;
+
+    if (!file) {
+        setRosterStatus("❌ Please select a completed Class List Excel file first.", true);
+        return;
+    }
+
+    await uploadClassListToDatabase(file);
+
+}
+
+async function uploadClassListToDatabase(file) {
+
+    if (typeof XLSX === "undefined") {
+        setRosterStatus("❌ Excel library has not loaded. Please refresh the page.", true);
+        return;
+    }
+
+    if (!currentUserId) {
+        setRosterStatus("❌ Please sign in before uploading the class list.", true);
+        return;
+    }
+
+    const context = getWorkflowContext(true);
+    if (!context) return;
+
+    if (uploadClassListButton) uploadClassListButton.disabled = true;
+    setRosterStatus("⏳ Reading the Class List…");
+
+    try {
+
+        const workbook = XLSX.read(new Uint8Array(await file.arrayBuffer()), { type: "array" });
+        const sheetName = workbook.Sheets["Class List"]
+            ? "Class List"
+            : workbook.SheetNames.find(function (name) { return name !== "Meta"; });
+
+        if (!sheetName) throw new Error("No worksheet was found in the uploaded file.");
+
+        const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: "" });
+
+        const pick = function (row, names) {
+            for (const key of Object.keys(row)) {
+                const simple = key.toLowerCase().replace(/[^a-z]/g, "");
+                if (names.indexOf(simple) !== -1) return row[key];
+            }
+            return "";
+        };
+
+        const students = [];
+        const seenKeys = new Set();
+        const seenAdmissions = new Set();
+
+        rows.forEach(function (row, index) {
+
+            const name = cleanStudentName(pick(row, ["studentname", "name", "fullname"]));
+            const admission = String(pick(row, ["admissionno", "admno", "admissionnumber"]) ?? "").trim();
+            const rowClass = cleanStudentName(pick(row, ["class"]));
+            const rowSession = String(pick(row, ["session"]) ?? "").trim();
+
+            if (!name && !admission) return;
+
+            if (!name) {
+                throw new Error("Row " + (index + 2) + " has an Admission No but no Student Name.");
+            }
+
+            if (rowClass && normalizeClassKey(rowClass) !== normalizeClassKey(context.className)) {
+                throw new Error(
+                    "This file is for a different class (" + rowClass + "). " +
+                    "Please upload the template for " + context.className + "."
+                );
+            }
+
+            if (rowSession && rowSession !== context.session) {
+                throw new Error(
+                    "This file is for session " + rowSession + " but " + context.session +
+                    " is selected. Change the session or download a new template."
+                );
+            }
+
+            const key = rosterKey(admission, name);
+
+            if (seenKeys.has(key)) {
+                throw new Error(
+                    "\"" + name + "\" appears twice" +
+                    (admission ? "." : " - add an Admission No to tell them apart.")
+                );
+            }
+
+            const admKey = normalizeStudentAdmissionNo(admission);
+
+            if (admKey && seenAdmissions.has(admKey)) {
+                throw new Error("Admission No \"" + admission + "\" is used by two students.");
+            }
+
+            seenKeys.add(key);
+            if (admKey) seenAdmissions.add(admKey);
+
+            students.push({
+                admission_no: admission,
+                student_name: name,
+                gender: String(pick(row, ["gender", "sex"]) ?? "").trim(),
+                house: String(pick(row, ["house"]) ?? "").trim()
+            });
+
+        });
+
+        if (students.length === 0) {
+            throw new Error("No student names were found. Please fill the Student Name column.");
+        }
+
+        if (students.length > TEMPLATE_STUDENT_ROWS) {
+            throw new Error(
+                "A class can have at most " + TEMPLATE_STUDENT_ROWS +
+                " students (this file has " + students.length + ")."
+            );
+        }
+
+        const existing = await fetchClassRoster(context.className, context.session);
+        const newKeys = new Set(students.map(function (s) { return rosterKey(s.admission_no, s.student_name); }));
+
+        const removed = existing.filter(function (s) {
+            return !newKeys.has(rosterKey(s.admission_no, s.student_name));
+        });
+
+        if (
+            removed.length > 0 &&
+            !confirm(
+                removed.length + " student(s) on the saved list for " +
+                contextLabel(context, false) + " are not in this file and will be removed " +
+                "from the list (their saved scores are not deleted).\n\nContinue?"
+            )
+        ) {
+            setRosterStatus("Upload cancelled. The saved class list was not changed.");
+            return;
+        }
+
+        setRosterStatus("⏳ Saving " + students.length + " student(s)…");
+
+        const now = new Date().toISOString();
+
+        const payload = students.map(function (student, index) {
+            return {
+                owner_user_id: currentUserId,
+                website_id: WEBSITE_ID,
+                class_name: context.className,
+                session: context.session,
+                admission_no: student.admission_no,
+                student_name: student.student_name,
+                gender: student.gender,
+                house: student.house,
+                match_key: rosterKey(student.admission_no, student.student_name),
+                sort_order: index,
+                updated_at: now
+            };
+        });
+
+        /* Saved on this phone first; it syncs to Supabase when online. */
+        await Offline.upsertManyByKey(
+            CLASS_ROSTER_TABLE,
+            ["owner_user_id", "website_id", "class_name", "session", "match_key"],
+            payload
+        );
+
+        const removedKeys = removed.map(function (s) { return rosterKey(s.admission_no, s.student_name); });
+
+        await Offline.removeWhere(CLASS_ROSTER_TABLE, function (r) {
+            return r.owner_user_id === currentUserId &&
+                r.website_id === WEBSITE_ID &&
+                r.class_name === context.className &&
+                r.session === context.session &&
+                removedKeys.indexOf(r.match_key) !== -1;
+        });
+
+        classRoster = await fetchClassRoster(context.className, context.session);
+        renderStudentPreview();
+
+        setRosterStatus(
+            "✅ " + students.length + " student(s) uploaded and saved for " +
+            contextLabel(context, false) +
+            ". They now appear automatically in Step 1B and Step 1C."
+        );
+
+    } catch (error) {
+
+        console.error("Class list upload error:", error);
+        setRosterStatus("❌ " + (error.message || "Could not upload the Class List."), true);
+
+    } finally {
+
+        if (uploadClassListButton) uploadClassListButton.disabled = false;
+
+    }
+
+}
+
+/* Warn a subject teacher when uploaded rows are not in the class list. */
+function describeRosterMismatch(roster, rows) {
+
+    if (!roster || roster.length === 0) return "";
+
+    const keys = new Set(roster.map(function (s) { return rosterKey(s.admission_no, s.student_name); }));
+    const admissions = new Set(
+        roster.map(function (s) { return normalizeStudentAdmissionNo(s.admission_no); }).filter(Boolean)
+    );
+    const names = new Set(roster.map(function (s) { return normalizeStudentName(s.student_name); }));
+
+    const unmatched = [];
+
+    rows.forEach(function (row) {
+
+        const admission = String(row["Adm No"] ?? "").trim();
+        const name = cleanStudentName(row["Student Name"]);
+
+        if (!admission && !name) return;
+
+        const matched =
+            keys.has(computeMatchKey(admission, name)) ||
+            (admission && admissions.has(normalizeStudentAdmissionNo(admission))) ||
+            (!admission && names.has(normalizeStudentName(name)));
+
+        if (!matched) unmatched.push(name || admission);
+
+    });
+
+    if (unmatched.length === 0) return "";
+
+    return (
+        " ⚠ " + unmatched.length + " row(s) are not in the class list (" +
+        unmatched.slice(0, 5).join(", ") + (unmatched.length > 5 ? ", …" : "") +
+        "). Check the spelling or Adm No."
+    );
+
+}
+
+
+/* =========================================================
+   AUTOMATIC COMMENTS
+
+   Class Teacher's and Principal's comments are chosen from the
+   student's AVERAGE, using the same A-F boundaries as the report's
+   grading. Several comments per band are kept so a whole class does
+   not receive the identical sentence; the one used for a given
+   student is fixed (derived from Adm No / name), so regenerating a
+   report never changes it. A comment typed in the Scores sheet
+   always wins. Comments are kept short to fit the report boxes.
+   ========================================================= */
+const COMMENT_GRADES = ["A", "B", "C", "D", "E", "F"];
+
+const DEFAULT_COMMENT_BANK = {
+
+    teacher: {
+        A: [
+            "An outstanding result. Keep up this excellent work and remain focused.",
+            "Excellent performance across the subjects. Continue to aim high.",
+            "A brilliant showing this term. Maintain this commendable standard.",
+            "Impressive results. Your dedication and hard work are clearly paying off."
+        ],
+        B: [
+            "A very good result. With a little more effort, you can reach the top.",
+            "Good performance overall. Keep working hard and aim even higher.",
+            "Commendable effort this term. Stay consistent and keep improving.",
+            "A good result. Focus on your weaker subjects to do even better."
+        ],
+        C: [
+            "A fair performance. More effort and consistent study will bring improvement.",
+            "Average result. You can do better with more concentration and practice.",
+            "Satisfactory work, but there is room for improvement. Study harder.",
+            "A decent effort. Pay closer attention in class and revise regularly."
+        ],
+        D: [
+            "A weak performance. You need to study harder and seek help where necessary.",
+            "Below average result. Greater effort and regular revision are needed.",
+            "Improvement is needed. Attend classes regularly and do all assignments.",
+            "A poor showing this term. More seriousness and dedication are required."
+        ],
+        E: [
+            "A marginal pass. Much more effort is needed to improve.",
+            "Performance is below expectation. Serious improvement is required.",
+            "A weak result. Regular study and extra help are strongly advised."
+        ],
+        F: [
+            "A very poor result. Urgent and serious improvement is required.",
+            "Performance is far below the expected standard. Extra support is advised.",
+            "Much work is needed. Parents should closely monitor study at home."
+        ]
+    },
+
+    principal: {
+        A: [
+            "Excellent result. Keep flying the school's flag high.",
+            "Outstanding performance. The school is proud of you; keep it up.",
+            "A remarkable achievement. Continue to be a role model to others."
+        ],
+        B: [
+            "A very good result. Keep striving for excellence.",
+            "Good performance. Continue to work hard and aim higher.",
+            "Commendable result. Keep up the effort."
+        ],
+        C: [
+            "A fair result. You can do better; work harder next term.",
+            "Average performance. Greater effort is expected of you.",
+            "Satisfactory, but you are capable of much more. Put in more effort."
+        ],
+        D: [
+            "A weak result. Serious effort is needed to improve next term.",
+            "Below average. You are advised to work much harder.",
+            "Not encouraging. Improve your study habits without delay."
+        ],
+        E: [
+            "A marginal pass. Serious improvement is expected next term.",
+            "A poor result. You must sit up and work much harder.",
+            "Weak performance. Please work harder; the school will support you."
+        ],
+        F: [
+            "A very poor result. Parents are advised to meet the class teacher.",
+            "Urgent improvement is required. Please see the school management.",
+            "Far below standard. Much greater seriousness is required next term."
+        ]
+    }
+
+};
+
+/* Saved settings + defaults. A band left empty falls back to the default. */
+function getCommentBank() {
+
+    const saved = reportSettings && reportSettings.commentBank
+        ? reportSettings.commentBank
+        : null;
+
+    const bank = {
+        enabled: !(saved && saved.enabled === false),
+        teacher: {},
+        principal: {}
+    };
+
+    ["teacher", "principal"].forEach(function (kind) {
+
+        COMMENT_GRADES.forEach(function (grade) {
+
+            const custom =
+                saved && saved[kind] && Array.isArray(saved[kind][grade])
+                    ? saved[kind][grade]
+                        .map(function (line) { return String(line).trim(); })
+                        .filter(Boolean)
+                    : [];
+
+            bank[kind][grade] = custom.length > 0
+                ? custom
+                : DEFAULT_COMMENT_BANK[kind][grade].slice();
+
+        });
+
+    });
+
+    return bank;
+
+}
+
+function studentHasAnyScore(student) {
+
+    return schoolSubjects.some(function (subject) {
+        return studentOffersSubject(student, subject);
+    });
+
+}
+
+function getAutoCommentsForStudent(student) {
+
+    const bank = getCommentBank();
+
+    if (!bank.enabled || !studentHasAnyScore(student)) return null;
+
+    const grade = getGrade(calculateStudentAverage(student));
+
+    const seed =
+        String(student["Admission No"] ?? "").trim() + "|" +
+        cleanStudentName(student["Student Name"]);
+
+    const pick = function (list, salt) {
+        return list[parseInt(simpleHash(seed + salt), 16) % list.length];
+    };
+
+    return {
+        teacher: pick(bank.teacher[grade], "|t"),
+        principal: pick(bank.principal[grade], "|p")
+    };
+
+}
+
+/* Fills blank comments (and refreshes ones this function filled before).
+   Comments typed by a teacher are never touched. Returns how many
+   students received at least one automatic comment. */
+function applyAutoCommentsToStudents(list) {
+
+    let touched = 0;
+
+    (list || []).forEach(function (student) {
+
+        if (!student) return;
+
+        if (!student.__behavior) student.__behavior = {};
+
+        const flags = student.__autoComment || {};
+        const auto = getAutoCommentsForStudent(student);
+        let changed = false;
+
+        [
+            ["Class Teacher's Comment", "teacher"],
+            ["Principal's Comment", "principal"]
+        ].forEach(function (pair) {
+
+            const field = pair[0];
+            const kind = pair[1];
+            const current = String(student.__behavior[field] ?? "").trim();
+
+            /* A teacher-typed comment always wins. */
+            if (current !== "" && !flags[kind]) return;
+
+            if (!auto) {
+                if (flags[kind]) {
+                    student.__behavior[field] = "";
+                    flags[kind] = false;
+                }
+                return;
+            }
+
+            student.__behavior[field] = auto[kind];
+            flags[kind] = true;
+            changed = true;
+
+        });
+
+        student.__autoComment = flags;
+
+        if (changed) touched++;
+
+    });
+
+    return touched;
+
+}
+
+/* Settings card: on/off switch + editable comments per grade band. */
+function createAutoCommentManager() {
+
+    if (document.getElementById("autoCommentManager")) return;
+
+    const card = document.createElement("section");
+    card.id = "autoCommentManager";
+    card.className = "card";
+
+    card.innerHTML = `
+        <h2>Automatic Comments</h2>
+        <p>
+            Blank Class Teacher's and Principal's comments are filled in from each
+            student's average when the completed template is uploaded in Step 2.
+            Anything typed in the sheet is kept.
+        </p>
+        <label>
+            <input type="checkbox" id="autoCommentEnabled">
+            Fill blank comments automatically
+        </label>
+        <details style="margin-top:10px;">
+            <summary>Customise the comments</summary>
+            <div style="margin-top:10px;">
+                <label for="autoCommentGrade">Grade band</label>
+                <select id="autoCommentGrade">
+                    ${COMMENT_GRADES.map(function (grade) {
+                        return `<option value="${grade}">Grade ${grade}</option>`;
+                    }).join("")}
+                </select>
+                <span id="autoCommentRange"></span>
+            </div>
+            <div style="margin-top:10px;">
+                <label for="autoCommentTeacher">Class Teacher's comments (one per line)</label>
+                <textarea id="autoCommentTeacher" rows="5" style="width:100%;"></textarea>
+            </div>
+            <div style="margin-top:10px;">
+                <label for="autoCommentPrincipal">Principal's comments (one per line)</label>
+                <textarea id="autoCommentPrincipal" rows="5" style="width:100%;"></textarea>
+            </div>
+            <p id="autoCommentLength"></p>
+            <div>
+                <button type="button" id="autoCommentSave">Save comments</button>
+                <button type="button" id="autoCommentReset">Reset to defaults</button>
+            </div>
+        </details>
+        <p id="autoCommentStatus"></p>
+    `;
+
+    const step2Card = elementExists(excelFileInput) ? excelFileInput.closest(".card") : null;
+
+    if (step2Card && step2Card.parentNode) {
+        step2Card.parentNode.insertBefore(card, step2Card);
+    } else if (elementExists(downloadTemplateButton) && downloadTemplateButton.parentNode) {
+        downloadTemplateButton.parentNode.appendChild(card);
+    } else {
+        document.body.appendChild(card);
+    }
+
+    const enabledBox = document.getElementById("autoCommentEnabled");
+    const gradeSelect = document.getElementById("autoCommentGrade");
+    const rangeLabel = document.getElementById("autoCommentRange");
+    const teacherBox = document.getElementById("autoCommentTeacher");
+    const principalBox = document.getElementById("autoCommentPrincipal");
+    const lengthLabel = document.getElementById("autoCommentLength");
+    const statusLabel = document.getElementById("autoCommentStatus");
+
+    const MAX_RECOMMENDED = 140;
+
+    /* Working copy of the bank; only written to settings on Save. */
+    let draft = getCommentBank();
+    let shownGrade = gradeSelect.value;
+
+    function splitLines(text) {
+        return String(text || "")
+            .split("\n")
+            .map(function (line) { return line.trim(); })
+            .filter(Boolean);
+    }
+
+    function gradeRangeText(grade) {
+        const s = reportSettings;
+        const ranges = {
+            A: "average " + s.gradeA + " and above",
+            B: "average " + s.gradeB + " to below " + s.gradeA,
+            C: "average " + s.gradeC + " to below " + s.gradeB,
+            D: "average " + s.gradeD + " to below " + s.gradeC,
+            E: "average " + s.gradeE + " to below " + s.gradeD,
+            F: "average below " + s.gradeE
+        };
+        return " (" + ranges[grade] + ")";
+    }
+
+    function storeShownGrade() {
+        const teacher = splitLines(teacherBox.value);
+        const principal = splitLines(principalBox.value);
+        draft.teacher[shownGrade] = teacher.length ? teacher : DEFAULT_COMMENT_BANK.teacher[shownGrade].slice();
+        draft.principal[shownGrade] = principal.length ? principal : DEFAULT_COMMENT_BANK.principal[shownGrade].slice();
+    }
+
+    function updateLengthNote() {
+        const longest = splitLines(teacherBox.value + "\n" + principalBox.value)
+            .reduce(function (max, line) { return Math.max(max, line.length); }, 0);
+        lengthLabel.textContent =
+            "Longest line: " + longest + " characters" +
+            (longest > MAX_RECOMMENDED
+                ? " - long comments may not fit the report's comment boxes (aim for " +
+                  MAX_RECOMMENDED + " or fewer)."
+                : " (aim for " + MAX_RECOMMENDED + " or fewer to fit the report).");
+    }
+
+    function showGrade() {
+        shownGrade = gradeSelect.value;
+        teacherBox.value = draft.teacher[shownGrade].join("\n");
+        principalBox.value = draft.principal[shownGrade].join("\n");
+        rangeLabel.textContent = gradeRangeText(shownGrade);
+        updateLengthNote();
+    }
+
+    function persist() {
+        reportSettings.commentBank = {
+            enabled: enabledBox.checked,
+            teacher: draft.teacher,
+            principal: draft.principal
+        };
+        const updated = applyAutoCommentsToStudents(students);
+        saveAppData();
+        return updated;
+    }
+
+    enabledBox.checked = draft.enabled;
+    showGrade();
+
+    enabledBox.addEventListener("change", function () {
+        storeShownGrade();
+        persist();
+        statusLabel.textContent = enabledBox.checked
+            ? "✅ Automatic comments are on."
+            : "Automatic comments are off. Comments typed in the sheet are still used.";
+    });
+
+    /* Store what was typed for the band being left, then show the new band. */
+    gradeSelect.addEventListener("change", function () {
+        storeShownGrade();
+        showGrade();
+    });
+
+    teacherBox.addEventListener("input", updateLengthNote);
+    principalBox.addEventListener("input", updateLengthNote);
+
+    document.getElementById("autoCommentSave").addEventListener("click", function () {
+        storeShownGrade();
+        const updated = persist();
+        showGrade();
+        statusLabel.textContent =
+            "✅ Comments saved." +
+            (updated > 0
+                ? " Regenerate the reports to see the new comments on " + updated + " student(s)."
+                : "");
+    });
+
+    document.getElementById("autoCommentReset").addEventListener("click", function () {
+        if (!confirm("Reset all automatic comments to the built-in defaults?")) return;
+        draft = { enabled: enabledBox.checked, teacher: {}, principal: {} };
+        COMMENT_GRADES.forEach(function (grade) {
+            draft.teacher[grade] = DEFAULT_COMMENT_BANK.teacher[grade].slice();
+            draft.principal[grade] = DEFAULT_COMMENT_BANK.principal[grade].slice();
+        });
+        persist();
+        showGrade();
+        statusLabel.textContent = "✅ Comments reset to the defaults.";
+    });
+
+}
+
+
+/* =========================================================
+   ANNUAL / CUMULATIVE PERFORMANCE
+
+   Reads every term's saved subject scores for the selected
+   Class + Session and shows, per student:
+       Subject | First | Second | Third | Cumulative
+   A term's subject total is 1st CA + 2nd CA + Exams. Cumulative is
+   the average of the terms that have a score (so it is already
+   meaningful after two terms).
+   ========================================================= */
+function formatCumulativeNumber(value) {
+    if (value === null || value === undefined || Number.isNaN(value)) return "–";
+    return String(Math.round(value * 10) / 10);
+}
+
+function averageOf(values) {
+    const present = values.filter(function (v) { return v !== null && v !== undefined; });
+    if (present.length === 0) return null;
+    return present.reduce(function (sum, v) { return sum + v; }, 0) / present.length;
+}
+
+function resetCumulativeView() {
+
+    cumulativeModel = null;
+
+    if (elementExists(cumulativeResult)) cumulativeResult.innerHTML = "";
+    if (elementExists(cumulativeStatus)) cumulativeStatus.textContent = "";
+
+    if (elementExists(cumulativeStudentSelect)) {
+        cumulativeStudentSelect.innerHTML = "";
+        cumulativeStudentSelect.style.display = "none";
+    }
+
+}
+
+async function buildCumulativeModel(context) {
+
+    /* Read the copy saved on this phone first (works offline). */
+    let data = await Offline.list(SUBJECT_SCORES_TABLE, function (r) {
+        return r.user_id === currentUserId &&
+            r.website_id === WEBSITE_ID &&
+            r.class_name === context.className &&
+            r.session === context.session;
+    });
+
+    if (!data.length && !smIsOffline()) {
+
+        const scoresResult = await runSubjectScoreSelect(
+            "subject, term, admission_no, student_name, first_ca, second_ca, exams",
+            function (columns) {
+                return supabaseClient
+                    .from(SUBJECT_SCORES_TABLE)
+                    .select(columns)
+                    .eq("user_id", currentUserId)
+                    .eq("website_id", WEBSITE_ID)
+                    .eq("class_name", context.className)
+                    .eq("session", context.session);
+            }
+        );
+
+        if (scoresResult.error) throw new Error(scoresResult.error.message || "Could not load the saved scores.");
+
+        data = scoresResult.data || [];
+
+    }
+
+    const roster = await fetchClassRoster(context.className, context.session);
+
+    const studentMap = new Map();
+    const subjectOrder = [];
+
+    const identity = function (admission, name) {
+        const adm = normalizeStudentAdmissionNo(admission);
+        return adm ? "adm:" + adm : "name:" + normalizeStudentName(name);
+    };
+
+    /* Lookup tables so a saved score row can be matched to the CURRENT
+       class list by Adm No first, then by name (unique names only). */
+    const rosterByAdm = new Map();
+    const rosterByName = new Map();
+
+    /* Class-list order first, so the report follows the register. */
+    roster.forEach(function (student) {
+        const key = identity(student.admission_no, student.student_name);
+        studentMap.set(key, {
+            admission_no: student.admission_no,
+            student_name: student.student_name,
+            gender: student.gender || "",
+            house: student.house || "",
+            scores: {},
+            studentPhotoKey: studentPhotoKey(student.admission_no, student.student_name)
+        });
+
+        const adm = normalizeStudentAdmissionNo(student.admission_no);
+        if (adm) rosterByAdm.set(adm, key);
+
+        const nameKey = normalizeStudentName(student.student_name);
+        if (!rosterByName.has(nameKey)) rosterByName.set(nameKey, []);
+        rosterByName.get(nameKey).push(key);
+    });
+
+    const hasRoster = roster.length > 0;
+
+    schoolSubjects.forEach(function (subject) {
+        if (subjectOrder.indexOf(subject) === -1) subjectOrder.push(subject);
+    });
+
+    /* Rows saved WITHOUT an Adm No are applied first, so a later save of the
+       same student WITH an Adm No always overrides the older score. */
+    const orderedRows = (data || []).slice().sort(function (a, b) {
+        const aHas = normalizeStudentAdmissionNo(a.admission_no) ? 1 : 0;
+        const bHas = normalizeStudentAdmissionNo(b.admission_no) ? 1 : 0;
+        return aHas - bHas;
+    });
+
+    /* Fallback groups (only used when there is no class list). */
+    const looseByName = new Map();
+
+    orderedRows.forEach(function (row) {
+
+        const rowExtras = cleanExtrasObject(row.extras);
+        const parts = [row.first_ca, row.second_ca, row.exams].concat(
+            getExtraAssessments().map(function (item) { return rowExtras[item.name]; })
+        ).filter(function (v) {
+            return v !== null && v !== undefined && v !== "";
+        });
+
+        if (parts.length === 0) return;
+
+        const total = parts.reduce(function (sum, v) { return sum + Number(v); }, 0);
+
+        const rowAdm = normalizeStudentAdmissionNo(row.admission_no);
+        const rowNameKey = normalizeStudentName(row.student_name);
+        let key = null;
+
+        /* 1) Same Adm No as a student in the current class list. */
+        if (rowAdm && rosterByAdm.has(rowAdm)) {
+            key = rosterByAdm.get(rowAdm);
+        }
+
+        /* 2) Same name as exactly one student in the class list
+              (covers scores saved before the Adm No was added). */
+        if (key === null) {
+            const candidates = rosterByName.get(rowNameKey) || [];
+            if (candidates.length === 1) key = candidates[0];
+        }
+
+        if (key === null) {
+
+            /* A class list exists: only its students are reported, so scores
+               left over for anyone not on it are ignored. */
+            if (hasRoster) return;
+
+            /* No class list: merge by Adm No, or by name when no Adm No. */
+            if (rowAdm) {
+                key = "adm:" + rowAdm;
+                const nameOnly = "name:" + rowNameKey;
+                if (studentMap.has(nameOnly) && !studentMap.has(key)) {
+                    /* Move the earlier no-Adm-No student under the Adm No. */
+                    const moved = studentMap.get(nameOnly);
+                    moved.admission_no = row.admission_no || "";
+                    studentMap.delete(nameOnly);
+                    studentMap.set(key, moved);
+                }
+            } else {
+                key = "name:" + rowNameKey;
+                if (looseByName.has(rowNameKey)) key = looseByName.get(rowNameKey);
+            }
+
+            if (!studentMap.has(key)) {
+                studentMap.set(key, {
+                    admission_no: row.admission_no || "",
+                    student_name: cleanStudentName(row.student_name),
+                    gender: "",
+                    house: "",
+                    scores: {},
+                    studentPhotoKey: studentPhotoKey(row.admission_no, row.student_name)
+                });
+            }
+            looseByName.set(rowNameKey, key);
+        }
+
+        if (subjectOrder.indexOf(row.subject) === -1) subjectOrder.push(row.subject);
+
+        const student = studentMap.get(key);
+        if (!student.scores[row.subject]) student.scores[row.subject] = {};
+        student.scores[row.subject][row.term] = total;
+
+    });
+
+    const students = Array.from(studentMap.values()).filter(function (student) {
+        return Object.keys(student.scores).length > 0;
+    });
+
+    students.forEach(function (student) {
+
+        student.subjectRows = subjectOrder
+            .filter(function (subject) { return student.scores[subject]; })
+            .map(function (subject) {
+                const terms = ACADEMIC_TERMS.map(function (term) {
+                    const value = student.scores[subject][term];
+                    return value === undefined ? null : value;
+                });
+                return { subject: subject, terms: terms, cumulative: averageOf(terms) };
+            });
+
+        student.termAverages = ACADEMIC_TERMS.map(function (term, index) {
+            return averageOf(student.subjectRows.map(function (r) { return r.terms[index]; }));
+        });
+
+        student.cumulativeAverage = averageOf(
+            student.subjectRows.map(function (r) { return r.cumulative; })
+        );
+
+    });
+
+    /* Position by cumulative average (ties share a position). */
+    const ranked = students.slice().sort(function (a, b) {
+        return (b.cumulativeAverage ?? -1) - (a.cumulativeAverage ?? -1);
+    });
+
+    ranked.forEach(function (student, index) {
+        const previous = ranked[index - 1];
+        student.position =
+            previous && previous.cumulativeAverage === student.cumulativeAverage
+                ? previous.position
+                : index + 1;
+    });
+
+    return { context: context, subjects: subjectOrder, students: students, ranked: ranked };
+
+}
+
+async function showCumulativePerformance() {
+
+    const context = getWorkflowContext(false);
+
+    if (!context.className || !context.session) {
+        alert("Please select the Academic Session and Class in Step 1A first.");
+        return;
+    }
+
+    if (!currentUserId) {
+        cumulativeStatus.textContent = "❌ Please sign in first.";
+        return;
+    }
+
+    cumulativeStatus.textContent = "⏳ Loading all terms…";
+
+    try {
+
+        cumulativeModel = await buildCumulativeModel(context);
+
+        if (cumulativeModel.students.length === 0) {
+            cumulativeResult.innerHTML = "";
+            cumulativeStudentSelect.style.display = "none";
+            cumulativeStatus.textContent =
+                "No saved scores found for " + contextLabel(context, false) +
+                ". Scores appear here after subject teachers upload their Step 1B templates.";
+            return;
+        }
+
+        cumulativeStudentSelect.innerHTML = "<option value=\"\">-- Whole class summary --</option>";
+
+        cumulativeModel.students.forEach(function (student, index) {
+            const option = document.createElement("option");
+            option.value = String(index);
+            option.textContent = student.student_name;
+            cumulativeStudentSelect.appendChild(option);
+        });
+
+        cumulativeStudentSelect.style.display = "block";
+        cumulativeStatus.textContent =
+            "✅ " + cumulativeModel.students.length + " student(s) with saved scores for " +
+            contextLabel(context, false) + ".";
+
+        renderCumulativeStudent();
+
+    } catch (error) {
+
+        console.error("Cumulative performance error:", error);
+        cumulativeStatus.textContent = "❌ " + (error.message || "Could not load cumulative data.");
+
+    }
+
+}
+
+function renderCumulativeStudent() {
+
+    if (!cumulativeModel || !elementExists(cumulativeResult)) return;
+
+    const cell = "border:1px solid #ccc;padding:6px;text-align:center;";
+    const head = cell + "background:#f0f0f0;";
+    const left = "border:1px solid #ccc;padding:6px;text-align:left;";
+    const table = "border-collapse:collapse;width:100%;margin-top:10px;";
+
+    const selected = cumulativeStudentSelect.value;
+
+    if (selected === "") {
+
+        let html =
+            "<table style=\"" + table + "\"><tr>" +
+            "<th style=\"" + head + "\">Position</th>" +
+            "<th style=\"" + head + "\">Student</th>" +
+            "<th style=\"" + head + "\">First</th>" +
+            "<th style=\"" + head + "\">Second</th>" +
+            "<th style=\"" + head + "\">Third</th>" +
+            "<th style=\"" + head + "\">Cumulative</th></tr>";
+
+        cumulativeModel.ranked.forEach(function (student) {
+            html +=
+                "<tr><td style=\"" + cell + "\">" + student.position + "</td>" +
+                "<td style=\"" + left + "\">" + escapeHTML(student.student_name) + "</td>" +
+                student.termAverages.map(function (avg) {
+                    return "<td style=\"" + cell + "\">" + formatCumulativeNumber(avg) + "</td>";
+                }).join("") +
+                "<td style=\"" + cell + "font-weight:700;\">" +
+                formatCumulativeNumber(student.cumulativeAverage) + "</td></tr>";
+        });
+
+        cumulativeResult.innerHTML = html + "</table>";
+        return;
+
+    }
+
+    const student = cumulativeModel.students[Number(selected)];
+    if (!student) return;
+
+    let html =
+        "<p><strong>" + escapeHTML(student.student_name) + "</strong> &mdash; " +
+        escapeHTML(contextLabel(cumulativeModel.context, false)) +
+        " &mdash; Position " + student.position + " of " + cumulativeModel.students.length + "</p>" +
+        "<table style=\"" + table + "\"><tr>" +
+        "<th style=\"" + head + "\">Subject</th>" +
+        "<th style=\"" + head + "\">First</th>" +
+        "<th style=\"" + head + "\">Second</th>" +
+        "<th style=\"" + head + "\">Third</th>" +
+        "<th style=\"" + head + "\">Cumulative</th></tr>";
+
+    student.subjectRows.forEach(function (row) {
+        html +=
+            "<tr><td style=\"" + left + "\">" + escapeHTML(row.subject) + "</td>" +
+            row.terms.map(function (value) {
+                return "<td style=\"" + cell + "\">" + formatCumulativeNumber(value) + "</td>";
+            }).join("") +
+            "<td style=\"" + cell + "font-weight:700;\">" + formatCumulativeNumber(row.cumulative) + "</td></tr>";
+    });
+
+    html +=
+        "<tr><td style=\"" + left + "font-weight:700;\">Average</td>" +
+        student.termAverages.map(function (avg) {
+            return "<td style=\"" + cell + "font-weight:700;\">" + formatCumulativeNumber(avg) + "</td>";
+        }).join("") +
+        "<td style=\"" + cell + "font-weight:700;\">" + formatCumulativeNumber(student.cumulativeAverage) + "</td></tr>";
+
+    cumulativeResult.innerHTML = html + "</table>";
+
+}
+
+async function downloadCumulativeWorkbook() {
+
+    if (typeof XLSX === "undefined") {
+        alert("Excel library has not loaded. Please refresh the page.");
+        return;
+    }
+
+    if (!cumulativeModel) {
+        await showCumulativePerformance();
+        if (!cumulativeModel) return;
+    }
+
+    const model = cumulativeModel;
+
+    const header = ["Position", "Adm No", "Student Name"];
+
+    model.subjects.forEach(function (subject) {
+        header.push(subject + " First", subject + " Second", subject + " Third", subject + " Cumulative");
+    });
+
+    header.push("First Avg", "Second Avg", "Third Avg", "Cumulative Avg");
+
+    const data = [header];
+
+    model.ranked.forEach(function (student) {
+
+        const row = [student.position, student.admission_no, student.student_name];
+
+        model.subjects.forEach(function (subject) {
+            const found = student.subjectRows.find(function (r) { return r.subject === subject; });
+            if (found) {
+                found.terms.forEach(function (value) {
+                    row.push(value === null ? "" : Math.round(value * 10) / 10);
+                });
+                row.push(found.cumulative === null ? "" : Math.round(found.cumulative * 10) / 10);
+            } else {
+                row.push("", "", "", "");
+            }
+        });
+
+        student.termAverages.forEach(function (avg) {
+            row.push(avg === null ? "" : Math.round(avg * 10) / 10);
+        });
+
+        row.push(student.cumulativeAverage === null ? "" : Math.round(student.cumulativeAverage * 10) / 10);
+
+        data.push(row);
+
+    });
+
+    const sheet = XLSX.utils.aoa_to_sheet(data);
+    sheet["!freeze"] = { xSplit: 3, ySplit: 1 };
+
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, sheet, "Cumulative");
+
+    downloadWorkbook(
+        workbook,
+        safeFilePart(model.context.className) + "_" + safeFilePart(model.context.session) +
+        "_Cumulative_Performance.xlsx"
+    );
+
+}
+
+
+
+/* =========================================================
+   CUMULATIVE REPORT SHEETS  (one per student)
+
+   Uses the same look as the term report (same CSS classes), so it
+   prints the same way. Built from every term saved for the
+   selected Class + Session:
+       Subject | First | Second | Third | Cumulative | Grade
+   Cumulative Class Teacher's / Principal's comments come from the
+   Automatic Comments bank, chosen by the student's CUMULATIVE
+   average. Producing these sheets does not use up any report
+   allowance and does not change the term reports.
+   ========================================================= */
+function autoCommentsForCumulative(student) {
+
+    const bank = getCommentBank();
+
+    if (!bank.enabled || student.cumulativeAverage === null) {
+        return { teacher: "", principal: "" };
+    }
+
+    const grade = getGrade(student.cumulativeAverage);
+
+    const seed =
+        String(student.admission_no ?? "").trim() + "|" +
+        cleanStudentName(student.student_name) + "|cumulative";
+
+    const pick = function (list, salt) {
+        return list[parseInt(simpleHash(seed + salt), 16) % list.length];
+    };
+
+    return {
+        teacher: pick(bank.teacher[grade], "|t"),
+        principal: pick(bank.principal[grade], "|p")
+    };
+
+}
+
+/* Attendance for the whole session. Never throws. */
+async function cumulativeLoadAttendance(model) {
+    try {
+        return await promotionLoadAttendance(model.context.className, model.context.session);
+    } catch (error) {
+        console.error("Cumulative attendance error:", error);
+        return { map: new Map(), failed: true };
+    }
+}
+
+/* "(present/opened) days" for the whole session, or "" when none is saved. */
+function cumulativeAttendanceText(student, model) {
+
+    const info = model.attendanceInfo;
+    if (!info || !info.map) return "";
+
+    const entry =
+        info.map.get(promotionIdentity(student.admission_no, student.student_name)) ||
+        info.map.get("name:" + normalizeStudentName(student.student_name));
+
+    if (!entry || !(entry.opened > 0)) return "";
+
+    return formatAttendanceValue(entry.present, entry.opened);
+
+}
+
+/* The behaviour ratings come from the Scores sheet uploaded in Step 1C (they are
+   not saved online). Use the uploaded row of this class and session; if more
+   than one term is loaded, the latest term wins. */
+function cumulativeBehaviorFor(student, model) {
+
+    const wantClass = String(model.context.className || "").trim().toLowerCase();
+    const wantSession = String(model.context.session || "").trim();
+    const adm = normalizeStudentAdmissionNo(student.admission_no);
+    const name = normalizeStudentName(student.student_name);
+
+    let best = null;
+    let bestTermIndex = -1;
+
+    (Array.isArray(students) ? students : []).forEach(function (record) {
+
+        if (!record || !record.__behavior) return;
+        if (String(record["Class"] || "").trim().toLowerCase() !== wantClass) return;
+        if (String(record["Session"] || "").trim() !== wantSession) return;
+
+        const recordAdm = normalizeStudentAdmissionNo(record["Admission No"]);
+        const sameStudent = (adm && recordAdm)
+            ? adm === recordAdm
+            : normalizeStudentName(record["Student Name"]) === name;
+
+        if (!sameStudent) return;
+
+        const termIndex = ACADEMIC_TERMS.indexOf(String(record["Term"] || "").trim());
+
+        if (!best || termIndex > bestTermIndex) {
+            best = record;
+            bestTermIndex = termIndex;
+        }
+
+    });
+
+    return best
+        ? { ratings: best.__behavior, term: bestTermIndex >= 0 ? ACADEMIC_TERMS[bestTermIndex] : "" }
+        : { ratings: {}, term: "" };
+
+}
+
+function cumulativeBehaviorHtml(student, model) {
+
+    const found = cumulativeBehaviorFor(student, model);
+    const behavior = Object.assign({}, found.ratings);
+
+    /* Attendance is for the whole session, not the one term of the uploaded sheet. */
+    behavior.Attendance = cumulativeAttendanceText(student, model);
+
+    const domainTables = behavioralDomains.map(function (domain) {
+
+        let traitHeaders = `<th class="trait-title">${escapeHTML(domain.name.toUpperCase())}</th>`;
+        let traitRatings = `<td class="trait-title">Rating</td>`;
+
+        domain.traits.forEach(function (trait) {
+            const rating = behavior[trait] !== undefined && behavior[trait] !== null ? behavior[trait] : "";
+            traitHeaders += `<th>${escapeHTML(trait)}</th>`;
+            traitRatings += `<td class="trait-rating">${escapeHTML(rating)}</td>`;
+        });
+
+        return `
+                <table class="behavior-table behavior-domain-table" style="margin-bottom:6px;">
+                    <thead>
+                        <tr>${traitHeaders}</tr>
+                    </thead>
+                    <tbody>
+                        <tr>${traitRatings}</tr>
+                    </tbody>
+                </table>
+        `;
+
+    }).join("");
+
+    return `
+            <section class="behavior-section">
+                <div class="section-heading">
+                    <span class="section-number">04</span>
+                    <div>
+                        <h2>Behavioural Development</h2>
+                        <p>Rating scale: 1 = Lowest &nbsp;•&nbsp; 5 = Highest</p>
+                    </div>
+                </div>
+
+                ${domainTables}
+
+                <p style="font-size:0.8em; margin:4px 0;">
+                    Attendance is for the whole session${found.term ? "; ratings are from the " + escapeHTML(found.term) : ""}.
+                </p>
+            </section>
+    `;
+
+}
+
+function cumulativePromotionNoteHtml(student, model, termsIncluded, termsRecorded) {
+
+    const verdicts = model && model.promotion;
+    const verdict = verdicts && verdicts.get ? verdicts.get(student) : null;
+
+    /* Only a student who does not meet the school's rules gets a note.
+       "Needs review" (missing data) is for the owner, not the parent. */
+    if (!verdict || verdict.status !== "repeat") return "";
+
+    const nextClass = promotionSettings().nextClass[model.context.className] || "";
+
+    const headline = nextClass === PROMOTION_GRADUATE
+        ? "Did not meet the requirements to graduate"
+        : (nextClass
+            ? "Did not meet the requirements for promotion to " + escapeHTML(nextClass)
+            : "Did not meet the promotion requirements");
+
+    const reasons = verdict.reasons.map(function (reason) {
+        return "<li>" + escapeHTML(reason) + "</li>";
+    }).join("");
+
+    return `
+        <section class="promotion-note" style="margin:10px 0;padding:8px 12px;border:2px solid #9b1c1c;border-radius:6px;background:#fdf0f0;color:#7a1414;-webkit-print-color-adjust:exact;print-color-adjust:exact;page-break-inside:avoid;">
+            <div style="font-weight:800;letter-spacing:0.5px;">PROMOTION STATUS: NOT PROMOTED</div>
+            <div style="margin-top:2px;">${headline}.</div>
+            ${reasons ? `<ul style="margin:4px 0 0 18px;padding:0;font-size:0.9em;">${reasons}</ul>` : ""}
+            ${termsRecorded < ACADEMIC_TERMS.length
+                ? `<div style="margin-top:4px;font-size:0.8em;">Based on the terms recorded so far (${escapeHTML(termsIncluded)}).</div>`
+                : ""}
+        </section>
+    `;
+
+}
+
+function createCumulativeReport(student, model) {
+
+    const context = model.context;
+    const comments = autoCommentsForCumulative(student);
+    const average = student.cumulativeAverage;
+    const cumulativePhoto = studentPhotoCache.get(student.studentPhotoKey || studentPhotoKey(student.admission_no, student.student_name)) || "";
+
+    /* Same report outlook as the term reports (Report Outlook picker). */
+    const reportTemplateId = getReportTemplateId();
+
+    const classicInline = function (css) {
+        return reportTemplateId === "classic" ? ' style="' + css + '"' : "";
+    };
+
+    const termsRecorded = ACADEMIC_TERMS.filter(function (term, index) {
+        return student.termAverages[index] !== null;
+    }).length;
+
+    const termsIncluded = ACADEMIC_TERMS
+        .filter(function (term, index) { return student.termAverages[index] !== null; })
+        .map(function (term) { return term.replace(" Term", ""); })
+        .join(", ");
+
+    const grade = average === null ? "" : getGrade(average);
+
+    const subjectRows = student.subjectRows.map(function (row, index) {
+        return `
+            <tr>
+                <td>${index + 1}</td>
+                <td>${escapeHTML(row.subject)}</td>
+                ${row.terms.map(function (value) {
+                    return `<td>${formatCumulativeNumber(value)}</td>`;
+                }).join("")}
+                <td><strong>${formatCumulativeNumber(row.cumulative)}</strong></td>
+                <td>${row.cumulative === null ? "" : getGrade(row.cumulative)}</td>
+                <td class="remark-cell">${row.cumulative === null ? "" : escapeHTML(getGradeRemark(getGrade(row.cumulative)))}</td>
+            </tr>
+        `;
+    }).join("");
+
+    return `
+        <article class="report cumulative-report tpl-${reportTemplateId}" data-report-template="${reportTemplateId}" style="position:relative;">
+            ${reportWatermarkHtml()}
+
+            <div class="report-top-accent"></div>
+
+            <header class="school-header"${classicInline("position:relative;width:100%;display:block;text-align:center!important;")}>
+                <div class="school-brand"${classicInline("position:relative;width:100%!important;display:block!important;text-align:center!important;")}>
+                    ${
+                        reportSettings.schoolLogo
+                            ? `<div class="school-logo-container"${classicInline("position:absolute!important;left:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;")}>
+                                   <img src="${reportSettings.schoolLogo}" alt="School Logo" class="school-logo">
+                               </div>`
+                            : `<div class="school-logo-container school-logo-placeholder"${classicInline("position:absolute!important;left:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;")}>
+                                   <span>SR</span>
+                               </div>`
+                    }
+
+                    ${
+                        cumulativePhoto
+                            ? `<div class="student-passport-container"${classicInline("position:absolute!important;right:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;")}>
+                                   <img src="${escapeHTML(cumulativePhoto)}" alt="Student passport photograph" class="student-passport-photo">
+                               </div>`
+                            : (reportTemplateId === "classic" ? "" : '<div class="school-side-spacer"></div>')
+                    }
+
+                    <div class="school-heading"${classicInline("width:100%!important;max-width:none!important;text-align:center!important;margin:0 auto!important;display:block!important;padding:0 100px!important;")}>
+                        <h1${classicInline("display:block!important;width:100%!important;text-align:center!important;margin:0 auto!important;font-size:26px!important;font-weight:800!important;line-height:1.15!important;letter-spacing:0.5px!important;")}>${escapeHTML(reportSettings.schoolName)}</h1>
+                        <p${classicInline("display:block!important;width:100%!important;text-align:center!important;margin:5px auto 0!important;font-size:14px!important;font-weight:600!important;line-height:1.25!important;letter-spacing:0.3px!important;")}>${escapeHTML(reportSettings.schoolAddress)}</p>
+                        <div class="report-title"${classicInline("display:block!important;width:100%!important;text-align:center!important;margin:8px auto 0!important;font-size:16px!important;font-weight:800!important;line-height:1.2!important;letter-spacing:1.2px!important;")}>CUMULATIVE (ANNUAL) REPORT SHEET</div>
+                    </div>
+                </div>
+            </header>
+
+            <section class="student-profile">
+                <div class="section-heading">
+                    <span class="section-number">01</span>
+                    <div>
+                        <h2>Student Information</h2>
+                        <p>Personal and class details</p>
+                    </div>
+                </div>
+
+                <div class="student-info">
+                    <div class="info-item info-name">
+                        <span class="info-label">Student Name</span>
+                        <strong>${escapeHTML(student.student_name || "")}</strong>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Admission No.</span>
+                        <strong>${escapeHTML(student.admission_no || "")}</strong>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Class</span>
+                        <strong>${escapeHTML(context.className)}</strong>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Gender</span>
+                        <strong>${escapeHTML(student.gender || "")}</strong>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">House</span>
+                        <strong>${escapeHTML(student.house || "")}</strong>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Class Size</span>
+                        <strong>${model.students.length}</strong>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Terms Included</span>
+                        <strong>${escapeHTML(termsIncluded)}</strong>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Session</span>
+                        <strong>${escapeHTML(context.session)}</strong>
+                    </div>
+                </div>
+            </section>
+
+            <section class="academic-section">
+                <div class="section-heading">
+                    <span class="section-number">02</span>
+                    <div>
+                        <h2>Academic Performance</h2>
+                        <p>Term-by-term and cumulative results</p>
+                    </div>
+                </div>
+
+                <table class="result-table" style="width:100%;max-width:100%;table-layout:fixed;">
+                    <colgroup>
+                        <col style="width:5%;">
+                        <col style="width:27%;">
+                        <col style="width:10%;">
+                        <col style="width:10%;">
+                        <col style="width:10%;">
+                        <col style="width:12%;">
+                        <col style="width:8%;">
+                        <col style="width:18%;">
+                    </colgroup>
+                    <thead>
+                        <tr>
+                            <th>No.</th>
+                            <th>Subject</th>
+                            <th>First<br>Term</th>
+                            <th>Second<br>Term</th>
+                            <th>Third<br>Term</th>
+                            <th>Cumulative</th>
+                            <th>Grade</th>
+                            <th>Remark</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${subjectRows}
+                    </tbody>
+                    <tfoot>
+                        <tr>
+                            <th colspan="2">TERM AVERAGE</th>
+                            ${student.termAverages.map(function (value) {
+                                return `<th>${formatCumulativeNumber(value)}</th>`;
+                            }).join("")}
+                            <th>${formatCumulativeNumber(average)}</th>
+                            <th>${grade}</th>
+                            <th>${average === null ? "" : escapeHTML(getGradeRemark(grade))}</th>
+                        </tr>
+                    </tfoot>
+                </table>
+
+                <p style="font-size:0.85em; margin:6px 0;">
+                    Cumulative is the average of the terms with recorded scores.
+                </p>
+            </section>
+
+            <section class="summary-section">
+                <div class="section-heading compact-heading">
+                    <span class="section-number">03</span>
+                    <div>
+                        <h2>Performance Summary</h2>
+                    </div>
+                </div>
+
+                <div class="summary">
+                    <div class="summary-card">
+                        <span>Cumulative Average</span>
+                        <strong>${formatCumulativeNumber(average)}%</strong>
+                    </div>
+
+                    <div class="summary-card">
+                        <span>Class Position</span>
+                        <strong class="position-value">${formatPosition(student.position)}</strong>
+                    </div>
+
+                    <div class="summary-card highlight-grade">
+                        <span>Overall Grade</span>
+                        <strong>${grade}</strong>
+                    </div>
+                </div>
+
+                ${gradeKeyHtml(grade)}
+
+                ${cumulativePromotionNoteHtml(student, model, termsIncluded, termsRecorded)}
+            </section>
+
+            ${cumulativeBehaviorHtml(student, model)}
+
+            <section class="comments">
+                <div class="section-heading">
+                    <span class="section-number">05</span>
+                    <div>
+                        <h2>Assessment & Comments</h2>
+                    </div>
+                </div>
+
+                <div class="comment-grid">
+                    <div class="comment-card">
+                        <div class="comment-label">CLASS TEACHER'S COMMENT</div>
+                        <div class="comment-box">${escapeHTML(comments.teacher)}</div>
+                        <div class="signature-line">
+                            <span>Class Teacher</span>
+                            <span>Date</span>
+                        </div>
+                    </div>
+
+                    <div class="comment-card">
+                        <div class="comment-label">PRINCIPAL'S COMMENT</div>
+                        <div class="comment-box">${escapeHTML(comments.principal)}</div>
+                        <div class="signature-line">
+                            <span>Principal</span>
+                            <span>Date</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            ${feesNoticeHtml({ className: context.className, session: context.session, term: ACADEMIC_TERMS[ACADEMIC_TERMS.length - 1], admissionNo: student.admission_no, name: student.student_name })}
+
+            <footer class="report-footer">
+                <span>Cumulative (Annual) Report</span>
+                <span>${escapeHTML(context.session)}</span>
+            </footer>
+
+        </article>
+    `;
+
+}
+
+function getCumulativeReportFingerprint(student, model) {
+
+    const payload = {
+        kind: "cumulative",
+        class_name: model.context.className,
+        session: model.context.session,
+        admission_no: student.admission_no || "",
+        student_name: cleanStudentName(student.student_name),
+        subjects: student.subjectRows.map(function (row) {
+            return [row.subject, row.terms];
+        }),
+        settings: stableValue(reportSettingsForFingerprint()),
+        website: WEBSITE_ID
+    };
+
+    return simpleHash(JSON.stringify(payload));
+
+}
+
+/* mode "one": the student chosen in the dropdown; mode "all": the whole class.
+   Each NEW cumulative report uses one report from the allowance, exactly like a
+   term report. Regenerating the same report (same scores) is free. */
+/* =========================================================
+   PUBLISH CUMULATIVE (ANNUAL) RESULT ONLINE
+
+   Uses the same publish_student_result function as term results,
+   saved with the term "Cumulative":
+     ca1 / ca2 / exam  = First / Second / Third term totals
+     total             = cumulative (average of the terms with scores)
+   The online Result Checker relabels these columns for cumulative
+   results. A cumulative report that was already generated is free to
+   publish (it is logged with the term "Cumulative").
+   ========================================================= */
+
+function showCumulativePublishedInfo(items) {
+
+    const box = document.getElementById("cumulativePublishInfo");
+
+    if (!box) return;
+
+    if (!Array.isArray(items) || items.length === 0) {
+        box.style.display = "none";
+        box.innerHTML = "";
+        return;
+    }
+
+    let html = "<strong>Published Cumulative Result PIN(s)</strong><div style=\"margin-top:10px;\">";
+
+    items.forEach(function (item) {
+        html +=
+            "<div style=\"padding:8px 0; border-bottom:1px solid #ddd;\">" +
+            "<strong>" + escapeHTML(item.studentName) + "</strong> — PIN: <strong>" +
+            escapeHTML(item.pin || "Not returned") + "</strong></div>";
+    });
+
+    box.innerHTML = html + "</div>";
+    box.style.display = "block";
+
+}
+
+async function publishOneCumulativeResult(student, model) {
+
+    const context = model.context;
+    const studentName = cleanStudentName(student.student_name || "");
+
+    if (!studentName) {
+        return { ok: false, message: "A student has no name." };
+    }
+
+    if (student.cumulativeAverage === null || student.cumulativeAverage === undefined) {
+        return { ok: false, studentName: studentName, message: "No scores to publish." };
+    }
+
+    const comments = autoCommentsForCumulative(student);
+
+    const termValue = function (value) {
+        return value === null || value === undefined ? "" : Math.round(value * 100) / 100;
+    };
+
+    const subjects = student.subjectRows.map(function (row) {
+        return {
+            subject_name: row.subject,
+            ca1: termValue(row.terms[0]),
+            ca2: termValue(row.terms[1]),
+            exam: termValue(row.terms[2]),
+            total: termValue(row.cumulative),
+            grade: row.cumulative === null ? "" : getGrade(row.cumulative),
+            subject_position: ""
+        };
+    });
+
+    try {
+
+        const { data, error } = await supabaseClient.rpc("publish_student_result", {
+            p_website_id: WEBSITE_ID,
+            p_school_name: reportSettings.schoolName || null,
+            p_school_address: reportSettings.schoolAddress || null,
+            p_school_logo_url: reportSettings.schoolLogo || null,
+            p_admission_no: String(student.admission_no || "").trim(),
+            p_student_name: studentName,
+            p_gender: student.gender || null,
+            p_class_name: context.className || null,
+            p_session: context.session,
+            p_term: "Cumulative",
+            p_average: Math.round(student.cumulativeAverage * 100) / 100,
+            p_position: Number.isFinite(Number(student.position)) ? Number(student.position) : null,
+            p_class_size: model.students.length || null,
+            p_attendance: null,
+            p_teacher_comment: comments.teacher || null,
+            p_principal_comment: comments.principal || null,
+            p_subjects: subjects
+        });
+
+        if (error) {
+            console.error("Cumulative publish RPC error:", error);
+            return {
+                ok: false,
+                studentName: studentName,
+                message: error.message || "The server could not publish this result."
+            };
+        }
+
+        const response = extractPublishResponse(data);
+
+        const success =
+            response.success === true ||
+            String(response.success).toLowerCase() === "true";
+
+        if (!success) {
+            return {
+                ok: false,
+                studentName: studentName,
+                message: response.message || response.error || "The result was not published."
+            };
+        }
+
+        await refreshReportsGeneratedFromServer();
+
+        return {
+            ok: true,
+            pin: extractPublishedPin(data),
+            studentName: studentName,
+            message: response.message || "Result published successfully."
+        };
+
+    } catch (error) {
+
+        console.error("Unexpected cumulative publish error:", error);
+
+        return {
+            ok: false,
+            studentName: studentName,
+            message: "An unexpected error occurred while publishing the result."
+        };
+
+    }
+
+}
+
+async function publishCumulativeResults(mode) {
+
+    const context = getWorkflowContext(false);
+
+    if (!context.className || !context.session) {
+        alert("Please select the Academic Session and Class in Step 1A first.");
+        return;
+    }
+
+    if (!currentUserId) {
+        alert("Please sign in first.");
+        return;
+    }
+
+    const setStatus = function (message) {
+        if (elementExists(cumulativeStatus)) cumulativeStatus.textContent = message;
+    };
+
+    let chosenName = "";
+
+    if (mode === "one") {
+
+        if (
+            !cumulativeModel ||
+            !elementExists(cumulativeStudentSelect) ||
+            cumulativeStudentSelect.value === ""
+        ) {
+            alert("Click \"Show Cumulative Performance\" and choose a student from the list first.");
+            return;
+        }
+
+        const chosen = cumulativeModel.students[Number(cumulativeStudentSelect.value)];
+        chosenName = chosen ? chosen.student_name : "";
+
+    }
+
+    const accessCheck = await verifyActiveSubscriptionForPublishing();
+
+    if (!accessCheck.valid) {
+        promptSubscriptionRequiredForPublishing(accessCheck.reason);
+        return;
+    }
+
+    const buttons = [
+        document.getElementById("publishCumulativeResultButton"),
+        document.getElementById("publishAllCumulativeResultsButton")
+    ];
+
+    const setButtons = function (disabled) {
+        buttons.forEach(function (button) { if (button) button.disabled = disabled; });
+    };
+
+    setStatus("⏳ Preparing cumulative result(s)…");
+
+    try {
+
+        const model = await buildCumulativeModel(context);
+
+        let list = model.students;
+
+        if (mode === "one") {
+            list = model.students.filter(function (s) { return s.student_name === chosenName; });
+        }
+
+        if (list.length === 0) {
+            setStatus("❌ No saved scores found for " + contextLabel(context, false) + ".");
+            return;
+        }
+
+        if (mode === "all") {
+
+            if (!canGenerateReports(list.length)) return;
+
+            const confirmed = confirm(
+                "Publish cumulative results for " + list.length + " student(s) online?\n\n" +
+                "A cumulative result that was NOT already generated will use one report " +
+                "from your allowance. Cumulative reports already generated here publish for free.\n\n" +
+                "Each student will receive a separate PIN for the cumulative result."
+            );
+
+            if (!confirmed) {
+                setStatus("");
+                return;
+            }
+
+        }
+
+        setButtons(true);
+        showCumulativePublishedInfo([]);
+
+        const successful = [];
+        const failed = [];
+
+        for (let i = 0; i < list.length; i++) {
+
+            setStatus("⏳ Publishing cumulative results… " + i + " / " + list.length);
+
+            const result = await publishOneCumulativeResult(list[i], model);
+
+            if (result.ok) {
+                successful.push(result);
+            } else {
+                failed.push(result);
+            }
+
+        }
+
+        showCumulativePublishedInfo(successful);
+
+        let status = "✅ Published " + successful.length + " cumulative result(s).";
+
+        if (failed.length > 0) {
+            status +=
+                " ❌ " + failed.length + " failed: " +
+                failed.slice(0, 3).map(function (f) {
+                    return (f.studentName || "A student") + " (" + f.message + ")";
+                }).join("; ") +
+                (failed.length > 3 ? "…" : "");
+        }
+
+        setStatus(status);
+
+    } catch (error) {
+
+        console.error("Publish cumulative error:", error);
+        setStatus("❌ " + (error.message || "Could not publish the cumulative results."));
+
+    } finally {
+
+        setButtons(false);
+
+    }
+
+}
+
+async function generateCumulativeReports(mode) {
+
+    const context = getWorkflowContext(false);
+
+    if (!context.className || !context.session) {
+        alert("Please select the Academic Session and Class in Step 1A first.");
+        return;
+    }
+
+    if (!currentUserId) {
+        alert("Please sign in first.");
+        return;
+    }
+
+    if (!elementExists(reportContainer)) {
+        alert("The report area was not found on this page.");
+        return;
+    }
+
+    let chosenName = "";
+
+    if (mode === "one") {
+
+        if (
+            !cumulativeModel ||
+            !elementExists(cumulativeStudentSelect) ||
+            cumulativeStudentSelect.value === ""
+        ) {
+            alert("Click \"Show Cumulative Performance\" and choose a student from the list first.");
+            return;
+        }
+
+        const chosen = cumulativeModel.students[Number(cumulativeStudentSelect.value)];
+        chosenName = chosen ? chosen.student_name : "";
+
+    }
+
+    const setStatus = function (message) {
+        if (elementExists(cumulativeStatus)) cumulativeStatus.textContent = message;
+    };
+
+    setStatus("⏳ Preparing cumulative report(s)…");
+
+    try {
+
+        /* Rebuilt from the database so the sheets always show the latest scores. */
+        const model = await buildCumulativeModel(context);
+
+        if (model.students.length === 0) {
+            setStatus(
+                "❌ No saved scores found for " + contextLabel(context, false) +
+                ". Subject teachers must upload their Step 1B templates first."
+            );
+            return;
+        }
+
+        cumulativeModel = model;
+
+        /* Attendance (all three terms) for the behavioural section and the promotion rules. */
+        model.attendanceInfo = await cumulativeLoadAttendance(model);
+
+        /* Promotion rules decide whether a "not promoted" note is printed. */
+        model.promotion = await promotionVerdictsForModel(model);
+
+        /* Register (class-list) order for the printed batch. */
+        let list = model.students.slice();
+
+        if (mode === "one") {
+            list = list.filter(function (student) {
+                return student.student_name === chosenName;
+            });
+        }
+
+        if (list.length === 0) {
+            setStatus("❌ That student has no saved scores.");
+            return;
+        }
+
+        /* Same allowance ledger as the term reports: a report costs one
+           allowance the first time it is generated, and nothing when the
+           same report (same scores) is generated again. */
+        const items = list.map(function (student) {
+            const fingerprint = getCumulativeReportFingerprint(student, model);
+            return {
+                student: student,
+                fingerprint: fingerprint,
+                alreadyGenerated: hasReportBeenGenerated(fingerprint)
+            };
+        });
+
+        const newItems = items.filter(function (item) { return !item.alreadyGenerated; });
+
+        let toRender = items;
+        let toCharge = [];
+        let blockedNew = false;
+
+        if (newItems.length > 0) {
+
+            if (mode === "one") {
+
+                if (!canGenerateReports(1)) {
+                    setStatus("");
+                    return;
+                }
+
+                toCharge = newItems;
+
+            } else {
+
+                const limit = getReportLimit();
+
+                if (!limit) {
+                    alert("❌ Your subscription plan could not be determined.");
+                    setStatus("");
+                    return;
+                }
+
+                const carriedOver = getCarriedOverReports();
+                const totalAvailable = limit + carriedOver;
+                const remaining = Math.max(totalAvailable - reportsGenerated, 0);
+
+                if (remaining <= 0) {
+                    alert(
+                        "⚠️ REPORT GENERATION LIMIT REACHED\n\n" +
+                        "Subscription: " + getPlanDisplayName() + "\n" +
+                        "Reports generated: " + reportsGenerated + " / " + totalAvailable +
+                        "\n\nPlease renew or upgrade your subscription to generate more reports."
+                    );
+                    updateReportStatus();
+                    setStatus("");
+                    return;
+                }
+
+                toCharge = newItems.slice(0, remaining);
+                blockedNew = newItems.length > toCharge.length;
+
+                const ok = confirm(
+                    "Generate cumulative reports for " + list.length + " student(s)?\n\n" +
+                    "Subscription: " + getPlanDisplayName() + "\n" +
+                    "Reports generated: " + reportsGenerated + " / " + formatReportCount(totalAvailable) + "\n" +
+                    "Carried-over reports: " + carriedOver + "\n" +
+                    "Reports remaining: " + formatReportCount(remaining) +
+                    "\n\nNew reports to be charged: " + toCharge.length +
+                    "\nAlready-generated reports will not use allowance again." +
+                    (blockedNew
+                        ? "\n\n⚠️ Only " + toCharge.length +
+                          " new report(s) fit in the remaining allowance."
+                        : "")
+                );
+
+                if (!ok) {
+                    setStatus("");
+                    return;
+                }
+
+            }
+
+            const chargeSet = new Set(toCharge.map(function (item) { return item.fingerprint; }));
+
+            /* Reports that cannot be afforded are left out, exactly as in Generate All. */
+            toRender = items.filter(function (item) {
+                return item.alreadyGenerated || chargeSet.has(item.fingerprint);
+            });
+
+        }
+
+        /* Outstanding balances come from the Fees area before the reports are built. */
+        await preloadFeeBalancesForCumulative(
+            toRender.map(function (item) { return item.student; }),
+            model.context
+        );
+
+        /* Build first, charge second - nothing is shown until the server confirms. */
+        const html = toRender.map(function (item) {
+            return createCumulativeReport(item.student, model);
+        });
+
+        if (toCharge.length > 0) {
+
+            const claimed = await incrementReportCount(toCharge.length);
+
+            if (!claimed) {
+                alert(
+                    "⚠️ No new reports were charged because the server could not confirm the allowance claim.\n\n" +
+                    "Please refresh and try again."
+                );
+                updateReportStatus();
+                setStatus("");
+                return;
+            }
+
+            markReportsAsGenerated(toCharge.map(function (item) { return item.fingerprint; }));
+
+        }
+
+        reportContainer.innerHTML = html.join("");
+        saveGeneratedReports();
+        reportContainer.scrollIntoView({ behavior: "smooth" });
+
+        for (let i = 0; i < toCharge.length; i++) {
+            await logReportGenerated({
+                "Admission No": toCharge[i].student.admission_no,
+                "Student Name": toCharge[i].student.student_name,
+                "Session": context.session,
+                "Term": "Cumulative"
+            });
+        }
+
+        updateReportStatus();
+
+        setStatus(
+            "✅ " + toRender.length + " cumulative report(s) generated for " +
+            contextLabel(context, false) + " (" + toCharge.length +
+            " new report(s) charged). Use Print Report below to print or save as PDF."
+        );
+
+        showRosterNotification(
+            "✅ " + toRender.length + " cumulative report(s) generated.",
+            false
+        );
+
+        if (blockedNew) {
+            alert(
+                "⚠️ Generation stopped at your available report limit.\n\n" +
+                "New reports charged: " + toCharge.length + "\n" +
+                "Reports generated: " + reportsGenerated +
+                "\n\nRenew or upgrade to generate the remaining reports."
+            );
+        }
+
+    } catch (error) {
+
+        console.error("Cumulative report error:", error);
+        setStatus("❌ " + (error.message || "Could not generate the cumulative reports."));
+
+    }
+
+}
+
+/* A cumulative report is identified by the student and the scores on it,
+   so regenerating the same sheet is free but new scores make a new report. */
+function getCumulativeReportFingerprint(student, model) {
+
+    const payload = {
+        type: "cumulative",
+        website: WEBSITE_ID,
+        class_name: model.context.className,
+        session: model.context.session,
+        admission_no: String(student.admission_no || "").trim(),
+        student_name: cleanStudentName(student.student_name),
+        rows: student.subjectRows.map(function (row) {
+            return [row.subject, row.terms];
+        }),
+        settings: reportSettingsForFingerprint()
+    };
+
+    return simpleHash(JSON.stringify(stableValue(payload)));
+
+}
+
+
+/* =========================================================
+   CLASS-TAGGED SUBJECT SCORES (SUPABASE)
+
+   Lets a subject teacher download just ONE subject's sheet,
+   fill it in, and upload it from any device. The upload is
+   saved to Supabase tagged by website_id + class_name + subject.
+   When the class teacher later downloads the combined ("general")
+   template, on any device, previously saved subject scores for
+   that class are fetched back and pre-filled into the workbook.
+   ========================================================= */
+
+const SUBJECT_SCORES_TABLE = "subject_scores";
+
+/* Every downloaded workbook (single-subject or general) carries a
+   hidden "Meta" sheet identifying which class (and, for a
+   single-subject file, which subject) it belongs to. This is what
+   lets an upload know its own class/subject without asking the
+   teacher to re-type it. */
+function buildMetaSheet(className, subject, session, term) {
+
+    const metaData = [
+        ["KEY", "VALUE"],
+        ["website_id", WEBSITE_ID],
+        ["class_name", className || ""],
+        ["subject", subject || ""],
+        ["session", session || ""],
+        ["term", term || ""],
+        ["level", getClassLevel(className)],
+        ["generated_at", new Date().toISOString()]
+    ];
+
+    const metaSheet = XLSX.utils.aoa_to_sheet(metaData);
+    metaSheet["!cols"] = [{ wch: 14 }, { wch: 24 }];
+
+    return metaSheet;
+}
+
+function appendMetaSheet(workbook, className, subject, session, term) {
+
+    const metaSheet = buildMetaSheet(className, subject, session, term);
+
+    XLSX.utils.book_append_sheet(workbook, metaSheet, "Meta");
+
+    /* Hidden: this is bookkeeping, not something teachers should edit. */
+    const metaIndex = workbook.SheetNames.indexOf("Meta");
+    if (!workbook.Workbook) workbook.Workbook = {};
+    if (!workbook.Workbook.Sheets) workbook.Workbook.Sheets = [];
+    workbook.Workbook.Sheets[metaIndex] = { Hidden: 1 };
+
+}
+
+function readMetaFromWorkbook(workbook) {
+
+    const result = { website_id: "", class_name: "", subject: "", session: "", term: "", level: "" };
+
+    if (!workbook || !workbook.Sheets || !workbook.Sheets["Meta"]) {
+        return result;
+    }
+
+    const rows = XLSX.utils.sheet_to_json(
+        workbook.Sheets["Meta"],
+        { header: 1, defval: "" }
+    );
+
+    rows.forEach(function (row) {
+        const key = String(row[0] || "").trim();
+        const value = row[1];
+
+        if (key === "website_id") result.website_id = String(value || "").trim();
+        if (key === "class_name") result.class_name = String(value || "").trim();
+        if (key === "subject") result.subject = String(value || "").trim();
+        if (key === "session") result.session = String(value || "").trim();
+        if (key === "term") result.term = String(value || "").trim();
+        if (key === "level") result.level = String(value || "").trim();
+    });
+
+    return result;
+
+}
+
+function getActiveClassName(required) {
+
+    const value = elementExists(classNameInput)
+        ? String(classNameInput.value || "").trim()
+        : "";
+
+    if (required && !value) {
+        alert("Please add a class in Step 0, then select it above.");
+    }
+
+    return value;
+
+}
+
+/* Same normalized composite key used on the Excel "Match Key"
+   column, so DB rows and spreadsheet rows always agree on identity
+   even when a student's name is typed with stray/extra spaces. */
+function computeMatchKey(admissionNo, studentName) {
+    return (
+        String(admissionNo || "").trim() +
+        "|" +
+        normalizeStudentName(studentName)
+    );
+}
+
+/* =========================================================
+   SAVE ONE SUBJECT'S SCORES TO SUPABASE
+   ========================================================= */
+async function saveSubjectScoresToDatabase(className, subject, rows, session, term) {
+
+    if (!currentUserId) {
+        throw new Error("You must be signed in to upload a subject template.");
+    }
+
+    const extraList = getExtraAssessments();
+
+    if (extraList.length > 0 && subjectScoresExtrasMissing) {
+        throw new Error(
+            "The database cannot store the extra assessments yet. Run extra_assessments.sql in Supabase, " +
+            "refresh this page and try again."
+        );
+    }
+
+    const payloadRows = rows
+        .map(function (row) {
+
+            const admissionNo = String(row["Adm No"] || "").trim();
+            const studentName = cleanStudentName(row["Student Name"]);
+
+            if (!admissionNo && !studentName) return null;
+
+            const record = {
+                user_id: currentUserId,
+                website_id: WEBSITE_ID,
+                class_name: className,
+                session: session || "",
+                term: term || "",
+                subject: subject,
+                admission_no: admissionNo,
+                student_name: studentName,
+                match_key: computeMatchKey(admissionNo, studentName),
+                first_ca: row["1st CA"] === "" ? null : Number(row["1st CA"]),
+                second_ca: row["2nd CA"] === "" ? null : Number(row["2nd CA"]),
+                exams: row["Exams"] === "" ? null : Number(row["Exams"]),
+                updated_at: new Date().toISOString()
+            };
+
+            /* Extra assessments are only sent when the school uses them, so
+               nothing changes for schools that do not. */
+            if (extraList.length > 0) {
+                const extras = {};
+                extraList.forEach(function (item) {
+                    const raw = row[item.name];
+                    const text = String(raw === null || raw === undefined ? "" : raw).trim();
+                    if (text !== "" && isFinite(Number(text))) extras[item.name] = Number(text);
+                });
+                record.extras = extras;
+            }
+
+            return record;
+
+        })
+        .filter(function (row) { return row !== null; });
+
+    if (payloadRows.length === 0) {
+        throw new Error("No student rows were found in that subject sheet.");
+    }
+
+    /* Saved on this phone first; it syncs to Supabase when online. */
+    await Offline.upsertManyByKey(
+        SUBJECT_SCORES_TABLE,
+        ["user_id", "website_id", "class_name", "session", "term", "subject", "match_key"],
+        payloadRows
+    );
+
+    return payloadRows.length;
+
+}
+
+/* =========================================================
+   FETCH PREVIOUSLY SAVED SUBJECT SCORES FOR A CLASS
+   Returns a map: { [subject]: [ {admission_no, student_name,
+   first_ca, second_ca, exams}, ... ] }
+   ========================================================= */
+async function fetchAllSavedSubjectScoresForClass(className, subjects, session, term) {
+
+    const result = {};
+    subjects.forEach(function (subject) { result[subject] = []; });
+
+    if (!currentUserId || !className) return result;
+
+    /* Read the copy saved on this phone first (works offline). */
+    const localScores = await Offline.list(SUBJECT_SCORES_TABLE, function (r) {
+        return r.user_id === currentUserId &&
+            r.website_id === WEBSITE_ID &&
+            r.class_name === className &&
+            (r.session || "") === (session || "") &&
+            (r.term || "") === (term || "");
+    });
+
+    if (localScores.length || smIsOffline()) {
+        localScores.forEach(function (row) {
+            if (!result[row.subject]) result[row.subject] = [];
+            result[row.subject].push(row);
+        });
+        return result;
+    }
+
+
+    const { data, error } = await runSubjectScoreSelect(
+        "subject, admission_no, student_name, first_ca, second_ca, exams",
+        function (columns) {
+            return supabaseClient
+                .from(SUBJECT_SCORES_TABLE)
+                .select(columns)
+                .eq("user_id", currentUserId)
+                .eq("website_id", WEBSITE_ID)
+                .eq("class_name", className)
+                .eq("session", session || "")
+                .eq("term", term || "");
+        }
+    );
+
+    if (error) {
+        console.error("Fetch saved subject scores error:", error);
+        /* Non-fatal: fall back to a blank template rather than blocking download. */
+        return result;
+    }
+
+    (data || []).forEach(function (row) {
+        if (!result[row.subject]) result[row.subject] = [];
+        result[row.subject].push(row);
+    });
+
+    return result;
+
+}
+
+
+/* =========================================================
+   DOWNLOAD SINGLE-SUBJECT TEMPLATE
+
+   Lets a subject teacher download JUST their subject's sheet
+   (Adm No / Student Name / 1st CA / 2nd CA / Exams), tagged
+   with the class and subject in a hidden Meta sheet, pre-filled
+   with any scores already saved for that class+subject.
+   ========================================================= */
+async function downloadSubjectTemplate() {
+
+    try {
+
+        if (typeof XLSX === "undefined") {
+            alert("Excel library has not loaded. Please refresh the page.");
+            return;
+        }
+
+        const context = getWorkflowContext(true);
+        if (!context) return;
+
+        const className = context.className;
+
+        if (!elementExists(subjectTemplateSelect) || !subjectTemplateSelect.value) {
+            alert("Please add and select a subject first.");
+            return;
+        }
+
+        const subject = subjectTemplateSelect.value;
+
+        setFileStatus("⏳ Preparing " + escapeHTML(subject) + " template…");
+
+        const savedBySubject = await fetchAllSavedSubjectScoresForClass(
+            className,
+            [subject],
+            context.session,
+            context.term
+        );
+
+        const roster = await fetchClassRoster(className, context.session);
+
+        /* The master class list decides who is on the sheet; scores already
+           saved for this term stay attached to the right student. */
+        const savedRows = mergeRosterWithSavedScores(
+            roster,
+            savedBySubject[subject] || []
+        );
+
+        const workbook = XLSX.utils.book_new();
+
+        const extraList = getExtraAssessments();
+
+        const subjectData = [
+            ["Adm No", "Student Name", "1st CA", "2nd CA", "Exams", "Match Key", "Total"]
+                .concat(extraList.map(function (item) { return item.name; }))
+        ];
+
+        const rowCount = Math.max(TEMPLATE_STUDENT_ROWS, savedRows.length);
+
+        for (let i = 0; i < rowCount; i++) {
+
+            const saved = savedRows[i];
+            const blankExtras = extraList.map(function () { return ""; });
+
+            if (saved) {
+                const savedExtras = cleanExtrasObject(saved.extras);
+                subjectData.push([
+                    saved.admission_no || "",
+                    saved.student_name || "",
+                    saved.first_ca ?? "",
+                    saved.second_ca ?? "",
+                    saved.exams ?? "",
+                    "",
+                    ""
+                ].concat(extraList.map(function (item) {
+                    return savedExtras[item.name] ?? "";
+                })));
+            } else if (i === 0 && savedRows.length === 0) {
+                subjectData.push(["001", "Example Student", "", "", "", "", ""].concat(blankExtras));
+            } else {
+                subjectData.push(["", "", "", "", "", "", ""].concat(blankExtras));
+            }
+
+        }
+
+        const subjectSheet = XLSX.utils.aoa_to_sheet(subjectData);
+
+        for (let row = 2; row <= rowCount + 1; row++) {
+            subjectSheet["F" + row] = {
+                t: "str",
+                f: `TRIM(A${row})&"|"&TRIM(CLEAN(SUBSTITUTE(B${row},CHAR(160)," ")))`
+            };
+        }
+
+        /* Visible "Total" column (G): 1st CA + 2nd CA + Exams, so
+           teachers can see each student's total. The hidden Match Key
+           stays in column F so the Scores sheet lookups are unchanged. */
+        for (let row = 2; row <= rowCount + 1; row++) {
+            subjectSheet["G" + row] = {
+                t: "n",
+                f: subjectSheetTotalFormula(row)
+            };
+        }
+        /* Level of the class this sheet belongs to (header only, so the
+           upload still reads the student rows exactly as before). It sits
+           after the extra assessment columns. */
+        const subjectSheetLevel = getClassLevel(className);
+        const levelColumn = 7 + extraList.length;
+
+        subjectSheet["!ref"] = XLSX.utils.encode_range({
+            s: { r: 0, c: 0 },
+            e: { r: rowCount, c: subjectSheetLevel ? levelColumn : levelColumn - 1 }
+        });
+
+        if (subjectSheetLevel) {
+            subjectSheet[XLSX.utils.encode_cell({ r: 0, c: levelColumn })] =
+                { t: "s", v: "Level: " + subjectSheetLevel };
+        }
+
+        subjectSheet["!cols"] = [
+            { wch: 7 },
+            { wch: 14 },
+            { wch: 6 },
+            { wch: 6 },
+            { wch: 6 },
+            { wch: 10, hidden: true },
+            { wch: 8 }
+        ];
+
+        extraList.forEach(function (item) {
+            subjectSheet["!cols"].push({ wch: Math.max(6, Math.min(14, item.name.length + 2)) });
+        });
+
+        if (subjectSheetLevel) {
+            subjectSheet["!cols"].push({ wch: 18 });
+        }
+
+        subjectSheet["!freeze"] = { xSplit: 3, ySplit: 1 };
+
+        XLSX.utils.book_append_sheet(
+            workbook,
+            subjectSheet,
+            getSubjectSheetName(subject, workbook)
+        );
+
+        appendMetaSheet(workbook, className, subject, context.session, context.term);
+
+        const excelData = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
+
+        const blob = new Blob([excelData], {
+            type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        });
+
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+
+        link.href = url;
+        link.download =
+            className.replace(/[^a-z0-9]+/gi, "_") + "_" +
+            context.session.replace(/[^a-z0-9]+/gi, "_") + "_" +
+            context.term.replace(/[^a-z0-9]+/gi, "_") + "_" +
+            subject.replace(/[^a-z0-9]+/gi, "_") + "_Template.xlsx";
+
+        document.body.appendChild(link);
+        link.click();
+        showManualDownloadLink(url, link.download);
+
+        setTimeout(function () {
+            URL.revokeObjectURL(url);
+            if (link.parentNode) link.parentNode.removeChild(link);
+        }, 300000);
+
+        setFileStatus(
+            "✅ " + escapeHTML(subject) + " template for " + escapeHTML(contextLabel(context)) +
+            " downloaded" +
+            (roster.length > 0
+                ? " with " + roster.length + " student(s) from the class list."
+                : rosterFetchFailed
+                    ? ". ⚠ The class list could not be loaded, so names are blank."
+                    : ". No class list has been uploaded in Step 1A, so names are blank.")
+        );
+
+    } catch (error) {
+
+        console.error("Subject template download error:", error);
+        alert("❌ Subject template could not be created.\n\n" + error.message);
+        setFileStatus("❌ Subject template generation failed.");
+
+    }
+
+}
+
+
+/* =========================================================
+   UPLOAD A COMPLETED SINGLE-SUBJECT TEMPLATE
+
+   Reads the hidden Meta sheet to learn which class/subject the
+   file belongs to (falling back to the Step 1B class/subject
+   pickers if a file has no Meta sheet), then saves every row to
+   Supabase so it is available on any device that later downloads
+   the general template for that class.
+   ========================================================= */
+function handleSubjectTemplateUpload(event) {
+
+    const file = event.target.files[0];
+    if (!file) return;
+
+    if (typeof XLSX === "undefined") {
+        if (elementExists(subjectTemplateStatus)) {
+            subjectTemplateStatus.textContent = "❌ Excel library has not loaded.";
+        }
+        return;
+    }
+
+    const reader = new FileReader();
+
+    reader.onload = async function (e) {
+
+        try {
+
+            const data = new Uint8Array(e.target.result);
+            const workbook = XLSX.read(data, { type: "array" });
+
+            const meta = readMetaFromWorkbook(workbook);
+
+            const uploadContext = getWorkflowContext(false);
+            const className = meta.class_name || uploadContext.className;
+            const uploadSession = meta.session || uploadContext.session;
+            const uploadTerm = meta.term || uploadContext.term;
+
+            if (!uploadSession || !uploadTerm) {
+                if (elementExists(subjectTemplateStatus)) {
+                    subjectTemplateStatus.textContent =
+                        "❌ Select the Academic Session and Term in Step 1A or Step 1B first.";
+                }
+                return;
+            }
+            const subject =
+                meta.subject ||
+                (elementExists(subjectTemplateSelect) ? subjectTemplateSelect.value : "");
+
+            if (!className || !subject) {
+                if (elementExists(subjectTemplateStatus)) {
+                    subjectTemplateStatus.textContent =
+                        "❌ Could not tell which class/subject this file is for. " +
+                        "Enter the Class Name and select the Subject above, then try again.";
+                }
+                return;
+            }
+
+            /* The subject-only template has exactly one (non-Meta) sheet. */
+            const sheetName = workbook.SheetNames.find(function (name) {
+                return name !== "Meta";
+            });
+
+            if (!sheetName) {
+                if (elementExists(subjectTemplateStatus)) {
+                    subjectTemplateStatus.textContent =
+                        "❌ No subject sheet found in that file.";
+                }
+                return;
+            }
+
+            const rows = XLSX.utils.sheet_to_json(
+                workbook.Sheets[sheetName],
+                { defval: "" }
+            );
+
+            if (elementExists(subjectTemplateStatus)) {
+                subjectTemplateStatus.textContent = "⏳ Saving " + subject + " scores…";
+            }
+
+            const savedCount = await saveSubjectScoresToDatabase(
+                className,
+                subject,
+                rows,
+                uploadSession,
+                uploadTerm
+            );
+
+            const uploadRoster = await fetchClassRoster(className, uploadSession);
+            const rosterWarning = describeRosterMismatch(uploadRoster, rows);
+
+            if (elementExists(subjectTemplateStatus)) {
+                subjectTemplateStatus.textContent =
+                    "✅ Saved " + savedCount + " " + subject + " record(s) for " +
+                    className + " | " + uploadSession + " | " + uploadTerm +
+                    ". They will appear automatically in Step 1C for this term, on any device." +
+                    rosterWarning;
+            }
+
+        } catch (error) {
+
+            console.error("Subject template upload error:", error);
+
+            if (elementExists(subjectTemplateStatus)) {
+                subjectTemplateStatus.textContent =
+                    "❌ " + (error.message || "Could not save that subject template.");
+            }
+
+        }
+
+    };
+
+    reader.readAsArrayBuffer(file);
+
+}
+
+
+/* =========================================================
+   ENTER SUBJECT SCORES ON THE WEBSITE (no Excel needed)
+
+   A button in Step 1B opens a score sheet for the selected
+   Class | Session | Term | Subject. Students come from the Step 1A
+   class list, and any scores already saved are filled in. Saving
+   uses the same saveSubjectScoresToDatabase() as an uploaded subject
+   template, so the scores appear in Step 1C and in the general
+   template exactly the same way. The subject dropdown already limits
+   staff to their own subjects, so the same rules apply here.
+   ========================================================= */
+
+let onlineScoreState = null;
+
+function onlineScoreLimits() {
+    return {
+        first: Number(reportSettings.firstCAMaximum) || 20,
+        second: Number(reportSettings.secondCAMaximum) || 20,
+        exams: Number(reportSettings.examsMaximum) || 60,
+        extras: getExtraAssessments()
+    };
+}
+
+function initializeOnlineScoreEntry() {
+
+    if (document.getElementById("onlineScoreOpenButton")) return;
+    if (!elementExists(subjectTemplateStatus)) return;
+
+    const wrap = document.createElement("div");
+    wrap.id = "onlineScoreEntryWrap";
+    wrap.style.margin = "10px 0";
+    wrap.innerHTML =
+        '<button type="button" id="onlineScoreOpenButton">✏️ Enter Scores on the Website</button>' +
+        '<div style="font-size:12px;opacity:.75;margin-top:4px;">' +
+        "Type scores here instead of using Excel. They are saved the same way as an uploaded template." +
+        "</div>";
+
+    subjectTemplateStatus.insertAdjacentElement("beforebegin", wrap);
+
+    document
+        .getElementById("onlineScoreOpenButton")
+        .addEventListener("click", openOnlineScoreEntry);
+
+}
+
+function setOnlineScoreMessage(message, isError) {
+
+    const box = document.getElementById("onlineScoreMessage");
+    if (box) {
+        box.textContent = message || "";
+        box.style.color = isError ? "#b00020" : "#1b5e20";
+    }
+
+    if (elementExists(subjectTemplateStatus) && message) {
+        subjectTemplateStatus.textContent = message;
+    }
+
+}
+
+function closeOnlineScoreEntry(force) {
+
+    if (!force && onlineScoreState && onlineScoreState.dirty) {
+        if (!confirm("You have unsaved scores. Close without saving?")) return;
+    }
+
+    const overlay = document.getElementById("onlineScoreOverlay");
+    if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+
+    onlineScoreState = null;
+
+}
+
+function onlineScoreRowHtml(row, index, limits, nameLocked) {
+
+    const val = function (v) {
+        return v === null || v === undefined ? "" : escapeHTML(v);
+    };
+
+    const cell = "padding:4px;border-bottom:1px solid #ddd;";
+    const num =
+        'type="number" inputmode="decimal" min="0" step="any" ' +
+        'style="width:58px;padding:6px;box-sizing:border-box;" data-row="' + index + '"';
+
+    const identity = nameLocked
+        ? '<td style="' + cell + 'white-space:nowrap;">' + escapeHTML(row.admission_no || "") + "</td>" +
+          '<td style="' + cell + '">' + escapeHTML(row.student_name || "") + "</td>"
+        : '<td style="' + cell + '"><input type="text" data-field="adm" data-row="' + index +
+          '" value="' + val(row.admission_no) + '" placeholder="Adm No" style="width:70px;padding:6px;box-sizing:border-box;"></td>' +
+          '<td style="' + cell + '"><input type="text" data-field="name" data-row="' + index +
+          '" value="' + val(row.student_name) + '" placeholder="Student name" style="width:150px;padding:6px;box-sizing:border-box;"></td>';
+
+    return (
+        '<tr data-row="' + index + '">' +
+        '<td style="' + cell + '">' + (index + 1) + "</td>" +
+        identity +
+        '<td style="' + cell + '"><input ' + num + ' data-field="first" max="' + limits.first +
+        '" value="' + val(row.first_ca) + '"></td>' +
+        '<td style="' + cell + '"><input ' + num + ' data-field="second" max="' + limits.second +
+        '" value="' + val(row.second_ca) + '"></td>' +
+        '<td style="' + cell + '"><input ' + num + ' data-field="exams" max="' + limits.exams +
+        '" value="' + val(row.exams) + '"></td>' +
+        (limits.extras || []).map(function (item, extraIndex) {
+            return '<td style="' + cell + '"><input ' + num + ' data-field="extra' + extraIndex +
+                '" max="' + item.max + '" value="' +
+                val(row.extras ? row.extras[item.name] : "") + '"></td>';
+        }).join("") +
+        '<td style="' + cell + 'font-weight:bold;text-align:center;" data-total="' + index + '"></td>' +
+        "</tr>"
+    );
+
+}
+
+function refreshOnlineScoreTotal(index) {
+
+    const tbody = document.getElementById("onlineScoreBody");
+    if (!tbody) return;
+
+    const read = function (field) {
+        const input = tbody.querySelector(
+            'input[data-field="' + field + '"][data-row="' + index + '"]'
+        );
+        return input ? input.value.trim() : "";
+    };
+
+    const parts = [read("first"), read("second"), read("exams")];
+
+    getExtraAssessments().forEach(function (item, extraIndex) {
+        parts.push(read("extra" + extraIndex));
+    });
+
+    const filled = parts.filter(function (p) { return p !== ""; });
+
+    const totalCell = tbody.querySelector('[data-total="' + index + '"]');
+    if (!totalCell) return;
+
+    totalCell.textContent = filled.length === 0
+        ? ""
+        : String(
+            Math.round(
+                filled.reduce(function (sum, p) { return sum + (Number(p) || 0); }, 0) * 100
+            ) / 100
+        );
+
+}
+
+async function openOnlineScoreEntry() {
+
+    try {
+
+        if (!currentUserId) {
+            alert("Please sign in first.");
+            return;
+        }
+
+        const context = getWorkflowContext(true);
+        if (!context) return;
+
+        if (!elementExists(subjectTemplateSelect) || !subjectTemplateSelect.value) {
+            alert("Please add and select a subject first.");
+            return;
+        }
+
+        const subject = subjectTemplateSelect.value;
+        const limits = onlineScoreLimits();
+
+        closeOnlineScoreEntry(true);
+
+        const overlay = document.createElement("div");
+        overlay.id = "onlineScoreOverlay";
+        overlay.style.cssText =
+            "position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.55);" +
+            "display:flex;align-items:flex-start;justify-content:center;";
+
+        overlay.innerHTML =
+            '<div style="background:#fff;color:#111;width:100%;max-width:760px;height:100%;' +
+            'display:flex;flex-direction:column;">' +
+            '<div style="padding:10px 12px;border-bottom:1px solid #ccc;">' +
+            '<div style="font-weight:bold;">✏️ ' + escapeHTML(subject) + " scores</div>" +
+            '<div style="font-size:13px;opacity:.8;">' + escapeHTML(contextLabel(context)) + "</div>" +
+            '<div style="font-size:12px;opacity:.7;margin-top:2px;">Maximum marks: 1st CA ' + limits.first +
+            ", 2nd CA " + limits.second + ", Exams " + limits.exams +
+            limits.extras.map(function (item) { return ", " + escapeHTML(item.name) + " " + item.max; }).join("") +
+            "</div>" +
+            "</div>" +
+            '<div id="onlineScoreScroll" style="flex:1;overflow:auto;padding:6px 8px;">' +
+            '<div id="onlineScoreLoading">⏳ Loading students and saved scores…</div>' +
+            "</div>" +
+            '<div style="padding:8px 12px;border-top:1px solid #ccc;">' +
+            '<div id="onlineScoreMessage" style="font-size:13px;min-height:18px;margin-bottom:6px;"></div>' +
+            '<button type="button" id="onlineScoreAddRow">+ Add student</button> ' +
+            '<button type="button" id="onlineScoreSave">💾 Save scores</button> ' +
+            '<button type="button" id="onlineScoreClose">Close</button>' +
+            "</div></div>";
+
+        document.body.appendChild(overlay);
+
+        document.getElementById("onlineScoreClose")
+            .addEventListener("click", function () { closeOnlineScoreEntry(false); });
+
+        const savedBySubject = await fetchAllSavedSubjectScoresForClass(
+            context.className, [subject], context.session, context.term
+        );
+
+        const roster = await fetchClassRoster(context.className, context.session);
+        const saved = savedBySubject[subject] || [];
+
+        const merged = roster.length > 0
+            ? mergeRosterWithSavedScores(roster, saved)
+            : saved;
+
+        const rows = merged.map(function (row) {
+            return {
+                admission_no: row.admission_no || "",
+                student_name: row.student_name || "",
+                first_ca: row.first_ca,
+                second_ca: row.second_ca,
+                exams: row.exams,
+                extras: cleanExtrasObject(row.extras),
+                hadSaved:
+                    row.first_ca !== null && row.first_ca !== undefined ||
+                    row.second_ca !== null && row.second_ca !== undefined ||
+                    row.exams !== null && row.exams !== undefined ||
+                    Object.keys(cleanExtrasObject(row.extras)).length > 0,
+                locked: roster.length > 0
+            };
+        });
+
+        onlineScoreState = {
+            context: context,
+            subject: subject,
+            limits: limits,
+            rows: rows,
+            dirty: false
+        };
+
+        if (rows.length === 0) {
+            for (let i = 0; i < 5; i++) {
+                rows.push({
+                    admission_no: "", student_name: "",
+                    first_ca: null, second_ca: null, exams: null,
+                    hadSaved: false, locked: false
+                });
+            }
+        }
+
+        renderOnlineScoreTable(roster.length === 0);
+
+        document.getElementById("onlineScoreAddRow")
+            .addEventListener("click", function () {
+                collectOnlineScoreInputs();
+                onlineScoreState.rows.push({
+                    admission_no: "", student_name: "",
+                    first_ca: null, second_ca: null, exams: null,
+                    hadSaved: false, locked: false
+                });
+                renderOnlineScoreTable(false);
+                const scroll = document.getElementById("onlineScoreScroll");
+                if (scroll) scroll.scrollTop = scroll.scrollHeight;
+            });
+
+        document.getElementById("onlineScoreSave")
+            .addEventListener("click", saveOnlineScores);
+
+    } catch (error) {
+
+        console.error("Online score entry error:", error);
+        alert("❌ Could not open the score sheet.\n\n" + error.message);
+        closeOnlineScoreEntry(true);
+
+    }
+
+}
+
+/* Draws the table from onlineScoreState.rows. */
+function renderOnlineScoreTable(showNoListNote) {
+
+    const state = onlineScoreState;
+    const scroll = document.getElementById("onlineScoreScroll");
+    if (!state || !scroll) return;
+
+    const head = "padding:6px 4px;text-align:left;border-bottom:2px solid #999;" +
+        "position:sticky;top:0;background:#f2f2f2;";
+
+    let html = "";
+
+    if (showNoListNote) {
+        html +=
+            '<div style="font-size:12px;background:#fff8e1;padding:6px;margin-bottom:6px;">' +
+            "No class list was found for this class and session, so type each student's " +
+            "Adm No and name below. Uploading the class list in Step 1A is better, because " +
+            "names are then filled in for you." +
+            "</div>";
+    }
+
+    html +=
+        '<table style="border-collapse:collapse;width:100%;font-size:14px;">' +
+        "<thead><tr>" +
+        '<th style="' + head + '">#</th>' +
+        '<th style="' + head + '">Adm No</th>' +
+        '<th style="' + head + '">Student Name</th>' +
+        '<th style="' + head + '">1st CA<br><small>/' + state.limits.first + "</small></th>" +
+        '<th style="' + head + '">2nd CA<br><small>/' + state.limits.second + "</small></th>" +
+        '<th style="' + head + '">Exams<br><small>/' + state.limits.exams + "</small></th>" +
+        state.limits.extras.map(function (item) {
+            return '<th style="' + head + '">' + escapeHTML(item.name) +
+                "<br><small>/" + item.max + "</small></th>";
+        }).join("") +
+        '<th style="' + head + '">Total</th>' +
+        '</tr></thead><tbody id="onlineScoreBody">';
+
+    state.rows.forEach(function (row, index) {
+        html += onlineScoreRowHtml(row, index, state.limits, row.locked);
+    });
+
+    html += "</tbody></table>";
+
+    scroll.innerHTML = html;
+
+    const body = document.getElementById("onlineScoreBody");
+
+    state.rows.forEach(function (row, index) { refreshOnlineScoreTotal(index); });
+
+    body.addEventListener("input", function (event) {
+
+        const input = event.target;
+        if (!input || !input.getAttribute) return;
+
+        state.dirty = true;
+
+        const index = Number(input.getAttribute("data-row"));
+        const field = input.getAttribute("data-field");
+
+        if (field === "first" || field === "second" || field === "exams" || /^extra\d+$/.test(field || "")) {
+
+            const max = /^extra\d+$/.test(field)
+                ? (state.limits.extras[Number(field.slice(5))] || { max: Infinity }).max
+                : state.limits[field];
+            const value = input.value.trim();
+            const bad = value !== "" && (isNaN(Number(value)) || Number(value) < 0 || Number(value) > max);
+
+            input.style.outline = bad ? "2px solid #d32f2f" : "";
+            refreshOnlineScoreTotal(index);
+
+        }
+
+    });
+
+    /* Enter moves down to the next student in the same column. */
+    body.addEventListener("keydown", function (event) {
+
+        if (event.key !== "Enter") return;
+
+        const input = event.target;
+        if (!input || !input.getAttribute) return;
+
+        const field = input.getAttribute("data-field");
+        if (!field) return;
+
+        event.preventDefault();
+
+        const next = body.querySelector(
+            'input[data-field="' + field + '"][data-row="' +
+            (Number(input.getAttribute("data-row")) + 1) + '"]'
+        );
+
+        if (next) {
+            next.focus();
+            if (next.select) next.select();
+        }
+
+    });
+
+}
+
+/* Copies what is typed in the table back into onlineScoreState.rows. */
+function collectOnlineScoreInputs() {
+
+    const state = onlineScoreState;
+    const body = document.getElementById("onlineScoreBody");
+    if (!state || !body) return;
+
+    state.rows.forEach(function (row, index) {
+
+        const read = function (field) {
+            const input = body.querySelector(
+                'input[data-field="' + field + '"][data-row="' + index + '"]'
+            );
+            return input ? input.value.trim() : null;
+        };
+
+        const adm = read("adm");
+        const name = read("name");
+
+        if (adm !== null) row.admission_no = adm;
+        if (name !== null) row.student_name = name;
+
+        row.first_ca = read("first");
+        row.second_ca = read("second");
+        row.exams = read("exams");
+
+        row.extras = row.extras || {};
+        state.limits.extras.forEach(function (item, extraIndex) {
+            const text = read("extra" + extraIndex);
+            if (text !== null) row.extras[item.name] = text;
+        });
+
+    });
+
+}
+
+async function saveOnlineScores() {
+
+    const state = onlineScoreState;
+    if (!state) return;
+
+    const saveButton = document.getElementById("onlineScoreSave");
+
+    try {
+
+        collectOnlineScoreInputs();
+
+        const toNumber = function (text) {
+            const t = String(text === null || text === undefined ? "" : text).trim();
+            return t === "" ? "" : Number(t);
+        };
+
+        const payload = [];
+        const names = { first: "1st CA", second: "2nd CA", exams: "Exams" };
+
+        for (let i = 0; i < state.rows.length; i++) {
+
+            const row = state.rows[i];
+            const label = row.student_name || row.admission_no || ("row " + (i + 1));
+
+            const values = {
+                first: toNumber(row.first_ca),
+                second: toNumber(row.second_ca),
+                exams: toNumber(row.exams)
+            };
+
+            for (const field of ["first", "second", "exams"]) {
+
+                const v = values[field];
+                if (v === "") continue;
+
+                if (isNaN(v) || v < 0) {
+                    setOnlineScoreMessage("❌ " + label + ": " + names[field] + " must be a number, 0 or more.", true);
+                    return;
+                }
+
+                if (v > state.limits[field]) {
+                    setOnlineScoreMessage(
+                        "❌ " + label + ": " + names[field] + " cannot be more than " + state.limits[field] + ".",
+                        true
+                    );
+                    return;
+                }
+
+            }
+
+            const extraValues = {};
+            let extraFailed = false;
+
+            state.limits.extras.forEach(function (item) {
+
+                if (extraFailed) return;
+
+                const v = toNumber(row.extras ? row.extras[item.name] : "");
+                extraValues[item.name] = v;
+
+                if (v === "") return;
+
+                if (isNaN(v) || v < 0) {
+                    setOnlineScoreMessage("❌ " + label + ": " + item.name + " must be a number, 0 or more.", true);
+                    extraFailed = true;
+                } else if (v > item.max) {
+                    setOnlineScoreMessage("❌ " + label + ": " + item.name + " cannot be more than " + item.max + ".", true);
+                    extraFailed = true;
+                }
+
+            });
+
+            if (extraFailed) return;
+
+            const hasAny = values.first !== "" || values.second !== "" || values.exams !== "" ||
+                Object.keys(extraValues).some(function (key) { return extraValues[key] !== ""; });
+            const hasIdentity = String(row.admission_no || "").trim() || String(row.student_name || "").trim();
+
+            /* Save a student who has a score now, or who had saved scores
+               that are being cleared. Untouched empty rows are skipped. */
+            if (!hasIdentity || (!hasAny && !row.hadSaved)) continue;
+
+            const payloadRow = {
+                "Adm No": String(row.admission_no || "").trim(),
+                "Student Name": row.student_name,
+                "1st CA": values.first,
+                "2nd CA": values.second,
+                "Exams": values.exams,
+                _row: row
+            };
+
+            Object.keys(extraValues).forEach(function (key) {
+                payloadRow[key] = extraValues[key];
+            });
+
+            payload.push(payloadRow);
+
+        }
+
+        if (payload.length === 0) {
+            setOnlineScoreMessage("Nothing to save yet. Type at least one score.", true);
+            return;
+        }
+
+        if (saveButton) saveButton.disabled = true;
+        setOnlineScoreMessage("⏳ Saving " + state.subject + " scores…", false);
+
+        const savedCount = await saveSubjectScoresToDatabase(
+            state.context.className,
+            state.subject,
+            payload,
+            state.context.session,
+            state.context.term
+        );
+
+        payload.forEach(function (item) {
+            item._row.hadSaved =
+                item["1st CA"] !== "" || item["2nd CA"] !== "" || item["Exams"] !== "" ||
+                state.limits.extras.some(function (extra) { return item[extra.name] !== "" && item[extra.name] !== undefined; });
+        });
+
+        state.dirty = false;
+
+        setOnlineScoreMessage(
+            "✅ Saved " + savedCount + " " + state.subject + " record(s) for " +
+            contextLabel(state.context) + ". They will appear in Step 1C.",
+            false
+        );
+
+    } catch (error) {
+
+        console.error("Online score save error:", error);
+        setOnlineScoreMessage("❌ " + (error.message || "Could not save the scores."), true);
+
+    } finally {
+
+        if (saveButton) saveButton.disabled = false;
+
+    }
+
+}
+
+
+/* =========================================================
+   ENTER THE CLASS LIST ON THE WEBSITE (no Excel needed)
+
+   A button in Step 1A opens a class list sheet for the selected
+   Class | Session. The saved students are loaded for editing, and
+   saving uses the same rules and the same table as the Excel upload
+   (names required, no duplicates, removed students are taken off the
+   list, saved scores are never deleted). The list is shared by all
+   three terms of the session, exactly like an uploaded class list.
+   ========================================================= */
+
+let onlineClassState = null;
+
+function initializeOnlineClassList() {
+
+    if (document.getElementById("onlineClassOpenButton")) return;
+
+    /* Placed beside the Step 1A status line so it sits inside the Step 1A
+       section and follows that section's visibility. */
+    const anchor = document.getElementById("rosterStatus");
+    if (!anchor) return;
+
+    const wrap = document.createElement("div");
+    wrap.id = "onlineClassEntryWrap";
+    wrap.style.margin = "10px 0";
+    wrap.innerHTML =
+        '<button type="button" id="onlineClassOpenButton">✏️ Enter Class List on the Website</button>' +
+        '<div style="font-size:12px;opacity:.75;margin-top:4px;">' +
+        "Type or edit the students here instead of using Excel. It is saved the same way as an uploaded class list." +
+        "</div>";
+
+    anchor.insertAdjacentElement("beforebegin", wrap);
+
+    document
+        .getElementById("onlineClassOpenButton")
+        .addEventListener("click", openOnlineClassList);
+
+}
+
+function setOnlineClassMessage(message, isError) {
+
+    const box = document.getElementById("onlineClassMessage");
+    if (box) {
+        box.textContent = message || "";
+        box.style.color = isError ? "#b00020" : "#1b5e20";
+    }
+
+}
+
+function closeOnlineClassList(force) {
+
+    if (!force && onlineClassState && onlineClassState.dirty) {
+        if (!confirm("You have unsaved changes to the class list. Close without saving?")) return;
+    }
+
+    const overlay = document.getElementById("onlineClassOverlay");
+    if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+
+    onlineClassState = null;
+
+}
+
+/* A staff member may only edit the class list of a class they are form master of. */
+function canEditClassListFor(className) {
+
+    if (typeof staffContext === "undefined" || !staffContext) return true;
+
+    return staffContext.assignments.some(function (a) {
+        return !a.subject && sameText(a.class_name, className);
+    });
+
+}
+
+function onlineClassRowHtml(row, index) {
+
+    const cell = "padding:4px;border-bottom:1px solid #ddd;";
+    const box = "padding:6px;box-sizing:border-box;";
+
+    const genders = ["", "Male", "Female"];
+    if (row.gender && genders.indexOf(row.gender) === -1) genders.push(row.gender);
+
+    const genderOptions = genders.map(function (g) {
+        return '<option value="' + escapeHTML(g) + '"' + (g === row.gender ? " selected" : "") + ">" +
+            (g === "" ? "-" : escapeHTML(g)) + "</option>";
+    }).join("");
+
+    return (
+        '<tr data-crow="' + index + '">' +
+        '<td style="' + cell + '">' + (index + 1) + "</td>" +
+        '<td style="' + cell + '"><input type="text" data-cfield="adm" data-crow="' + index +
+        '" value="' + escapeHTML(row.admission_no) + '" placeholder="Adm No" autocomplete="off" ' +
+        'style="width:78px;' + box + '"></td>' +
+        '<td style="' + cell + '"><input type="text" data-cfield="name" data-crow="' + index +
+        '" value="' + escapeHTML(row.student_name) + '" placeholder="Student name" autocomplete="off" ' +
+        'autocapitalize="words" style="width:170px;' + box + '"></td>' +
+        '<td style="' + cell + '"><select data-cfield="gender" data-crow="' + index +
+        '" style="width:84px;' + box + '">' + genderOptions + "</select></td>" +
+        '<td style="' + cell + '"><input type="text" data-cfield="house" data-crow="' + index +
+        '" value="' + escapeHTML(row.house) + '" placeholder="House" autocomplete="off" ' +
+        'style="width:72px;' + box + '"></td>' +
+        '<td style="' + cell + '"><button type="button" data-cremove="' + index +
+        '" title="Remove this student" style="padding:4px 8px;">✕</button></td>' +
+        "</tr>"
+    );
+
+}
+
+function blankOnlineClassRow() {
+    return { admission_no: "", student_name: "", gender: "", house: "" };
+}
+
+/* Copies what is typed in the table back into onlineClassState.rows. */
+function collectOnlineClassInputs() {
+
+    const state = onlineClassState;
+    const body = document.getElementById("onlineClassBody");
+    if (!state || !body) return;
+
+    state.rows.forEach(function (row, index) {
+
+        const read = function (field) {
+            const input = body.querySelector(
+                '[data-cfield="' + field + '"][data-crow="' + index + '"]'
+            );
+            return input ? input.value : "";
+        };
+
+        row.admission_no = read("adm").trim();
+        row.student_name = read("name");
+        row.gender = read("gender").trim();
+        row.house = read("house").trim();
+
+    });
+
+}
+
+function renderOnlineClassTable(focusIndex) {
+
+    const state = onlineClassState;
+    const scroll = document.getElementById("onlineClassScroll");
+    if (!state || !scroll) return;
+
+    const head = "padding:6px 4px;text-align:left;border-bottom:2px solid #999;" +
+        "position:sticky;top:0;background:#f2f2f2;";
+
+    let html =
+        '<div style="font-size:12px;background:#fff8e1;padding:6px;margin-bottom:6px;">' +
+        "Student Name is required. Admission No is optional but helps keep a student linked to " +
+        "their saved scores if the name is ever corrected. Press Enter in a name box to go to the next student." +
+        "</div>" +
+        '<table style="border-collapse:collapse;width:100%;font-size:14px;">' +
+        "<thead><tr>" +
+        '<th style="' + head + '">#</th>' +
+        '<th style="' + head + '">Adm No</th>' +
+        '<th style="' + head + '">Student Name</th>' +
+        '<th style="' + head + '">Gender</th>' +
+        '<th style="' + head + '">House</th>' +
+        '<th style="' + head + '"></th>' +
+        '</tr></thead><tbody id="onlineClassBody">';
+
+    state.rows.forEach(function (row, index) {
+        html += onlineClassRowHtml(row, index);
+    });
+
+    html += "</tbody></table>";
+
+    scroll.innerHTML = html;
+
+    const count = document.getElementById("onlineClassCount");
+    if (count) count.textContent = state.rows.length + " row(s)";
+
+    const body = document.getElementById("onlineClassBody");
+
+    body.addEventListener("input", function () { state.dirty = true; });
+    body.addEventListener("change", function () { state.dirty = true; });
+
+    body.addEventListener("click", function (event) {
+
+        const target = event.target;
+        if (!target || !target.getAttribute) return;
+
+        const removeIndex = target.getAttribute("data-cremove");
+        if (removeIndex === null) return;
+
+        collectOnlineClassInputs();
+        state.rows.splice(Number(removeIndex), 1);
+        if (state.rows.length === 0) state.rows.push(blankOnlineClassRow());
+        state.dirty = true;
+        renderOnlineClassTable();
+
+    });
+
+    /* Enter in a name box moves to the next student's name, adding a new row after the last. */
+    body.addEventListener("keydown", function (event) {
+
+        if (event.key !== "Enter") return;
+
+        const input = event.target;
+        if (!input || !input.getAttribute) return;
+
+        const field = input.getAttribute("data-cfield");
+        if (field !== "name" && field !== "adm" && field !== "house") return;
+
+        event.preventDefault();
+
+        const index = Number(input.getAttribute("data-crow"));
+        const nextSelector = '[data-cfield="' + field + '"][data-crow="' + (index + 1) + '"]';
+        const next = body.querySelector(nextSelector);
+
+        if (next) {
+            next.focus();
+            if (next.select) next.select();
+            return;
+        }
+
+        if (field === "name") {
+            collectOnlineClassInputs();
+            state.rows.push(blankOnlineClassRow());
+            state.dirty = true;
+            renderOnlineClassTable(index + 1);
+        }
+
+    });
+
+    if (focusIndex !== undefined && focusIndex !== null) {
+        const target = body.querySelector(
+            '[data-cfield="name"][data-crow="' + focusIndex + '"]'
+        );
+        if (target) {
+            target.focus();
+            target.scrollIntoView({ block: "center" });
+        }
+    }
+
+}
+
+async function openOnlineClassList() {
+
+    try {
+
+        if (!currentUserId) {
+            alert("Please sign in first.");
+            return;
+        }
+
+        const context = getWorkflowContext(true);
+        if (!context) return;
+
+        if (!canEditClassListFor(context.className)) {
+            alert("Only the school owner or the form master of " + context.className +
+                " can change its class list.");
+            return;
+        }
+
+        closeOnlineClassList(true);
+
+        const overlay = document.createElement("div");
+        overlay.id = "onlineClassOverlay";
+        overlay.style.cssText =
+            "position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.55);" +
+            "display:flex;align-items:flex-start;justify-content:center;";
+
+        overlay.innerHTML =
+            '<div style="background:#fff;color:#111;width:100%;max-width:760px;height:100%;' +
+            'display:flex;flex-direction:column;">' +
+            '<div style="padding:10px 12px;border-bottom:1px solid #ccc;">' +
+            '<div style="font-weight:bold;">✏️ Class list</div>' +
+            '<div style="font-size:13px;opacity:.8;">' + escapeHTML(contextLabel(context, false)) +
+            ' <span id="onlineClassCount" style="opacity:.8;"></span></div>' +
+            "</div>" +
+            '<div id="onlineClassScroll" style="flex:1;overflow:auto;padding:6px 8px;">' +
+            "⏳ Loading the saved class list…" +
+            "</div>" +
+            '<div style="padding:8px 12px;border-top:1px solid #ccc;">' +
+            '<div id="onlineClassMessage" style="font-size:13px;min-height:18px;margin-bottom:6px;"></div>' +
+            '<button type="button" id="onlineClassAddRow">+ Add student</button> ' +
+            '<button type="button" id="onlineClassAddFive">+ Add 5 rows</button> ' +
+            '<button type="button" id="onlineClassSort">Sort A-Z</button> ' +
+            '<button type="button" id="onlineClassSave">💾 Save class list</button> ' +
+            '<button type="button" id="onlineClassClose">Close</button>' +
+            "</div></div>";
+
+        document.body.appendChild(overlay);
+
+        document.getElementById("onlineClassClose")
+            .addEventListener("click", function () { closeOnlineClassList(false); });
+
+        const existing = await fetchClassRoster(context.className, context.session);
+
+        if (rosterFetchFailed) {
+            throw new Error("The saved class list could not be loaded, so it was not opened for editing.");
+        }
+
+        const rows = existing.map(function (s) {
+            return {
+                admission_no: s.admission_no || "",
+                student_name: s.student_name || "",
+                gender: s.gender || "",
+                house: s.house || ""
+            };
+        });
+
+        if (rows.length === 0) {
+            for (let i = 0; i < 5; i++) rows.push(blankOnlineClassRow());
+        }
+
+        onlineClassState = {
+            context: context,
+            rows: rows,
+            existing: existing,
+            dirty: false
+        };
+
+        renderOnlineClassTable();
+
+        const addRows = function (count) {
+            collectOnlineClassInputs();
+            const firstNew = onlineClassState.rows.length;
+            for (let i = 0; i < count; i++) onlineClassState.rows.push(blankOnlineClassRow());
+            onlineClassState.dirty = true;
+            renderOnlineClassTable(firstNew);
+        };
+
+        document.getElementById("onlineClassAddRow")
+            .addEventListener("click", function () { addRows(1); });
+
+        document.getElementById("onlineClassAddFive")
+            .addEventListener("click", function () { addRows(5); });
+
+        document.getElementById("onlineClassSort")
+            .addEventListener("click", function () {
+                collectOnlineClassInputs();
+                const filled = onlineClassState.rows.filter(function (r) {
+                    return r.student_name.trim() || r.admission_no;
+                });
+                const blanks = onlineClassState.rows.length - filled.length;
+                filled.sort(function (a, b) {
+                    return cleanStudentName(a.student_name).localeCompare(
+                        cleanStudentName(b.student_name), undefined, { sensitivity: "base" }
+                    );
+                });
+                for (let i = 0; i < blanks; i++) filled.push(blankOnlineClassRow());
+                onlineClassState.rows = filled;
+                onlineClassState.dirty = true;
+                renderOnlineClassTable();
+            });
+
+        document.getElementById("onlineClassSave")
+            .addEventListener("click", saveOnlineClassList);
+
+    } catch (error) {
+
+        console.error("Online class list error:", error);
+        alert("❌ Could not open the class list.\n\n" + error.message);
+        closeOnlineClassList(true);
+
+    }
+
+}
+
+async function saveOnlineClassList() {
+
+    const state = onlineClassState;
+    if (!state) return;
+
+    const saveButton = document.getElementById("onlineClassSave");
+    const context = state.context;
+
+    try {
+
+        collectOnlineClassInputs();
+
+        const students = [];
+        const seenKeys = new Set();
+        const seenAdmissions = new Set();
+
+        for (let i = 0; i < state.rows.length; i++) {
+
+            const row = state.rows[i];
+            const name = cleanStudentName(row.student_name);
+            const admission = String(row.admission_no || "").trim();
+
+            if (!name && !admission) continue;
+
+            if (!name) {
+                setOnlineClassMessage("❌ Row " + (i + 1) + " has an Admission No but no Student Name.", true);
+                return;
+            }
+
+            const key = rosterKey(admission, name);
+
+            if (seenKeys.has(key)) {
+                setOnlineClassMessage(
+                    "❌ \"" + name + "\" appears twice" +
+                    (admission ? "." : " - add an Admission No to tell them apart."),
+                    true
+                );
+                return;
+            }
+
+            const admKey = normalizeStudentAdmissionNo(admission);
+
+            if (admKey && seenAdmissions.has(admKey)) {
+                setOnlineClassMessage("❌ Admission No \"" + admission + "\" is used by two students.", true);
+                return;
+            }
+
+            seenKeys.add(key);
+            if (admKey) seenAdmissions.add(admKey);
+
+            students.push({
+                admission_no: admission,
+                student_name: name,
+                gender: String(row.gender || "").trim(),
+                house: String(row.house || "").trim()
+            });
+
+        }
+
+        if (students.length === 0) {
+            setOnlineClassMessage("❌ Enter at least one student name.", true);
+            return;
+        }
+
+        if (students.length > TEMPLATE_STUDENT_ROWS) {
+            setOnlineClassMessage(
+                "❌ A class can have at most " + TEMPLATE_STUDENT_ROWS +
+                " students (this list has " + students.length + ").",
+                true
+            );
+            return;
+        }
+
+        if (saveButton) saveButton.disabled = true;
+        setOnlineClassMessage("⏳ Checking the saved list…", false);
+
+        /* Compare with what is saved right now (it may have changed on another device). */
+        const existing = await fetchClassRoster(context.className, context.session);
+
+        if (rosterFetchFailed) {
+            throw new Error("The saved class list could not be checked, so nothing was changed.");
+        }
+
+        const newKeys = new Set(students.map(function (s) {
+            return rosterKey(s.admission_no, s.student_name);
+        }));
+
+        const removed = existing.filter(function (s) {
+            return !newKeys.has(rosterKey(s.admission_no, s.student_name));
+        });
+
+        if (
+            removed.length > 0 &&
+            !confirm(
+                removed.length + " saved student(s) for " + contextLabel(context, false) +
+                " are not in this list (removed or renamed) and will be taken off the class list. " +
+                "Their saved scores are not deleted.\n\nContinue?"
+            )
+        ) {
+            setOnlineClassMessage("Cancelled. The saved class list was not changed.", false);
+            return;
+        }
+
+        setOnlineClassMessage("⏳ Saving " + students.length + " student(s)…", false);
+
+        const now = new Date().toISOString();
+
+        const payload = students.map(function (student, index) {
+            return {
+                owner_user_id: currentUserId,
+                website_id: WEBSITE_ID,
+                class_name: context.className,
+                session: context.session,
+                admission_no: student.admission_no,
+                student_name: student.student_name,
+                gender: student.gender,
+                house: student.house,
+                match_key: rosterKey(student.admission_no, student.student_name),
+                sort_order: index,
+                updated_at: now
+            };
+        });
+
+        /* Saved on this phone first; it syncs to Supabase when online. */
+        await Offline.upsertManyByKey(
+            CLASS_ROSTER_TABLE,
+            ["owner_user_id", "website_id", "class_name", "session", "match_key"],
+            payload
+        );
+
+        const removedKeys = removed.map(function (s) {
+            return rosterKey(s.admission_no, s.student_name);
+        });
+
+        await Offline.removeWhere(CLASS_ROSTER_TABLE, function (r) {
+            return r.owner_user_id === currentUserId &&
+                r.website_id === WEBSITE_ID &&
+                r.class_name === context.className &&
+                r.session === context.session &&
+                removedKeys.indexOf(r.match_key) !== -1;
+        });
+
+        classRoster = await fetchClassRoster(context.className, context.session);
+        renderStudentPreview();
+
+        /* Show the saved list again (cleaned names, saved order). */
+        state.rows = classRoster.map(function (s) {
+            return {
+                admission_no: s.admission_no || "",
+                student_name: s.student_name || "",
+                gender: s.gender || "",
+                house: s.house || ""
+            };
+        });
+
+        state.dirty = false;
+        renderOnlineClassTable();
+
+        const doneMessage =
+            "✅ " + students.length + " student(s) saved for " + contextLabel(context, false) +
+            ". They now appear automatically in Step 1B and Step 1C.";
+
+        setOnlineClassMessage(doneMessage, false);
+        setRosterStatus(doneMessage);
+
+    } catch (error) {
+
+        console.error("Online class list save error:", error);
+        setOnlineClassMessage("❌ " + (error.message || "Could not save the class list."), true);
+
+    } finally {
+
+        if (saveButton) saveButton.disabled = false;
+
+    }
+
+}
+
+
+/* =========================================================
+   MARKING & GRADING SETTINGS (inside School Information)
+
+   Lets the owner set the 1st CA, 2nd CA and Exams maximum marks, the
+   mark each grade A-E starts at, and the remark (key) shown for each
+   grade, directly on the website. They are saved with the rest of the
+   school profile by the existing "Save School Information" button, so
+   they follow the school to every device and staff login.
+
+   Once saved here, these website values win: an uploaded Excel file's
+   Settings sheet no longer overwrites them (see readSettings below).
+   ========================================================= */
+
+const MARKING_GRADE_LETTERS = ["A", "B", "C", "D", "E", "F"];
+const MARKING_NUMBER_KEYS = [
+    "firstCAMaximum", "secondCAMaximum", "examsMaximum",
+    "gradeA", "gradeB", "gradeC", "gradeD", "gradeE"
+];
+
+function markingEl(id) {
+    return document.getElementById(id);
+}
+
+function markingNumberOr(value, fallback) {
+    const n = Number(value);
+    return value === undefined || value === null || value === "" || !isFinite(n) ? fallback : n;
+}
+
+function initializeMarkingSettingsBlock() {
+
+    if (markingEl("markingSettingsBlock")) return;
+    if (!elementExists(saveSchoolInformationButton)) return;
+
+    const input =
+        'type="number" inputmode="decimal" min="0" step="any" ' +
+        'style="width:100%;box-sizing:border-box;padding:6px;"';
+
+    const cellStyle = "padding:4px;border-bottom:1px solid #ddd;";
+
+    let gradeRows = "";
+
+    MARKING_GRADE_LETTERS.forEach(function (letter) {
+
+        const isLast = letter === "F";
+
+        gradeRows +=
+            "<tr>" +
+            '<td style="' + cellStyle + 'font-weight:bold;text-align:center;">' + letter + "</td>" +
+            '<td style="' + cellStyle + '">' +
+            (isLast
+                ? '<span style="font-size:12px;opacity:.75;">Below E</span>'
+                : '<input id="markGrade' + letter + '" ' + input + ">") +
+            "</td>" +
+            '<td style="' + cellStyle + '"><input id="markRemark' + letter +
+            '" type="text" maxlength="24" autocomplete="off" ' +
+            'style="width:100%;box-sizing:border-box;padding:6px;"></td>' +
+            '<td style="' + cellStyle + 'font-size:12px;white-space:nowrap;" id="markRange' + letter + '"></td>' +
+            "</tr>";
+
+    });
+
+    const block = document.createElement("div");
+    block.id = "markingSettingsBlock";
+    block.style.cssText = "margin:12px 0;";
+
+    block.innerHTML =
+        '<div style="font-weight:bold;margin-bottom:4px;">Marking &amp; Grading</div>' +
+
+        '<div style="font-size:13px;margin-bottom:4px;">Maximum marks</div>' +
+        '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">' +
+        '<label style="font-size:12px;">1st CA' +
+        '<input id="markFirstCA" ' + input + "></label>" +
+        '<label style="font-size:12px;">2nd CA' +
+        '<input id="markSecondCA" ' + input + "></label>" +
+        '<label style="font-size:12px;">Exams' +
+        '<input id="markExams" ' + input + "></label>" +
+        "</div>" +
+        '<div style="font-size:13px;margin:10px 0 4px;">Extra assessments (optional, up to ' + MAX_EXTRA_ASSESSMENTS + ")</div>" +
+        '<div style="font-size:12px;opacity:.75;margin-bottom:4px;">' +
+        "Add another assessment such as 3rd CA or Project. It appears in the templates and on every report, " +
+        "and its marks are added to each subject total.</div>" +
+        '<div id="markExtraList"></div>' +
+        '<button type="button" id="markExtraAdd" style="margin-top:4px;">+ Add assessment</button>' +
+        '<div id="markTotalNote" style="font-size:12px;margin:6px 0 10px;"></div>' +
+
+        '<div style="font-size:13px;margin-bottom:4px;">Grading key (marks out of the total)</div>' +
+        '<table style="border-collapse:collapse;width:100%;font-size:14px;">' +
+        "<thead><tr>" +
+        '<th style="text-align:center;padding:4px;border-bottom:2px solid #999;">Grade</th>' +
+        '<th style="text-align:left;padding:4px;border-bottom:2px solid #999;">Starts at</th>' +
+        '<th style="text-align:left;padding:4px;border-bottom:2px solid #999;">Remark</th>' +
+        '<th style="text-align:left;padding:4px;border-bottom:2px solid #999;">Marks</th>' +
+        "</tr></thead><tbody>" + gradeRows + "</tbody></table>" +
+
+        '<div id="markingSettingsMessage" style="font-size:13px;min-height:18px;margin-top:6px;"></div>' +
+        '<div style="font-size:12px;opacity:.75;margin-top:2px;">' +
+        "Press Save School Information to apply. Scores already entered are not changed, so download " +
+        "fresh templates after changing the maximums." +
+        "</div>";
+
+    saveSchoolInformationButton.insertAdjacentElement("beforebegin", block);
+
+    block.addEventListener("input", updateMarkingPreview);
+
+    block.addEventListener("click", function (event) {
+
+        const target = event.target;
+        if (!target || !target.id && !target.getAttribute) return;
+
+        if (target.id === "markExtraAdd") {
+
+            const current = readMarkingExtraRows();
+
+            if (current.length >= MAX_EXTRA_ASSESSMENTS) {
+                showMarkingMessage("You can add up to " + MAX_EXTRA_ASSESSMENTS + " extra assessments.", true);
+                return;
+            }
+
+            current.push({ name: "", max: "" });
+            renderMarkingExtraRows(current);
+            updateMarkingPreview();
+
+        } else if (target.getAttribute("data-extra-remove") !== null) {
+
+            const current = readMarkingExtraRows();
+            current.splice(Number(target.getAttribute("data-extra-remove")), 1);
+            renderMarkingExtraRows(current);
+            updateMarkingPreview();
+
+        }
+
+    });
+
+    fillMarkingSettingsForm();
+
+}
+
+/* Draws the editable list of extra assessments: [{ name, max }]. */
+function renderMarkingExtraRows(list) {
+
+    const box = markingEl("markExtraList");
+    if (!box) return;
+
+    const field = "padding:6px;box-sizing:border-box;";
+
+    box.innerHTML = list.map(function (item, index) {
+        return '<div style="display:flex;gap:6px;margin-bottom:4px;align-items:center;">' +
+            '<input type="text" class="markExtraName" maxlength="20" autocomplete="off" placeholder="Name e.g. 3rd CA" ' +
+            'value="' + escapeHTML(item.name === undefined || item.name === null ? "" : item.name) +
+            '" style="flex:1;min-width:0;' + field + '">' +
+            '<input type="number" class="markExtraMax" inputmode="decimal" min="0" step="any" placeholder="Max" ' +
+            'value="' + escapeHTML(item.max === undefined || item.max === null ? "" : item.max) +
+            '" style="width:70px;' + field + '">' +
+            '<button type="button" data-extra-remove="' + index + '" title="Remove">✕</button>' +
+            "</div>";
+    }).join("");
+
+}
+
+/* Reads the typed extra assessments, including unfinished rows. */
+function readMarkingExtraRows() {
+
+    const names = document.querySelectorAll("#markExtraList .markExtraName");
+    const maxes = document.querySelectorAll("#markExtraList .markExtraMax");
+    const rows = [];
+
+    for (let i = 0; i < names.length; i++) {
+        rows.push({
+            name: names[i].value.replace(/\s+/g, " ").trim(),
+            max: maxes[i] ? maxes[i].value.trim() : ""
+        });
+    }
+
+    return rows;
+
+}
+
+function showMarkingMessage(message, isError) {
+
+    const box = markingEl("markingSettingsMessage");
+
+    if (box) {
+        box.textContent = message || "";
+        box.style.color = isError ? "#b00020" : "#1b5e20";
+    }
+
+}
+
+/* Puts the saved settings into the form. */
+function fillMarkingSettingsForm() {
+
+    if (!markingEl("markingSettingsBlock")) return;
+
+    const s = reportSettings;
+
+    const set = function (id, value) {
+        const el = markingEl(id);
+        if (el) el.value = value;
+    };
+
+    set("markFirstCA", markingNumberOr(s.firstCAMaximum, 20) || 20);
+    set("markSecondCA", markingNumberOr(s.secondCAMaximum, 20) || 20);
+    set("markExams", markingNumberOr(s.examsMaximum, 60) || 60);
+
+    renderMarkingExtraRows(getExtraAssessments());
+
+    set("markGradeA", markingNumberOr(s.gradeA, 70));
+    set("markGradeB", markingNumberOr(s.gradeB, 60));
+    set("markGradeC", markingNumberOr(s.gradeC, 50));
+    set("markGradeD", markingNumberOr(s.gradeD, 45));
+    set("markGradeE", markingNumberOr(s.gradeE, 40));
+
+    MARKING_GRADE_LETTERS.forEach(function (letter) {
+        set("markRemark" + letter, getGradeRemark(letter));
+    });
+
+    updateMarkingPreview();
+
+}
+
+/* Reads the form into a plain object (numbers are NaN when blank/invalid). */
+function readMarkingForm() {
+
+    const num = function (id) {
+        const el = markingEl(id);
+        const text = el ? String(el.value).trim() : "";
+        return text === "" ? NaN : Number(text);
+    };
+
+    const remarks = {};
+
+    MARKING_GRADE_LETTERS.forEach(function (letter) {
+        const el = markingEl("markRemark" + letter);
+        remarks[letter] = el ? el.value.trim() : "";
+    });
+
+    return {
+        firstCAMaximum: num("markFirstCA"),
+        secondCAMaximum: num("markSecondCA"),
+        examsMaximum: num("markExams"),
+        gradeA: num("markGradeA"),
+        gradeB: num("markGradeB"),
+        gradeC: num("markGradeC"),
+        gradeD: num("markGradeD"),
+        gradeE: num("markGradeE"),
+        gradeF: 0,
+        gradeRemarks: remarks,
+        extraAssessments: readMarkingExtraRows()
+    };
+
+}
+
+/* Returns a message describing the first problem, or "" when everything is valid. */
+function validateMarkingDraft(d) {
+
+    const names = {
+        firstCAMaximum: "1st CA maximum",
+        secondCAMaximum: "2nd CA maximum",
+        examsMaximum: "Exams maximum"
+    };
+
+    for (const key of Object.keys(names)) {
+        if (!isFinite(d[key]) || d[key] <= 0) {
+            return names[key] + " must be a number above 0.";
+        }
+    }
+
+    const seenExtraNames = [];
+
+    for (const item of d.extraAssessments || []) {
+
+        const max = item.max === "" ? NaN : Number(item.max);
+
+        if (item.name === "" && item.max === "") {
+            return "Fill in or remove the empty extra assessment row.";
+        }
+
+        if (item.name === "") return "Every extra assessment needs a name.";
+
+        const key = item.name.toLowerCase();
+
+        if (RESERVED_ASSESSMENT_NAMES.indexOf(key) !== -1) {
+            return "\"" + item.name + "\" cannot be used as an assessment name. Choose another name.";
+        }
+
+        if (seenExtraNames.indexOf(key) !== -1) {
+            return "Two assessments are named \"" + item.name + "\". Each name must be different.";
+        }
+
+        seenExtraNames.push(key);
+
+        if (/[|]/.test(item.name)) return "Assessment names cannot contain the | character.";
+
+        if (!isFinite(max) || max <= 0) {
+            return item.name + " needs a maximum mark above 0.";
+        }
+
+    }
+
+    const total = d.firstCAMaximum + d.secondCAMaximum + d.examsMaximum +
+        getExtraAssessments(d).reduce(function (sum, item) { return sum + item.max; }, 0);
+    const letters = ["A", "B", "C", "D", "E"];
+
+    for (const letter of letters) {
+        const value = d["grade" + letter];
+        if (!isFinite(value) || value < 0) {
+            return "Grade " + letter + " must start at a number, 0 or more.";
+        }
+    }
+
+    if (d.gradeA > total) {
+        return "Grade A cannot start above the total maximum (" + total + ").";
+    }
+
+    for (let i = 1; i < letters.length; i++) {
+        if (d["grade" + letters[i]] >= d["grade" + letters[i - 1]]) {
+            return "Grade " + letters[i] + " must start lower than grade " + letters[i - 1] + ".";
+        }
+    }
+
+    for (const letter of MARKING_GRADE_LETTERS) {
+        if (d.gradeRemarks[letter].length > 24) {
+            return "The remark for grade " + letter + " is too long (24 letters at most).";
+        }
+    }
+
+    return "";
+
+}
+
+/* Live total and the marks range of each grade, as the report will show them. */
+function updateMarkingPreview() {
+
+    const d = readMarkingForm();
+    const error = validateMarkingDraft(d);
+
+    const totalNote = markingEl("markTotalNote");
+    const total = d.firstCAMaximum + d.secondCAMaximum + d.examsMaximum +
+        getExtraAssessments(d).reduce(function (sum, item) { return sum + item.max; }, 0);
+
+    if (totalNote) {
+        totalNote.textContent = isFinite(total)
+            ? "Total maximum: " + formatGradeBound(total) +
+              (total === 100 ? "" : " (schools usually use 100)")
+            : "";
+        totalNote.style.color = isFinite(total) && total !== 100 ? "#8a5a00" : "inherit";
+    }
+
+    MARKING_GRADE_LETTERS.forEach(function (letter) {
+        const cell = markingEl("markRange" + letter);
+        if (cell) cell.textContent = "";
+    });
+
+    if (error) {
+        showMarkingMessage("⚠ " + error, true);
+        return;
+    }
+
+    showMarkingMessage("", false);
+
+    const draftSettings = Object.assign({}, reportSettings, d);
+
+    getGradeKeyRows(draftSettings).forEach(function (row) {
+        const cell = markingEl("markRange" + row.grade);
+        if (cell) cell.textContent = row.range;
+    });
+
+}
+
+/* Called at the start of saveSchoolInformation(). Returns false (and saves
+   nothing) when the form has a problem or the owner cancels. */
+function applyMarkingSettingsFromForm() {
+
+    if (!markingEl("markingSettingsBlock")) return true;
+
+    /* Only the school owner's settings are ever saved from here. */
+    if (typeof staffContext !== "undefined" && staffContext) return true;
+
+    const d = readMarkingForm();
+    const error = validateMarkingDraft(d);
+
+    if (error) {
+        showMarkingMessage("❌ " + error, true);
+        if (schoolInformationStatus) {
+            schoolInformationStatus.textContent = "❌ Not saved: " + error;
+        }
+        return false;
+    }
+
+    const changed = MARKING_NUMBER_KEYS.some(function (key) {
+        return Number(reportSettings[key]) !== d[key];
+    });
+
+    if (
+        changed &&
+        !confirm(
+            "Changing the maximum marks or grade starting marks changes how every report is " +
+            "calculated. Reports you already generated may count against your report allowance " +
+            "again if you generate them again.\n\nSave these changes?"
+        )
+    ) {
+        showMarkingMessage("Not saved. Nothing was changed.", false);
+        if (schoolInformationStatus) {
+            schoolInformationStatus.textContent = "Not saved. Nothing was changed.";
+        }
+        return false;
+    }
+
+    MARKING_NUMBER_KEYS.forEach(function (key) {
+        reportSettings[key] = d[key];
+    });
+
+    reportSettings.gradeF = 0;
+
+    reportSettings.extraAssessments = getExtraAssessments(d);
+
+    /* Only wording that differs from the built-in key is stored. */
+    const custom = {};
+    let hasCustom = false;
+
+    MARKING_GRADE_LETTERS.forEach(function (letter) {
+        const text = d.gradeRemarks[letter];
+        if (text && text !== GRADE_REMARKS[letter]) {
+            custom[letter] = text;
+            hasCustom = true;
+        }
+    });
+
+    if (hasCustom) {
+        reportSettings.gradeRemarks = custom;
+    } else {
+        delete reportSettings.gradeRemarks;
+    }
+
+    /* From now on the website values win over an Excel file's Settings sheet. */
+    reportSettings.markingFromWebsite = true;
+
+    showMarkingMessage("✓ Marking and grading saved.", false);
+
+    return true;
+
+}
+
+/* The Settings sheet of an uploaded Excel file used to set these values. Once
+   they have been saved on the website, the website values are kept instead. */
+function readSettings(settingsSheet) {
+
+    if (!reportSettings.markingFromWebsite) {
+        return readSettingsFromSheet(settingsSheet);
+    }
+
+    const keep = {};
+
+    MARKING_NUMBER_KEYS.concat(["gradeF"]).forEach(function (key) {
+        keep[key] = reportSettings[key];
+    });
+
+    const keepExtras = getExtraAssessments();
+
+    const result = readSettingsFromSheet(settingsSheet);
+
+    Object.keys(keep).forEach(function (key) {
+        reportSettings[key] = keep[key];
+    });
+
+    reportSettings.extraAssessments = keepExtras;
+
+    return result;
+
+}
+
+
+/* =========================================================
+   DOWNLOAD EXCEL TEMPLATE
+   ========================================================= */
+
+async function downloadExcelTemplate() {
+
+    try {
+
+        if (
+            typeof XLSX ===
+            "undefined"
+        ) {
+
+            alert(
+                "Excel library has not loaded. Please refresh the page."
+            );
+
+            return;
+
+        }
+
+
+        const templateContext = getWorkflowContext(true);
+        if (!templateContext) return;
+
+        const activeClassName = templateContext.className;
+
+        /* Extra assessments the school added (e.g. 3rd CA). Each subject
+           block on the Scores sheet is 1st CA, 2nd CA, Exams, extras..., Total. */
+        const extraList = getExtraAssessments();
+        const blockWidth = 4 + extraList.length;
+
+
+        const templateLevel =
+            getClassLevel(activeClassName);
+
+        /* Only the subjects of this class's level go into the template
+           (every subject when the class has no level yet). The school's
+           own list is left untouched. */
+        let templateSubjects =
+            subjectsForClass(activeClassName)
+                .map(
+                    function (subject) {
+
+                        return String(
+                            subject
+                        ).trim();
+
+                    }
+                )
+                .filter(
+                    function (subject) {
+
+                        return (
+                            subject !== ""
+                        );
+
+                    }
+                );
+
+
+        if (
+            templateSubjects.length ===
+            0
+        ) {
+
+            alert(
+                templateLevel
+                    ? "No subjects have been added for the " + templateLevel + " level yet. Add them in School Subjects first."
+                    : "Please add at least one subject."
+            );
+
+            return;
+
+        }
+
+
+        setFileStatus(
+            "⏳ Checking for previously saved subject scores for " +
+            escapeHTML(activeClassName) + "…"
+        );
+
+        const savedScoresBySubject =
+            await fetchAllSavedSubjectScoresForClass(
+                activeClassName,
+                templateSubjects,
+                templateContext.session,
+                templateContext.term
+            );
+
+        const masterRoster = await fetchClassRoster(
+            activeClassName,
+            templateContext.session
+        );
+
+
+        const workbook =
+            XLSX.utils.book_new();
+
+
+        /* =================================================
+           SCORES SHEET
+           ================================================= */
+
+        const scoresHeaders = [
+
+            "Admission No",
+            "Student Name",
+            "Gender",
+            "Class",
+            "Term",
+            "Session",
+            "House"
+
+        ];
+
+
+        templateSubjects.forEach(
+            function (subject) {
+
+                scoresHeaders.push(
+                    subject +
+                    " 1st CA"
+                );
+
+                scoresHeaders.push(
+                    subject +
+                    " 2nd CA"
+                );
+
+                scoresHeaders.push(
+                    subject +
+                    " Exams"
+                );
+
+                extraList.forEach(function (item) {
+                    scoresHeaders.push(subject + " " + item.name);
+                });
+
+                scoresHeaders.push(
+                    subject +
+                    " Total"
+                );
+
+            }
+        );
+
+
+        scoresHeaders.push(
+            "Overall Total"
+        );
+
+        scoresHeaders.push(
+            "Average"
+        );
+
+        scoresHeaders.push(
+            "Position"
+        );
+
+        scoresHeaders.push(
+            "Class Teacher's Comment"
+        );
+
+        scoresHeaders.push(
+            "Principal's Comment"
+        );
+
+        behavioralTraits.forEach(
+            function (trait) {
+
+                scoresHeaders.push(
+                    trait
+                );
+
+            }
+        );
+
+
+        const scoresData = [
+            scoresHeaders
+        ];
+
+
+        for (
+            let i = 1;
+            i <= TEMPLATE_STUDENT_ROWS;
+            i++
+        ) {
+
+            const row = [
+
+                i === 1
+                    ? "001"
+                    : "",
+
+                i === 1
+                    ? "Example Student"
+                    : "",
+
+                i === 1
+                    ? "Male"
+                    : "",
+
+                i === 1
+                    ? "SS2"
+                    : "",
+
+                i === 1
+                    ? "First Term"
+                    : "",
+
+                i === 1
+                    ? "2025/2026"
+                    : "",
+
+                i === 1
+                    ? "Example House"
+                    : ""
+
+            ];
+
+
+            templateSubjects.forEach(
+                function () {
+
+                    row.push("");
+
+                    row.push("");
+
+                    row.push("");
+
+                    extraList.forEach(function () { row.push(""); });
+
+                    row.push("");
+
+                }
+            );
+
+
+            row.push("");
+
+            row.push("");
+
+            row.push("");
+
+            row.push("");
+
+            row.push("");
+
+            behavioralTraits.forEach(
+                function () {
+                    row.push("");
+                }
+            );
+
+
+            scoresData.push(
+                row
+            );
+
+        }
+
+
+        const scoresSheet =
+            XLSX.utils.aoa_to_sheet(
+                scoresData
+            );
+
+
+        scoresSheet["!cols"] = [
+
+            { wch: 9 },
+            { wch: 14 },
+            { wch: 9 },
+            { wch: 9 },
+            { wch: 10 },
+            { wch: 10 },
+            { wch: 12 }
+
+        ];
+
+
+        templateSubjects.forEach(
+            function () {
+
+                scoresSheet["!cols"].push(
+
+                    { wch: 10 },
+                    { wch: 10 },
+                    { wch: 10 },
+                    { wch: 10 }
+
+                );
+
+                extraList.forEach(function () {
+                    scoresSheet["!cols"].push({ wch: 10 });
+                });
+
+            }
+        );
+
+
+        scoresSheet["!cols"].push(
+
+            { wch: 9 },
+            { wch: 9 },
+            { wch: 9 },
+            { wch: 18 },
+            { wch: 18 }
+
+        );
+
+        behavioralTraits.forEach(
+            function () {
+
+                scoresSheet["!cols"].push(
+                    { wch: 10 }
+                );
+
+            }
+        );
+
+
+        scoresSheet["!freeze"] = {
+
+            xSplit: 3,
+
+            ySplit: 1
+
+        };
+
+
+        XLSX.utils.book_append_sheet(
+            workbook,
+            scoresSheet,
+            "Scores"
+        );
+
+        /* Master class list -> Admission No, Name, Gender, Class, Term, Session, House */
+        applyRosterToScoresSheet(scoresSheet, masterRoster, templateContext);
+
+
+        /* =================================================
+           SETTINGS SHEET
+           ================================================= */
+
+        const settingsData = [
+
+            [
+                "SETTING",
+                "VALUE"
+            ],
+
+            [
+                "School Name",
+                reportSettings.schoolName
+            ],
+
+            [
+                "School Address",
+                reportSettings.schoolAddress
+            ],
+
+            [
+                "1st CA Maximum",
+                reportSettings.firstCAMaximum
+            ],
+
+            [
+                "2nd CA Maximum",
+                reportSettings.secondCAMaximum
+            ],
+
+            [
+                "Exams Maximum",
+                reportSettings.examsMaximum
+            ],
+
+            [
+                "Extra Assessment 1",
+                (extraList[0] ? extraList[0].name + "|" + extraList[0].max : "")
+            ],
+
+
+            [
+                "Extra Assessment 2",
+                (extraList[1] ? extraList[1].name + "|" + extraList[1].max : "")
+            ],
+
+
+            [
+                "Extra Assessment 3",
+                (extraList[2] ? extraList[2].name + "|" + extraList[2].max : "")
+            ],
+
+
+            [
+                "Extra Assessment 4",
+                (extraList[3] ? extraList[3].name + "|" + extraList[3].max : "")
+            ],
+
+            [
+                "Grade A Minimum",
+                reportSettings.gradeA
+            ],
+
+            [
+                "Grade B Minimum",
+                reportSettings.gradeB
+            ],
+
+            [
+                "Grade C Minimum",
+                reportSettings.gradeC
+            ],
+
+            [
+                "Grade D Minimum",
+                reportSettings.gradeD
+            ],
+
+            [
+                "Grade E Minimum",
+                reportSettings.gradeE
+            ],
+
+            [
+                "Grade F Minimum",
+                reportSettings.gradeF
+            ],
+
+            [
+                "Subjects",
+                templateSubjects.join(", ")
+            ],
+
+            [
+                "Level",
+                templateLevel || "All levels"
+            ],
+
+            [
+                "Class",
+                activeClassName
+            ]
+
+        ];
+
+
+        const settingsSheet =
+            XLSX.utils.aoa_to_sheet(
+                settingsData
+            );
+
+
+        settingsSheet["!cols"] = [
+
+            { wch: 13 },
+            { wch: 13 }
+
+        ];
+
+
+        XLSX.utils.book_append_sheet(
+            workbook,
+            settingsSheet,
+            "Settings"
+        );
+
+
+        /* =================================================
+           SUBJECT SHEETS
+           ================================================= */
+
+        const actualSubjectSheetNames =
+            {};
+
+
+        const subjectTotalLetters =
+            [];
+
+
+        templateSubjects.forEach(
+            function (subject) {
+
+                const sheetName =
+                    getSubjectSheetName(
+                        subject,
+                        workbook
+                    );
+
+
+                actualSubjectSheetNames[
+                    subject
+                ] =
+                    sheetName;
+
+
+                const subjectData = [
+
+                    [
+                        "Adm No",
+                        "Student Name",
+                        "1st CA",
+                        "2nd CA",
+                        "Exams",
+                        "Match Key",
+                        "Total"
+                    ].concat(extraList.map(function (item) { return item.name; }))
+
+                ];
+
+
+                /* Pre-fill with anything a subject teacher already
+                   uploaded for this class via the single-subject
+                   template, on this device or any other. */
+                const savedSubjectRows =
+                    mergeRosterWithSavedScores(
+                        masterRoster,
+                        savedScoresBySubject[subject] || []
+                    );
+
+
+                for (
+                    let i = 1;
+                    i <= TEMPLATE_STUDENT_ROWS;
+                    i++
+                ) {
+
+                    const saved =
+                        savedSubjectRows[i - 1];
+
+                    if (saved) {
+
+                        subjectData.push([
+                            saved.admission_no || "",
+                            saved.student_name || "",
+                            saved.first_ca ?? "",
+                            saved.second_ca ?? "",
+                            saved.exams ?? "",
+                            "",
+                    ""
+                        ].concat(extraList.map(function (item) {
+                            return cleanExtrasObject(saved.extras)[item.name] ?? "";
+                        })));
+
+                    } else {
+
+                        subjectData.push([
+
+                            (i === 1 && savedSubjectRows.length === 0)
+                                ? "001"
+                                : "",
+
+                            (i === 1 && savedSubjectRows.length === 0)
+                                ? "Example Student"
+                                : "",
+
+                            "",
+                            "",
+                            "",
+                            "",
+                        ""
+
+                        ].concat(extraList.map(function () { return ""; })));
+
+                    }
+
+                }
+
+
+                const subjectSheet =
+                    XLSX.utils.aoa_to_sheet(
+                        subjectData
+                    );
+
+
+                /* Hidden "Match Key" column (F): a normalized copy of the
+                   Student Name (extra/leading/trailing spaces collapsed,
+                   non-breaking spaces and invisible characters stripped)
+                   that the main Scores sheet matches against instead of
+                   the raw Student Name, so stray spaces typed while
+                   entering scores don't break the lookup. */
+
+                for (
+                    let row = 2;
+                    row <= TEMPLATE_STUDENT_ROWS + 1;
+                    row++
+                ) {
+
+                    subjectSheet[
+                        "F" + row
+                    ] = {
+
+                        t: "str",
+
+                        f:
+                            `TRIM(A${row})&"|"&TRIM(CLEAN(SUBSTITUTE(B${row},CHAR(160)," ")))`
+
+                    };
+
+                }
+
+
+                subjectSheet["!cols"] = [
+
+                    { wch: 7 },
+                    { wch: 14 },
+                    { wch: 6 },
+                    { wch: 6 },
+                    { wch: 6 },
+                    { wch: 10, hidden: true },
+                { wch: 8 }
+
+                ];
+
+                extraList.forEach(function (item) {
+                    subjectSheet["!cols"].push({ wch: Math.max(6, Math.min(14, item.name.length + 2)) });
+                });
+
+
+                subjectSheet["!freeze"] = {
+
+                    xSplit: 3,
+
+                    ySplit: 1
+
+                };
+        /* Visible "Total" column (G): 1st CA + 2nd CA + Exams, so
+           teachers can see each student's total. The hidden Match Key
+           stays in column F so the Scores sheet lookups are unchanged. */
+        for (let row = 2; row <= TEMPLATE_STUDENT_ROWS + 1; row++) {
+            subjectSheet["G" + row] = {
+                t: "n",
+                f: subjectSheetTotalFormula(row)
+            };
+        }
+        subjectSheet["!ref"] = XLSX.utils.encode_range({
+            s: { r: 0, c: 0 },
+            e: { r: TEMPLATE_STUDENT_ROWS, c: 6 + extraList.length }
+        });
+
+
+
+                XLSX.utils.book_append_sheet(
+                    workbook,
+                    subjectSheet,
+                    sheetName
+                );
+
+            }
+        );
+
+
+        /* =================================================
+           VLOOKUP FORMULAS
+           ================================================= */
+
+        templateSubjects.forEach(
+            function (
+                subject,
+                subjectIndex
+            ) {
+
+                const sheetName =
+                    actualSubjectSheetNames[
+                        subject
+                    ];
+
+
+                const safeSheetName =
+                    sheetName.replace(
+                        /'/g,
+                        "''"
+                    );
+
+
+                const firstCAColumn =
+                    8 +
+                    (
+                        subjectIndex *
+                        blockWidth
+                    );
+
+
+                const secondCAColumn =
+                    firstCAColumn +
+                    1;
+
+
+                const examsColumn =
+                    firstCAColumn +
+                    2;
+
+
+                const totalColumn =
+                    firstCAColumn +
+                    3 + extraList.length;
+
+
+                const firstCALetter =
+                    XLSX.utils.encode_col(
+                        firstCAColumn - 1
+                    );
+
+
+                const secondCALetter =
+                    XLSX.utils.encode_col(
+                        secondCAColumn - 1
+                    );
+
+
+                const examsLetter =
+                    XLSX.utils.encode_col(
+                        examsColumn - 1
+                    );
+
+
+                const totalLetter =
+                    XLSX.utils.encode_col(
+                        totalColumn - 1
+                    );
+
+
+                subjectTotalLetters.push(
+                    totalLetter
+                );
+
+
+                for (
+                    let row = 2;
+                    row <=
+                    TEMPLATE_STUDENT_ROWS + 1;
+                    row++
+                ) {
+
+                    scoresSheet[
+                        firstCALetter +
+                        row
+                    ] = {
+
+                        t: "n",
+
+                        f:
+                            `IF($B${row}="","",IFERROR(IF(INDEX('${safeSheetName}'!$C:$C,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))="","",INDEX('${safeSheetName}'!$C:$C,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))),""))`
+
+                    };
+
+
+                    scoresSheet[
+                        secondCALetter +
+                        row
+                    ] = {
+
+                        t: "n",
+
+                        f:
+                            `IF($B${row}="","",IFERROR(IF(INDEX('${safeSheetName}'!$D:$D,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))="","",INDEX('${safeSheetName}'!$D:$D,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))),""))`
+
+                    };
+
+
+                    scoresSheet[
+                        examsLetter +
+                        row
+                    ] = {
+
+                        t: "n",
+
+                        f:
+                            `IF($B${row}="","",IFERROR(IF(INDEX('${safeSheetName}'!$E:$E,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))="","",INDEX('${safeSheetName}'!$E:$E,MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))),""))`
+
+                    };
+
+
+                    /* Per-subject Total: sum of that subject's 1st CA,
+                       2nd CA and Exams for this row. Blank (not "0")
+                       when the subject isn't offered, i.e. all three
+                       component cells are blank. */
+                    extraList.forEach(function (item, extraIndex) {
+
+                        const extraLetter =
+                            XLSX.utils.encode_col(firstCAColumn + 2 + extraIndex);
+
+                        const sourceLetter =
+                            XLSX.utils.encode_col(7 + extraIndex);
+
+                        scoresSheet[extraLetter + row] = {
+                            t: "n",
+                            f:
+                                `IF($B${row}="","",IFERROR(IF(INDEX('${safeSheetName}'!$${sourceLetter}:$${sourceLetter},MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))="","",INDEX('${safeSheetName}'!$${sourceLetter}:$${sourceLetter},MATCH(TRIM($A${row})&"|"&TRIM(CLEAN(SUBSTITUTE($B${row},CHAR(160)," "))),'${safeSheetName}'!$F:$F,0))),""))`
+                        };
+
+                    });
+
+                    const lastPartLetter =
+                        XLSX.utils.encode_col(totalColumn - 2);
+
+                    scoresSheet[
+                        totalLetter +
+                        row
+                    ] = {
+
+                        t: "n",
+
+                        f:
+                            `IF(COUNT(${firstCALetter}${row}:${lastPartLetter}${row})=0,"",SUM(${firstCALetter}${row}:${lastPartLetter}${row}))`
+
+                    };
+
+                }
+
+            }
+        );
+
+
+        /* =================================================
+           OVERALL TOTAL / AVERAGE / POSITION
+           ================================================= */
+
+        const firstSubjectColumn =
+            8;
+
+
+        const lastSubjectColumn =
+            firstSubjectColumn +
+            (
+                templateSubjects.length *
+                blockWidth
+            ) -
+            1;
+
+
+        const overallTotalColumn =
+            lastSubjectColumn +
+            1;
+
+
+        const averageColumn =
+            overallTotalColumn +
+            1;
+
+
+        const positionColumn =
+            averageColumn +
+            1;
+
+
+        const firstSubjectLetter =
+            XLSX.utils.encode_col(
+                firstSubjectColumn - 1
+            );
+
+
+        const lastSubjectLetter =
+            XLSX.utils.encode_col(
+                lastSubjectColumn - 1
+            );
+
+
+        const overallTotalLetter =
+            XLSX.utils.encode_col(
+                overallTotalColumn - 1
+            );
+
+
+        const averageLetter =
+            XLSX.utils.encode_col(
+                averageColumn - 1
+            );
+
+
+        const positionLetter =
+            XLSX.utils.encode_col(
+                positionColumn - 1
+            );
+
+
+        const subjectSheetSafeNames =
+            templateSubjects.map(
+                function (subject) {
+
+                    return actualSubjectSheetNames[
+                        subject
+                    ].replace(
+                        /'/g,
+                        "''"
+                    );
+
+                }
+            );
+
+
+        for (
+            let row = 2;
+            row <=
+            TEMPLATE_STUDENT_ROWS + 1;
+            row++
+        ) {
+
+            /* Sum only each subject's Total column (not the raw
+               CA/Exams columns too), since those are already folded
+               into each subject's Total — summing the whole
+               firstSubjectLetter:lastSubjectLetter range here would
+               double-count every score. */
+            const overallTotalFormula =
+                subjectTotalLetters
+                    .map(
+                        function (letter) {
+
+                            return letter +
+                                row;
+
+                        }
+                    )
+                    .join(",");
+
+
+            scoresSheet[
+                overallTotalLetter +
+                row
+            ] = {
+
+                t: "n",
+
+                f:
+                    `IF($B${row}="","",SUM(${overallTotalFormula}))`
+
+            };
+
+
+            /* Count only the subjects this student actually has a score
+               in. A subject's Total cell is blank when its 1st CA, 2nd CA
+               and Exams are all blank (not offered), and a number
+               otherwise, so COUNT() skips the subjects not offered
+               instead of dividing by every subject the school has. */
+            const subjectsOfferedFormula = "COUNT(" + overallTotalFormula + ")";
+
+
+            scoresSheet[
+                averageLetter +
+                row
+            ] = {
+
+                t: "n",
+
+                f:
+                    `IF($B${row}="","",IFERROR(${overallTotalLetter}${row}/${subjectsOfferedFormula},0))`
+
+            };
+
+
+            scoresSheet[
+                positionLetter +
+                row
+            ] = {
+
+                t: "n",
+
+                f:
+                    `IF($B${row}="","",RANK(${averageLetter}${row},$${averageLetter}$2:$${averageLetter}$${TEMPLATE_STUDENT_ROWS + 1},0))`
+
+            };
+
+        }
+
+
+        /* Tag the whole workbook with the class it belongs to. */
+        appendMetaSheet(workbook, activeClassName, "", templateContext.session, templateContext.term);
+
+
+        /* =================================================
+           WRITE FILE
+           ================================================= */
+
+        const excelData =
+            XLSX.write(
+                workbook,
+                {
+
+                    bookType:
+                        "xlsx",
+
+                    type:
+                        "array"
+
+                }
+            );
+
+
+        const blob =
+            new Blob(
+                [excelData],
+                {
+
+                    type:
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+                }
+            );
+
+
+        const url =
+            URL.createObjectURL(
+                blob
+            );
+
+
+        const link =
+            document.createElement(
+                "a"
+            );
+
+
+        link.href =
+            url;
+
+
+        link.download =
+            activeClassName.replace(/[^a-z0-9]+/gi, "_") + "_" +
+            templateContext.session.replace(/[^a-z0-9]+/gi, "_") + "_" +
+            templateContext.term.replace(/[^a-z0-9]+/gi, "_") +
+            "_Student_Report_Template.xlsx";
+
+
+        document.body.appendChild(
+            link
+        );
+
+
+        link.click();
+        showManualDownloadLink(url, link.download);
+
+
+        setTimeout(
+            function () {
+
+                URL.revokeObjectURL(
+                    url
+                );
+
+
+                if (
+                    link.parentNode
+                ) {
+
+                    link.parentNode.removeChild(
+                        link
+                    );
+
+                }
+
+            },
+            300000
+        );
+
+
+        const mergedSubjectCount =
+            Object.keys(savedScoresBySubject).filter(function (subject) {
+                return (savedScoresBySubject[subject] || []).length > 0;
+            }).length;
+
+        setFileStatus(
+
+            "✅ Template created successfully for " + escapeHTML(contextLabel(templateContext)) + " with " +
+            (masterRoster.length > 0
+                ? masterRoster.length + " student(s) from the class list and "
+                : (rosterFetchFailed ? "⚠ (class list could not be loaded) " : "no class list and ")) +
+
+            templateSubjects.length +
+
+            " subject sheet(s)" +
+
+            (mergedSubjectCount > 0
+                ? " (" + mergedSubjectCount + " of them pre-filled with previously saved scores)"
+                : "") +
+
+            ". Comments and all Behavioral Traits are now on the Scores sheet after Position."
+
+        );
+
+
+    } catch (error) {
+
+        console.error(
+            "Excel template error:",
+            error
+        );
+
+
+        alert(
+
+            "❌ Excel template could not be created.\n\n" +
+            error.message
+
+        );
+
+
+        setFileStatus(
+            "❌ Excel template generation failed."
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   HANDLE EXCEL UPLOAD
+   ========================================================= */
+
+function handleExcelUpload(event) {
+
+    const file =
+        event.target.files[0];
+
+
+    if (!file) {
+        return;
+    }
+
+
+    if (
+        typeof XLSX ===
+        "undefined"
+    ) {
+
+        setFileStatus(
+            "❌ Excel library has not loaded."
+        );
+
+        return;
+
+    }
+
+
+    const reader =
+        new FileReader();
+
+
+    reader.onload =
+        function (e) {
+
+            try {
+
+                const data =
+                    new Uint8Array(
+                        e.target.result
+                    );
+
+
+                const workbook =
+                    XLSX.read(
+                        data,
+                        {
+                            type: "array"
+                        }
+                    );
+
+
+                if (
+                    !workbook.Sheets[
+                        "Scores"
+                    ]
+                ) {
+
+                    setFileStatus(
+                        "❌ The Excel file does not contain a Scores sheet."
+                    );
+
+                    return;
+
+                }
+
+
+                /* =========================
+                   SETTINGS
+                   ========================= */
+
+                if (
+                    workbook.Sheets[
+                        "Settings"
+                    ]
+                ) {
+
+                    readSettings(
+                        workbook.Sheets[
+                            "Settings"
+                        ]
+                    );
+
+                }
+
+
+                /* =========================
+                   SCORES
+                   ========================= */
+
+                const worksheet =
+                    workbook.Sheets[
+                        "Scores"
+                    ];
+
+
+                const rows =
+                    XLSX.utils.sheet_to_json(
+                        worksheet,
+                        {
+                            defval: ""
+                        }
+                    );
+
+
+                const actualRows =
+                    rows.filter(
+                        function (student) {
+
+                            return (
+
+                                String(
+                                    student[
+                                        "Admission No"
+                                    ] ||
+                                    ""
+                                ).trim() !==
+                                "" ||
+
+                                String(
+                                    student[
+                                        "Student Name"
+                                    ] ||
+                                    ""
+                                ).trim() !==
+                                ""
+
+                            );
+
+                        }
+                    );
+
+
+                if (
+                    actualRows.length ===
+                    0
+                ) {
+
+                    setFileStatus(
+                        "❌ No student records found."
+                    );
+
+                    return;
+
+                }
+
+
+                const invalidStudents =
+                    actualRows.filter(
+                        function (student) {
+
+                            return !String(
+                                student[
+                                    "Student Name"
+                                ] ||
+                                ""
+                            ).trim();
+
+                        }
+                    );
+
+
+                if (
+                    invalidStudents.length >
+                    0
+                ) {
+
+                    setFileStatus(
+                        "❌ One or more student records have no Student Name."
+                    );
+
+                    return;
+
+                }
+
+
+                /* =========================
+                   CLEAN STUDENT NAMES
+                   ========================= */
+
+                actualRows.forEach(function (student) {
+                    student["Student Name"] = cleanStudentName(
+                        student["Student Name"]
+                    );
+                });
+
+
+                /* =========================
+                   SUBJECTS
+                   ========================= */
+
+                const detectedSubjects =
+                    detectSubjectsFromRows(
+                        actualRows
+                    );
+
+
+                if (
+                    detectedSubjects.length >
+                    0
+                ) {
+
+                    /* A class's file only holds its own level's subjects, so
+                       keep the school's full list and just add anything new. */
+                    if (mergeDetectedSubjects(detectedSubjects)) {
+
+                        renderSubjectList();
+
+                    }
+
+                }
+
+
+                /* =========================
+                   REBUILD SUBJECT SCORES
+                   ========================= */
+
+                attachSubjectScores(
+                    actualRows,
+                    workbook,
+                    detectedSubjects.length > 0
+                        ? detectedSubjects
+                        : schoolSubjects
+                );
+
+
+                /* =========================
+                   BEHAVIOR
+                   =========================
+
+                   New templates store these fields directly in Scores.
+                   Keep the old Behavioral Traits sheet as a fallback so
+                   older templates already downloaded by users still work.
+                   ========================= */
+
+                const behaviorColumns = [
+                    "Class Teacher's Comment",
+                    "Principal's Comment"
+                ].concat(behavioralTraits);
+
+                const scoresContainBehaviorColumns =
+                    behaviorColumns.some(function (column) {
+                        return Object.prototype.hasOwnProperty.call(
+                            actualRows[0] || {},
+                            column
+                        );
+                    });
+
+                if (scoresContainBehaviorColumns) {
+                    actualRows.forEach(function (student) {
+                        student.__behavior = {};
+
+                        behaviorColumns.forEach(function (column) {
+                            student.__behavior[column] =
+                                student[column] ?? "";
+                        });
+                    });
+                } else {
+                    const behaviorSheet =
+                        workbook.Sheets["Behavioral Traits"];
+
+                    if (behaviorSheet) {
+                        attachBehaviorData(
+                            actualRows,
+                            behaviorSheet
+                        );
+                    } else {
+                        actualRows.forEach(function (student) {
+                            student.__behavior = {};
+                        });
+                    }
+                }
+
+
+                /* =========================
+                   STORE STUDENTS
+                   ========================= */
+
+                students =
+                    actualRows;
+
+                /* Fill blank Class Teacher's / Principal's comments from each
+                   student's average (typed comments are never replaced). */
+                applyAutoCommentsToStudents(students);
+
+
+                saveAppData();
+
+
+                /* =========================
+                   CLEAR OLD GENERATED
+                   REPORTS
+                   =========================
+
+                   A newly uploaded Excel file
+                   represents a new dataset.
+
+                   Therefore old generated reports
+                   must not remain attached to it.
+                */
+
+                clearGeneratedReports();
+
+
+                if (reportContainer) {
+
+                    reportContainer.innerHTML =
+                        "";
+
+                }
+
+
+                /* =========================
+                   STATUS
+                   ========================= */
+
+                setFileStatus(
+
+                    "✅ Excel file successfully loaded. " +
+
+                    students.length +
+
+                    " student record(s) found. " +
+
+                    schoolSubjects.length +
+
+                    " subject(s) detected."
+
+                );
+
+
+                loadStudents();
+
+
+                if (reportSection) {
+
+                    reportSection.style.display =
+                        "block";
+
+                }
+
+
+                updateReportStatus();
+
+
+            } catch (error) {
+
+                console.error(
+                    "Excel upload error:",
+                    error
+                );
+
+
+                setFileStatus(
+                    "❌ Unable to read this Excel file."
+                );
+
+            }
+
+        };
+
+
+    reader.readAsArrayBuffer(
+        file
+    );
+
+}
+
+
+/* =========================================================
+   READ SETTINGS
+   ========================================================= */
+
+function readSettingsFromSheet(
+    settingsSheet
+) {
+
+    const rows =
+        XLSX.utils.sheet_to_json(
+            settingsSheet,
+            {
+                header: 1,
+                defval: ""
+            }
+        );
+
+
+    /* Extra assessments listed in the uploaded Settings sheet. */
+    const uploadedExtraAssessments = [];
+
+    rows.forEach(
+        function (row) {
+
+            const setting =
+                String(
+                    row[0] ||
+                    ""
+                ).trim();
+
+
+            const value =
+                row[1];
+
+
+            if (/^Extra Assessment \d+$/i.test(setting)) {
+
+                const parts = String(value === null || value === undefined ? "" : value).split("|");
+                const extraName = String(parts[0] || "").trim();
+                const extraMax = Number(parts[1]);
+
+                if (extraName && extraMax > 0) {
+                    uploadedExtraAssessments.push({ name: extraName, max: extraMax });
+                }
+
+            }
+
+
+            if (
+                setting ===
+                "School Name"
+            ) {
+
+                reportSettings.schoolName =
+                    String(value);
+
+            }
+
+
+            if (
+                setting ===
+                "School Address"
+            ) {
+
+                reportSettings.schoolAddress =
+                    String(value);
+
+            }
+
+
+            if (
+                setting ===
+                "1st CA Maximum"
+            ) {
+
+                reportSettings.firstCAMaximum =
+                    Number(value) ||
+                    20;
+
+            }
+
+
+            if (
+                setting ===
+                "2nd CA Maximum"
+            ) {
+
+                reportSettings.secondCAMaximum =
+                    Number(value) ||
+                    20;
+
+            }
+
+
+            if (
+                setting ===
+                "Exams Maximum"
+            ) {
+
+                reportSettings.examsMaximum =
+                    Number(value) ||
+                    60;
+
+            }
+
+
+            if (
+                setting ===
+                "Grade A Minimum"
+            ) {
+
+                reportSettings.gradeA =
+                    Number(value);
+
+            }
+
+
+            if (
+                setting ===
+                "Grade B Minimum"
+            ) {
+
+                reportSettings.gradeB =
+                    Number(value);
+
+            }
+
+
+            if (
+                setting ===
+                "Grade C Minimum"
+            ) {
+
+                reportSettings.gradeC =
+                    Number(value);
+
+            }
+
+
+            if (
+                setting ===
+                "Grade D Minimum"
+            ) {
+
+                reportSettings.gradeD =
+                    Number(value);
+
+            }
+
+
+            if (
+                setting ===
+                "Grade E Minimum"
+            ) {
+
+                reportSettings.gradeE =
+                    Number(value);
+
+            }
+
+
+            if (
+                setting ===
+                "Grade F Minimum"
+            ) {
+
+                reportSettings.gradeF =
+                    Number(value);
+
+            }
+
+
+            if (
+                setting ===
+                "Subjects"
+            ) {
+
+                const importedSubjects =
+                    String(
+                        value || ""
+                    )
+                        .split(",")
+                        .map(
+                            function (
+                                subject
+                            ) {
+
+                                return subject.trim();
+
+                            }
+                        )
+                        .filter(
+                            function (
+                                subject
+                            ) {
+
+                                return (
+                                    subject.length >
+                                    0
+                                );
+
+                            }
+                        );
+
+
+                if (
+                    importedSubjects.length >
+                    0
+                ) {
+
+                    mergeDetectedSubjects(
+                        importedSubjects
+                    );
+
+                }
+
+            }
+
+
+            if (
+                setting ===
+                "Class"
+            ) {
+
+                const uploadedClassName =
+                    String(value || "").trim();
+
+                if (uploadedClassName) {
+
+                    const alreadyKnown = schoolClasses.some(
+                        function (schoolClass) {
+                            return (
+                                normalizeClassKey(schoolClass.class_name) ===
+                                normalizeClassKey(uploadedClassName)
+                            );
+                        }
+                    );
+
+                    if (alreadyKnown) {
+
+                        if (elementExists(classNameInput)) {
+                            classNameInput.value = uploadedClassName;
+                        }
+
+                    } else {
+
+                        /* Uploaded file references a class not yet in
+                           Step 0's list (e.g. first time on a new
+                           device) — add it so it becomes selectable
+                           and future downloads/uploads for it line up. */
+                        addSchoolClass(uploadedClassName);
+
+                    }
+
+                }
+
+            }
+
+        }
+    );
+
+
+    if (uploadedExtraAssessments.length > 0) {
+
+        reportSettings.extraAssessments = uploadedExtraAssessments;
+        reportSettings.extraAssessments = getExtraAssessments();
+
+    }
+
+    renderSubjectList();
+
+    saveAppData();
+
+}
+
+
+/* =========================================================
+   STUDENT NAME CLEANING / NORMALIZATION
+
+   This applies ONLY to Student Name values.
+   It removes leading/trailing spaces, repeated whitespace,
+   tabs/line breaks, non-breaking spaces, zero-width characters,
+   BOM characters and other invisible/control characters.
+   The displayed name keeps its original letter case.
+   ========================================================= */
+function cleanStudentName(value) {
+    if (value === null || value === undefined) return "";
+
+    return String(value)
+        .normalize("NFKC")
+        .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
+        .replace(/[\u00A0\u1680\u2000-\u200B\u2028\u2029\u202F\u205F\u3000\uFEFF]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function normalizeStudentName(value) {
+    return cleanStudentName(value)
+        .toLowerCase()
+        /* Ignore punctuation/symbols for matching only.
+           The displayed Student Name remains unchanged. */
+        .replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+function normalizeStudentAdmissionNo(value) {
+    if (value === null || value === undefined) return "";
+    return String(value).trim().toLowerCase();
+}
+
+/* =========================================================
+   FIND AN UPLOADED SUBJECT SHEET
+   ========================================================= */
+function getUploadedSubjectSheet(subject, workbook) {
+    if (!workbook || !workbook.SheetNames) return null;
+
+    const cleanSubject = String(subject || "")
+        .replace(/[:\\/?*\[\]]/g, "")
+        .trim()
+        .substring(0, 31)
+        .toLowerCase();
+
+    const exactName = workbook.SheetNames.find(function (name) {
+        return String(name).toLowerCase() === cleanSubject;
+    });
+
+    if (exactName) return workbook.Sheets[exactName];
+
+    /* Also tolerate harmless extra spaces in the sheet name. */
+    const relaxedName = workbook.SheetNames.find(function (name) {
+        return cleanStudentName(name).toLowerCase() === cleanSubject;
+    });
+
+    return relaxedName ? workbook.Sheets[relaxedName] : null;
+}
+
+/* =========================================================
+   ATTACH SUBJECT SCORES
+
+   The Excel template normally uses VLOOKUP formulas. However,
+   cached Excel formula results can be blank when a teacher entered
+   extra/invisible characters in a Student Name. This function reads
+   each subject sheet directly and rebuilds the subject score values
+   in JavaScript using the cleaned Student Name as a matching key.
+
+   Admission No is preferred when available; Student Name is the
+   fallback. This affects Student Name matching only and does not
+   alter scores or any other field.
+   ========================================================= */
+function attachSubjectScores(scoreRows, workbook, subjects) {
+    if (!Array.isArray(scoreRows) || !workbook || !Array.isArray(subjects)) {
+        return;
+    }
+
+    scoreRows.forEach(function (student) {
+        subjects.forEach(function (subject) {
+            student[subject + " 1st CA"] = "";
+            student[subject + " 2nd CA"] = "";
+            student[subject + " Exams"] = "";
+            getExtraAssessments().forEach(function (item) {
+                student[subject + " " + item.name] = "";
+            });
+        });
+    });
+
+    subjects.forEach(function (subject) {
+        const sheet = getUploadedSubjectSheet(subject, workbook);
+        if (!sheet) return;
+
+        const subjectRows = XLSX.utils.sheet_to_json(sheet, {
+            defval: ""
+        });
+
+        const byAdmission = new Map();
+        const byName = new Map();
+
+        subjectRows.forEach(function (row) {
+            const admissionNo = normalizeStudentAdmissionNo(row["Adm No"]);
+            const name = normalizeStudentName(row["Student Name"]);
+
+            if (admissionNo && !byAdmission.has(admissionNo)) {
+                byAdmission.set(admissionNo, row);
+            }
+
+            if (name && !byName.has(name)) {
+                byName.set(name, row);
+            }
+        });
+
+        scoreRows.forEach(function (student) {
+            const admissionNo = normalizeStudentAdmissionNo(student["Admission No"]);
+            const name = normalizeStudentName(student["Student Name"]);
+
+            let subjectRow = null;
+
+            if (admissionNo) {
+                subjectRow = byAdmission.get(admissionNo) || null;
+            }
+
+            if (!subjectRow && name) {
+                subjectRow = byName.get(name) || null;
+            }
+
+            if (!subjectRow) return;
+
+            student[subject + " 1st CA"] = subjectRow["1st CA"] ?? "";
+            student[subject + " 2nd CA"] = subjectRow["2nd CA"] ?? "";
+            student[subject + " Exams"] = subjectRow["Exams"] ?? "";
+            getExtraAssessments().forEach(function (item) {
+                student[subject + " " + item.name] = subjectRow[item.name] ?? "";
+            });
+        });
+    });
+}
+
+/* =========================================================
+   DETECT SUBJECTS
+   ========================================================= */
+
+function detectSubjectsFromRows(
+    rows
+) {
+
+    if (
+        !rows ||
+        rows.length ===
+        0
+    ) {
+
+        return [];
+
+    }
+
+
+    const firstStudent =
+        rows[0];
+
+
+    const subjectSet =
+        new Set();
+
+
+    Object.keys(
+        firstStudent
+    )
+        .forEach(
+            function (key) {
+
+                const match =
+                    key.match(
+                        /^(.+)\s+(1st CA|2nd CA|Exams)$/i
+                    );
+
+
+                if (match) {
+
+                    subjectSet.add(
+                        match[1].trim()
+                    );
+
+                }
+
+            }
+        );
+
+
+    return Array.from(
+        subjectSet
+    );
+
+}
+
+
+/* =========================================================
+   ATTACH BEHAVIOR DATA
+   ========================================================= */
+
+function attachBehaviorData(
+    scoreRows,
+    behaviorSheet
+) {
+
+    const behaviorRows =
+        XLSX.utils.sheet_to_json(
+            behaviorSheet,
+            {
+                defval: ""
+            }
+        );
+
+
+    const behaviorMap =
+        new Map();
+
+
+    behaviorRows.forEach(
+        function (row) {
+
+            const name =
+                normalizeStudentName(
+                    row[
+                        "Student Name"
+                    ]
+                );
+
+
+            if (name) {
+
+                behaviorMap.set(
+                    name,
+                    {
+
+                        Attendance:
+                            row[
+                                "Attendance"
+                            ] ||
+                            "",
+
+                        Punctuality:
+                            row[
+                                "Punctuality"
+                            ] ||
+                            "",
+
+                        "Class Participation":
+                            row[
+                                "Class Participation"
+                            ] ||
+                            "",
+
+                        Neatness:
+                            row[
+                                "Neatness"
+                            ] ||
+                            "",
+
+                        Honesty:
+                            row[
+                                "Honesty"
+                            ] ||
+                            "",
+
+                        "Class Teacher's Comment":
+                            row[
+                                "Class Teacher's Comment"
+                            ] ||
+                            row[
+                                "Class Teacher's Comment/Sign"
+                            ] ||
+                            "",
+
+                        "Principal's Comment":
+                            row[
+                                "Principal's Comment"
+                            ] ||
+                            row[
+                                "Principal's Comment/Sign"
+                            ] ||
+                            ""
+
+                    }
+                );
+
+            }
+
+        }
+    );
+
+
+    scoreRows.forEach(
+        function (student) {
+
+            const name =
+                normalizeStudentName(
+                    student[
+                        "Student Name"
+                    ]
+                );
+
+
+            const behavior =
+                behaviorMap.get(
+                    name
+                );
+
+
+            if (behavior) {
+
+                student.__behavior =
+                    behavior;
+
+            } else {
+
+                student.__behavior = {
+
+                    Attendance:
+                        "",
+
+                    Punctuality:
+                        "",
+
+                    "Class Participation":
+                        "",
+
+                    Neatness:
+                        "",
+
+                    Honesty:
+                        "",
+
+                    "Class Teacher's Comment":
+                        "",
+
+                    "Principal's Comment":
+                        ""
+
+                };
+
+            }
+
+        }
+    );
+
+}
+
+
+/* =========================================================
+   LOAD STUDENTS
+   ========================================================= */
+
+function loadStudents() {
+
+    if (
+        !elementExists(
+            studentSelect
+        )
+    ) {
+
+        return;
+
+    }
+
+
+    studentSelect.innerHTML =
+        "-- Select Student --";
+
+
+    students.forEach(
+        function (
+            student,
+            index
+        ) {
+
+            const option =
+                document.createElement(
+                    "option"
+                );
+
+
+            option.value =
+                index;
+
+
+            option.textContent =
+
+                (
+                    student[
+                        "Admission No"
+                    ] ||
+                    ""
+                ) +
+
+                " - " +
+
+                (
+                    student[
+                        "Student Name"
+                    ] ||
+                    ""
+                );
+
+
+            studentSelect.appendChild(
+                option
+            );
+
+        }
+    );
+
+    loadPublishStudents();
+
+}
+
+
+/* =========================================================
+   REPORT LIMIT FUNCTIONS
+   ========================================================= */
+
+function getReportLimit() {
+
+    const plan =
+        String(
+            currentSubscriptionPlan ||
+            ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    return (
+        REPORT_LIMITS[plan] ||
+        0
+    );
+
+}
+
+
+/* =========================================================
+   GET PLAN DISPLAY NAME
+   ========================================================= */
+
+function getPlanDisplayName() {
+
+    return getPlanDisplayNameFromPlan(
+        currentSubscriptionPlan
+    );
+
+}
+
+
+/* =========================================================
+   REPORT BALANCE HELPERS
+
+   A renewal starts a fresh usage counter. Unused reports from the
+   previous subscription are stored in carried_over_reports.
+   The available balance is therefore:
+
+       NEW PLAN LIMIT + CARRIED-OVER REPORTS - CURRENT USAGE
+   ========================================================= */
+
+function getCarriedOverReports(subscription = currentSubscription) {
+    return Math.max(Number(subscription?.carried_over_reports) || 0, 0);
+}
+
+function getTotalAvailableReports(subscription = currentSubscription) {
+    const plan = String(
+        subscription?.plan ||
+        subscription?.subscription_plan ||
+        subscription?.package ||
+        currentSubscriptionPlan ||
+        ""
+    ).trim().toLowerCase();
+
+    return (REPORT_LIMITS[plan] || 0) +
+        getCarriedOverReports(subscription);
+}
+
+function getReportsRemaining(subscription = currentSubscription) {
+    const generated = Math.max(
+        Number(subscription?.reports_generated ?? reportsGenerated) || 0,
+        0
+    );
+
+    return Math.max(
+        getTotalAvailableReports(subscription) - generated,
+        0
+    );
+}
+
+
+/* =========================================================
+    UPDATE REPORT STATUS
+    ========================================================= */
+
+/*
+   Re-reads reports_generated / the subscription row from the server
+   and updates the local counters + on-screen status. Used after
+   publishing, since the allowance claim for a publish happens inside
+   the publish_student_result SQL function itself rather than via a
+   separate client-side call.
+*/
+async function refreshReportsGeneratedFromServer() {
+
+    try {
+
+        if (!currentUserId) {
+            return;
+        }
+
+        const subscriptionResult =
+            await supabaseClient
+                .from("subscriptions")
+                .select("*")
+                .eq("user_id", currentUserId)
+                .eq("website_id", WEBSITE_ID)
+                .order("created_at", {
+                    ascending: false
+                })
+                .limit(1)
+                .maybeSingle();
+
+        if (subscriptionResult.error || !subscriptionResult.data) {
+            return;
+        }
+
+        currentSubscription =
+            subscriptionResult.data;
+
+        reportsGenerated =
+            Number(currentSubscription.reports_generated) || 0;
+
+        updateReportStatus();
+
+    } catch (error) {
+
+        console.error(
+            "Unable to refresh report count after publishing:",
+            error
+        );
+
+    }
+
+}
+
+
+/*
+   Tells the server this student's report was just generated (and
+   charged). publish_student_result checks this log before deciding
+   whether to charge for publishing the same (student, session, term)
+   again. Best-effort: if this call fails, the report was still
+   generated and charged correctly — the only side effect is that a
+   later publish of the same result would also be charged, which is
+   the safe direction to fail in.
+*/
+async function logReportGenerated(student) {
+
+    try {
+
+        if (!currentUserId || !student) {
+            return;
+        }
+
+        await supabaseClient.rpc(
+            "log_report_generated",
+            {
+                p_user_id: currentUserId,
+                p_website_id: WEBSITE_ID,
+                p_admission_no:
+                    String(student["Admission No"] || "").trim(),
+                p_student_name:
+                    String(student["Student Name"] || "").trim(),
+                p_session:
+                    String(student["Session"] || "").trim(),
+                p_term:
+                    String(student["Term"] || "").trim()
+            }
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Unable to log report generation:",
+            error
+        );
+
+    }
+
+}
+
+
+function updateReportStatus() {
+
+    const limit =
+        getReportLimit();
+
+
+    const plan =
+        getPlanDisplayName();
+
+
+    let statusElement =
+        document.getElementById(
+            "reportGenerationStatus"
+        );
+
+
+    if (!statusElement) {
+
+        statusElement =
+            document.createElement(
+                "div"
+            );
+
+
+        statusElement.id =
+            "reportGenerationStatus";
+
+
+        statusElement.style.margin =
+            "10px 0";
+
+
+        statusElement.style.padding =
+            "10px";
+
+
+        statusElement.style.borderRadius =
+            "6px";
+
+
+        statusElement.style.fontWeight =
+            "bold";
+
+
+        statusElement.style.background =
+            "#f5f5f5";
+
+
+        if (reportSection) {
+
+            reportSection.prepend(
+                statusElement
+            );
+
+        }
+
+    }
+
+
+    if (!limit) {
+
+        statusElement.innerHTML =
+            "⚠️ Subscription plan could not be determined.";
+
+        return;
+
+    }
+
+
+    /* =====================================================
+       CARRIED-OVER REPORTS
+       ===================================================== */
+
+    const carriedOverReports =
+        Math.max(
+            Number(
+                currentSubscription?.carried_over_reports
+            ) || 0,
+            0
+        );
+
+
+    /* =====================================================
+       TOTAL AVAILABLE REPORTS
+       ===================================================== */
+
+    const totalAvailable =
+        limit +
+        carriedOverReports;
+
+
+    /* =====================================================
+       REMAINING REPORTS
+       ===================================================== */
+
+    const remaining =
+        Math.max(
+            totalAvailable -
+            reportsGenerated,
+            0
+        );
+
+
+    /* =====================================================
+       DISPLAY
+       ===================================================== */
+
+    statusElement.innerHTML =
+
+        "📊 Subscription: " +
+        plan +
+
+        "<br>" +
+
+        "📄 Reports generated: " +
+        reportsGenerated +
+
+        " / " +
+
+        formatReportCount(totalAvailable) +
+
+        "<br>" +
+
+        "🎁 Carried-over reports: " +
+        carriedOverReports +
+
+        "<br>" +
+
+        "📌 Reports remaining: " +
+        formatReportCount(remaining);
+
+
+    /* =====================================================
+       LIMIT REACHED
+       ===================================================== */
+
+    if (
+        reportsGenerated >=
+        totalAvailable
+    ) {
+
+        statusElement.innerHTML +=
+
+            "<br><br>" +
+
+            "⚠️ Report generation limit reached. " +
+
+            "Please renew or upgrade your subscription to generate more reports.";
+
+    }
+
+}
+
+
+/* =========================================================
+   CAN GENERATE REPORTS
+   ========================================================= */
+
+function canGenerateReports(
+    numberOfReports
+) {
+
+    if (isFreeTrial(currentSubscription)) {
+        const expiry = new Date(currentSubscription.expires_at);
+        if (!Number.isFinite(expiry.getTime()) || expiry <= new Date()) {
+            alert(
+                "🎁 Your 7-day free trial has expired.\n\nPlease choose a paid subscription plan to continue."
+            );
+            return false;
+        }
+    }
+
+    const limit =
+        getReportLimit();
+
+
+    if (!limit) {
+
+        alert(
+            "❌ Your subscription plan could not be determined."
+        );
+
+        return false;
+
+    }
+
+
+    /* =====================================================
+       CARRIED-OVER REPORTS
+       ===================================================== */
+
+    const carriedOverReports =
+        Math.max(
+            Number(
+                currentSubscription?.carried_over_reports
+            ) || 0,
+            0
+        );
+
+
+    /* =====================================================
+       TOTAL AVAILABLE
+       ===================================================== */
+
+    const totalAvailable =
+        limit +
+        carriedOverReports;
+
+
+    /* =====================================================
+       REMAINING
+       ===================================================== */
+
+    const remaining =
+        Math.max(
+            totalAvailable -
+            reportsGenerated,
+            0
+        );
+
+
+    /* =====================================================
+       CHECK ZERO
+       ===================================================== */
+
+    if (
+        remaining <=
+        0
+    ) {
+
+        alert(
+
+            "⚠️ REPORT GENERATION LIMIT REACHED\n\n" +
+
+            "Subscription: " +
+            getPlanDisplayName() +
+            "\n" +
+
+            "Reports generated: " +
+            reportsGenerated +
+            " / " +
+            totalAvailable +
+            "\n\n" +
+
+            "Please renew or upgrade your subscription to generate more reports."
+
+        );
+
+
+        updateReportStatus();
+
+
+        return false;
+
+    }
+
+
+    /* =====================================================
+       CHECK REQUESTED AMOUNT
+       ===================================================== */
+
+    if (
+        numberOfReports >
+        remaining
+    ) {
+
+        alert(
+
+            "⚠️ REPORT LIMIT EXCEEDED\n\n" +
+
+            "Subscription: " +
+            getPlanDisplayName() +
+            "\n" +
+
+            "Reports generated: " +
+            reportsGenerated +
+            " / " +
+            totalAvailable +
+            "\n" +
+
+            "Reports remaining: " +
+            remaining +
+            "\n\n" +
+
+            "You requested " +
+            numberOfReports +
+            " report(s), but only " +
+            remaining +
+            " report(s) remain."
+
+        );
+
+
+        updateReportStatus();
+
+
+        return false;
+
+    }
+
+
+    return true;
+
+}
+/* =========================================================
+   INCREMENT REPORT COUNT SECURELY
+   SERVER AUTHORITATIVE
+   ========================================================= */
+
+async function incrementReportCount(
+    amount
+) {
+
+    if (!currentUserId) {
+        console.error("No authenticated user found.");
+        return false;
+    }
+
+    const reportAmount = Number(amount);
+
+    if (!Number.isInteger(reportAmount) || reportAmount <= 0) {
+        console.error("Invalid report count:", amount);
+        return false;
+    }
+
+    /*
+       IMPORTANT:
+       The browser must NEVER directly increment reports_generated.
+       The database RPC remains the final authority for both paid
+       subscriptions and the free trial.
+
+       This function refreshes the authenticated user and the current
+       subscription immediately before claiming. That prevents a newly
+       created/updated trial row from being stale in the browser.
+    */
+    async function refreshAllowanceState() {
+        const sessionResult =
+            await supabaseClient.auth.getSession();
+
+        if (
+            sessionResult.error ||
+            !sessionResult.data ||
+            !sessionResult.data.session ||
+            !sessionResult.data.session.user
+        ) {
+            throw new Error("Authenticated session could not be confirmed.");
+        }
+
+        const user = sessionResult.data.session.user;
+        if (!staffContext) {
+            currentUserId = user.id;
+        }
+
+        const subscriptionResult =
+            await supabaseClient
+                .from("subscriptions")
+                .select("*")
+                .eq("user_id", currentUserId)
+                .eq("website_id", WEBSITE_ID)
+                .order("created_at", {
+                    ascending: false
+                })
+                .limit(1)
+                .maybeSingle();
+
+        if (subscriptionResult.error) {
+            throw subscriptionResult.error;
+        }
+
+        if (!subscriptionResult.data) {
+            throw new Error(
+                "No subscription record was found for this website."
+            );
+        }
+
+        currentSubscription = subscriptionResult.data;
+
+        currentSubscriptionPlan = String(
+            currentSubscription.plan ||
+            currentSubscription.subscription_plan ||
+            currentSubscription.package ||
+            ""
+        ).trim().toLowerCase();
+
+        reportsGenerated =
+            Number(currentSubscription.reports_generated) || 0;
+
+        return currentSubscription;
+    }
+
+    async function claimOnce() {
+        const { data, error } =
+            await supabaseClient.rpc(
+                "claim_report_allowance",
+                {
+                    p_user_id: currentUserId,
+                    p_website_id: WEBSITE_ID,
+                    p_amount: reportAmount
+                }
+            );
+
+        if (error) {
+            console.error(
+                "Unable to claim report allowance:",
+                error
+            );
+
+            return {
+                ok: false,
+                error: error
+            };
+        }
+
+        const result =
+            Array.isArray(data) ? data[0] : data;
+
+        /* Accept a normal boolean as well as a stringified boolean. */
+        const success =
+            result &&
+            (
+                result.success === true ||
+                String(result.success).toLowerCase() === "true"
+            );
+
+        if (!success) {
+            console.error(
+                "Report allowance claim was rejected by the server:",
+                result
+            );
+
+            return {
+                ok: false,
+                result: result
+            };
+        }
+
+        const claimedAmount =
+            Number(result.claimed_amount);
+
+        if (claimedAmount !== reportAmount) {
+            console.error(
+                "Server did not claim the requested number of reports:",
+                {
+                    requested: reportAmount,
+                    result: result
+                }
+            );
+
+            return {
+                ok: false,
+                result: result
+            };
+        }
+
+        /* The server's count is authoritative. */
+        const authoritativeCount =
+            Number(result.reports_generated);
+
+        if (Number.isFinite(authoritativeCount)) {
+            reportsGenerated = authoritativeCount;
+        } else {
+            reportsGenerated += reportAmount;
+        }
+
+        /* Keep the local subscription object synchronized. */
+        if (currentSubscription) {
+            currentSubscription = {
+                ...currentSubscription,
+                reports_generated: reportsGenerated
+            };
+        }
+
+        updateReportStatus();
+
+        return {
+            ok: true,
+            result: result
+        };
+    }
+
+    try {
+        /*
+           Refresh first. This is especially important for the free trial,
+           because the trial subscription can be created by the Supabase
+           auth trigger after account creation.
+        */
+        await refreshAllowanceState();
+
+        /*
+           Confirm that the locally visible subscription is actually usable.
+           This is only a pre-check; the RPC remains authoritative.
+        */
+        const plan = String(
+            currentSubscription?.plan ||
+            currentSubscription?.subscription_plan ||
+            currentSubscription?.package ||
+            ""
+        ).trim().toLowerCase();
+
+        const status = String(
+            currentSubscription?.status ||
+            ""
+        ).trim().toLowerCase();
+
+        const expiry = new Date(
+            currentSubscription?.expires_at || ""
+        );
+
+        const active =
+            Number.isFinite(expiry.getTime()) &&
+            expiry > new Date();
+
+        const validPaidStatuses = [
+            "paid",
+            "active",
+            "success",
+            "successful",
+            "completed"
+        ];
+
+        const valid =
+            (
+                validPaidStatuses.includes(status) ||
+                (plan === FREE_TRIAL_PLAN && status === FREE_TRIAL_STATUS)
+            ) &&
+            active;
+
+        if (!valid) {
+            console.error(
+                "Allowance claim stopped because the subscription is not active:",
+                {
+                    plan: plan,
+                    status: status,
+                    expires_at: currentSubscription?.expires_at
+                }
+            );
+            updateReportStatus();
+            return false;
+        }
+
+        /* First server-authoritative claim. */
+        let claimResult = await claimOnce();
+
+        if (claimResult.ok) {
+            return true;
+        }
+
+        /*
+           One controlled retry after a fresh subscription/session read.
+           This handles timing races immediately after a trial row is created
+           or after the subscription state changes. It cannot over-charge:
+           the RPC itself decides whether the requested amount is claimable.
+        */
+        await new Promise(function (resolve) {
+            setTimeout(resolve, 350);
+        });
+
+        await refreshAllowanceState();
+        claimResult = await claimOnce();
+
+        if (claimResult.ok) {
+            return true;
+        }
+
+        console.error(
+            "Final report allowance claim failure:",
+            claimResult.error || claimResult.result || claimResult
+        );
+
+        return false;
+
+    } catch (error) {
+        console.error(
+            "Report allowance error:",
+            error
+        );
+        return false;
+    }
+}
+
+
+/* =========================================================
+   ONLINE RESULT PUBLISHING
+
+   These functions work with the Publish Results section added to
+   Index.html and the public result-checker.html page.
+
+   Publishing is deliberately separate from report-generation allowance:
+   generating a report consumes the normal report allowance, while
+   publishing stores a copy of the already-loaded result online and lets
+   the server generate/control the result PIN. If a student's report was
+   already generated (and therefore already charged), publishing that
+   same result is free — the server checks this via report_generation_log
+   before deciding whether to claim an allowance.
+   ========================================================= */
+
+function setPublishStatus(message, isError) {
+
+    if (!publishResultsStatus) {
+        return;
+    }
+
+    publishResultsStatus.textContent =
+        message || "";
+
+    publishResultsStatus.style.color =
+        isError ? "#b00020" : "#0b6b62";
+
+}
+
+
+function loadPublishStudents() {
+
+    if (!publishStudentSelect) {
+        return;
+    }
+
+    publishStudentSelect.innerHTML =
+        '<option value="">-- Select Student --</option>';
+
+    students.forEach(function (student, index) {
+
+        const option =
+            document.createElement("option");
+
+        option.value = String(index);
+
+        option.textContent =
+            (student["Admission No"] || "") +
+            " - " +
+            (student["Student Name"] || "");
+
+        publishStudentSelect.appendChild(option);
+
+    });
+
+}
+
+
+/* Extra report-sheet details (house, photo, totals, grade key, behaviour
+   ratings, fees) so the online sheet matches the generated report. */
+function buildPublishExtra(student, subjects, overallTotal, average, behavior) {
+
+    const firstCAMax = Number(reportSettings.firstCAMaximum) || 20;
+    const secondCAMax = Number(reportSettings.secondCAMaximum) || 20;
+    const examsMax = Number(reportSettings.examsMaximum) || 60;
+
+    const domains = (behavioralDomains || []).map(function (domain) {
+        return {
+            name: domain.name,
+            traits: domain.traits.map(function (trait) {
+                return {
+                    name: trait,
+                    rating: behavior[trait] !== undefined ? String(behavior[trait]) : ""
+                };
+            })
+        };
+    });
+
+    /* Fees & next term, same rules as feesNoticeHtml. */
+    const fees = reportSettings.nextTermFees || {};
+    const classKey = normalizeClassKey(student["Class"]);
+    let nextFee = null;
+
+    Object.keys(fees).forEach(function (name) {
+        if (normalizeClassKey(name) === classKey && Number(fees[name]) > 0) {
+            nextFee = Number(fees[name]);
+        }
+    });
+
+    let balanceInfo = null;
+    try {
+        const cached = feeBalanceCache.get(
+            feeCacheKey(
+                student["Session"],
+                student["Term"],
+                computeMatchKey(student["Admission No"], student["Student Name"])
+            )
+        );
+        if (cached && showFeeBalanceOnReports()) balanceInfo = cached;
+    } catch (e) { /* fees are optional */ }
+
+    const outstanding =
+        balanceInfo && Number(balanceInfo.balance) > 0
+            ? Number(balanceInfo.balance)
+            : 0;
+
+    let photo = "";
+    try {
+        photo = getStudentPhoto(student) || "";
+    } catch (e) { photo = ""; }
+
+    /* Each subject's extra-assessment marks, keyed by subject name. Sent in
+       p_extra as well as on the subject rows, so the online result checker
+       can show the extra columns even if the server only keeps the basic
+       subject fields. */
+    const subjectExtras = {};
+    (subjects || []).forEach(function (subject) {
+        if (subject && subject.subject_name && subject.extras &&
+            Object.keys(subject.extras).length > 0) {
+            subjectExtras[subject.subject_name] = subject.extras;
+        }
+    });
+
+    return {
+        house: student["House"] || "",
+        student_photo: photo,
+        subject_extras: subjectExtras,
+        overall_total: Number(overallTotal.toFixed(2)),
+        overall_grade: getGrade(average),
+        marks: {
+            ca1_max: firstCAMax,
+            ca2_max: secondCAMax,
+            exam_max: examsMax,
+            extras: getExtraAssessments(),
+            total_max: getTotalMaximumMarks()
+        },
+        grade_key: getGradeKeyRows(),
+        behaviour: domains,
+        fees: {
+            outstanding_balance: outstanding,
+            fully_paid: !!balanceInfo && outstanding === 0,
+            has_balance_record: !!balanceInfo,
+            next_term_begins: reportSettings.nextTermResumption || "",
+            next_term_fee: nextFee,
+            total_at_resumption:
+                outstanding > 0 && nextFee !== null ? outstanding + nextFee : null
+        }
+    };
+}
+
+function getPublishResultData(student) {
+
+    const subjects = [];
+    let overallTotal = 0;
+
+    let subjectsToUse = schoolSubjects;
+
+    const detectedSubjects =
+        detectSubjectsFromRows([student]);
+
+    if (detectedSubjects.length > 0) {
+        subjectsToUse = detectedSubjects;
+    }
+
+    function isFilledIn(value) {
+        return (
+            value !== undefined &&
+            value !== null &&
+            String(value).trim() !== ""
+        );
+    }
+
+    subjectsToUse.forEach(function (subjectName) {
+
+        const firstCAKey =
+            subjectName + " 1st CA";
+
+        const secondCAKey =
+            subjectName + " 2nd CA";
+
+        const examsKey =
+            subjectName + " Exams";
+
+        const hasSubject = studentOffersSubject(student, subjectName);
+
+        if (!hasSubject) {
+            return;
+        }
+
+        const extraMarks = {};
+        let extrasTotal = 0;
+
+        getExtraAssessments().forEach(function (item) {
+            const mark = Number(student[subjectName + " " + item.name]) || 0;
+            extraMarks[item.name] = mark;
+            extrasTotal += mark;
+        });
+
+        const firstCA =
+            Number(student[firstCAKey]) || 0;
+
+        const secondCA =
+            Number(student[secondCAKey]) || 0;
+
+        const exams =
+            Number(student[examsKey]) || 0;
+
+        const total =
+            firstCA + secondCA + exams + extrasTotal;
+
+        /* Same class statistics the printed report uses. */
+        const subjectStats =
+            getSubjectClassStatistics(student, subjectName);
+
+        const subjectGrade = getGrade(total);
+
+        subjects.push({
+            subject_name: subjectName,
+            ca1: firstCA,
+            ca2: secondCA,
+            exam: exams,
+            extras: extraMarks,
+            total: total,
+            grade: subjectGrade,
+            remark: getGradeRemark(subjectGrade),
+            subject_average:
+                subjectStats.average === null
+                    ? ""
+                    : Number(subjectStats.average.toFixed(2)),
+            subject_position:
+                subjectStats.position === null
+                    ? ""
+                    : subjectStats.position
+        });
+
+        overallTotal += total;
+
+    });
+
+    const average =
+        subjects.length > 0
+            ? overallTotal / subjects.length
+            : 0;
+
+    const positionValue =
+        student["Position"];
+
+    const position =
+        String(positionValue ?? "").trim() !== ""
+            ? (isNaN(Number(positionValue))
+                ? positionValue
+                : Number(positionValue))
+            : "";
+
+    const classSize =
+        students.filter(
+            function (s) {
+                return String(
+                    s["Student Name"] || ""
+                ).trim() !== "";
+            }
+        ).length;
+
+    const behavior =
+        withStoredAttendance(student, student.__behavior || {});
+
+    return {
+
+        school: {
+            name: reportSettings.schoolName || "",
+            address: reportSettings.schoolAddress || "",
+            logo_url: reportSettings.schoolLogo || ""
+        },
+
+        student: {
+            name: cleanStudentName(
+                student["Student Name"] || ""
+            ),
+            admission_no:
+                student["Admission No"] || "",
+            gender:
+                student["Gender"] || "",
+            class_name:
+                student["Class"] || ""
+        },
+
+        result: {
+            session:
+                student["Session"] || "",
+            term:
+                student["Term"] || "",
+            average: Number(average.toFixed(2)),
+            position: position,
+            class_size: classSize,
+            attendance:
+                behavior["Attendance"] || "",
+            teacher_comment:
+                behavior["Class Teacher's Comment"] || "",
+            principal_comment:
+                behavior["Principal's Comment"] || ""
+        },
+
+        subjects: subjects,
+
+        /* Everything else the printed report shows. */
+        extra: buildPublishExtra(
+            student, subjects, overallTotal, average, behavior
+        )
+
+    };
+
+}
+
+
+function extractPublishResponse(data) {
+
+    let response = data;
+
+    if (Array.isArray(response)) {
+        response = response[0] || {};
+    }
+
+    if (response && response.data && typeof response.data === "object") {
+        response = response.data;
+    }
+
+    return response || {};
+
+}
+
+
+function extractPublishedPin(data) {
+
+    const response = extractPublishResponse(data);
+
+    return String(
+        response.pin ||
+        response.result_pin ||
+        response.generated_pin ||
+        response.access_pin ||
+        ""
+    ).trim();
+
+}
+
+
+function showPublishedResultInfo(items) {
+
+    if (!publishedResultInfo) {
+        return;
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+        publishedResultInfo.style.display = "none";
+        publishedResultInfo.innerHTML = "";
+        return;
+    }
+
+    let html =
+        "<strong>Published Result PIN(s)</strong>" +
+        "<div style=\"margin-top:10px;\">";
+
+    items.forEach(function (item) {
+
+        html +=
+            "<div style=\"padding:8px 0; border-bottom:1px solid #ddd;\">" +
+            "<strong>" +
+            escapeHTML(item.studentName) +
+            "</strong> — PIN: <strong>" +
+            escapeHTML(item.pin || "Not returned") +
+            "</strong>" +
+            "</div>";
+
+    });
+
+    html += "</div>";
+
+    publishedResultInfo.innerHTML = html;
+    publishedResultInfo.style.display = "block";
+
+}
+
+
+async function publishOneStudentResult(student) {
+
+    if (student) await preloadAttendanceForStudents([student]);
+
+    if (!student) {
+        return {
+            ok: false,
+            message: "Student record was not found."
+        };
+    }
+
+    const studentName =
+        cleanStudentName(
+            student["Student Name"] || ""
+        );
+
+    const session =
+        String(student["Session"] || "").trim();
+
+    const term =
+        String(student["Term"] || "").trim();
+
+    if (!studentName) {
+        return {
+            ok: false,
+            message: "The selected student has no name."
+        };
+    }
+
+    if (!session) {
+        return {
+            ok: false,
+            message:
+                "The selected student has no session."
+        };
+    }
+
+    if (!term) {
+        return {
+            ok: false,
+            message:
+                "The selected student has no term."
+        };
+    }
+
+    /*
+       The report allowance claim happens inside the
+       publish_student_result SQL function itself (it calls
+       claim_report_allowance server-side, after checking
+       report_generation_log), so it cannot be bypassed by calling
+       the RPC directly. Do NOT add a client-side claim here.
+    */
+
+    const resultData =
+        getPublishResultData(student);
+
+    try {
+
+        const publishParams = {
+            p_website_id: WEBSITE_ID,
+            p_school_name: resultData.school.name || null,
+            p_school_address: resultData.school.address || null,
+            p_school_logo_url: resultData.school.logo_url || null,
+            p_admission_no:
+                String(resultData.student.admission_no || "").trim(),
+            p_student_name: studentName,
+            p_gender: resultData.student.gender || null,
+            p_class_name: resultData.student.class_name || null,
+            p_session: session,
+            p_term: term,
+            p_average: Number(resultData.result.average) || 0,
+            p_position:
+                String(resultData.result.position ?? "").trim() === ""
+                    ? null
+                    : (isNaN(Number(resultData.result.position))
+                        ? null
+                        : Number(resultData.result.position)),
+            p_class_size:
+                Number(resultData.result.class_size) || null,
+            p_attendance: resultData.result.attendance || null,
+            p_teacher_comment: resultData.result.teacher_comment || null,
+            p_principal_comment: resultData.result.principal_comment || null,
+            p_subjects: (resultData.subjects || []).map(function (subject) {
+                return {
+                    subject_name: subject.subject_name || "",
+                    ca1: subject.ca1 ?? "",
+                    ca2: subject.ca2 ?? "",
+                    exam: subject.exam ?? "",
+                    extras: subject.extras || {},
+                    total: subject.total ?? "",
+                    grade: subject.grade || "",
+                    remark: subject.remark || "",
+                    subject_average: subject.subject_average ?? "",
+                    subject_position: subject.subject_position ?? ""
+                };
+            })
+        };
+
+        /* Full report-sheet details. Needs the p_extra parameter added by
+           the SQL migration; if the server does not have it yet, fall
+           back to the original call so publishing never breaks. */
+        let usedFallbackWithoutExtras = false;
+        let { data, error } =
+            await supabaseClient.rpc(
+                "publish_student_result",
+                Object.assign({}, publishParams, { p_extra: resultData.extra })
+            );
+
+        if (
+            error &&
+            (error.code === "PGRST202" ||
+             /p_extra|could not find the function/i.test(error.message || ""))
+        ) {
+            console.warn("Server has no p_extra yet; publishing without extras.");
+            usedFallbackWithoutExtras = true;
+            ({ data, error } =
+                await supabaseClient.rpc("publish_student_result", publishParams));
+        }
+
+        if (error) {
+            console.error(
+                "Publish result RPC error:",
+                error
+            );
+
+            return {
+                ok: false,
+                message:
+                    error.message ||
+                    "The server could not publish this result."
+            };
+        }
+
+        const response =
+            extractPublishResponse(data);
+
+        const success =
+            response.success === true ||
+            String(response.success).toLowerCase() === "true";
+
+        if (!success) {
+            return {
+                ok: false,
+                message:
+                    response.message ||
+                    response.error ||
+                    "The result was not published."
+            };
+        }
+
+        /*
+           The RPC may have claimed one report allowance server-side.
+           Refresh the local counters so the on-screen "reports
+           remaining" display stays accurate without waiting for a
+           page reload.
+        */
+        await refreshReportsGeneratedFromServer();
+
+        return {
+            ok: true,
+            pin: extractPublishedPin(data),
+            maxUses:
+                Number(response.max_uses) || 5,
+            usesRemaining:
+                Number.isFinite(Number(response.uses_remaining))
+                    ? Number(response.uses_remaining)
+                    : 5,
+            studentName: studentName,
+            message:
+                (response.message ||
+                "Result published successfully.") +
+                (usedFallbackWithoutExtras
+                    ? " WARNING: the full report-sheet details were NOT saved because the database migration has not been applied. Run migration_full_report_online.sql in Supabase, then publish again."
+                    : "")
+        };
+
+    } catch (error) {
+
+        console.error(
+            "Unexpected publish error:",
+            error
+        );
+
+        return {
+            ok: false,
+            message:
+                "An unexpected error occurred while publishing the result."
+        };
+
+    }
+
+}
+
+
+async function verifyActiveSubscriptionForPublishing() {
+
+    try {
+
+        const sessionResult =
+            await supabaseClient.auth.getSession();
+
+        if (
+            sessionResult.error ||
+            !sessionResult.data ||
+            !sessionResult.data.session ||
+            !sessionResult.data.session.user
+        ) {
+            return {
+                valid: false,
+                reason:
+                    "Your session could not be confirmed. Please log in again."
+            };
+        }
+
+        const user = sessionResult.data.session.user;
+        if (!staffContext) {
+            currentUserId = user.id;
+        }
+
+        const subscriptionResult =
+            await supabaseClient
+                .from("subscriptions")
+                .select("*")
+                .eq("user_id", currentUserId)
+                .eq("website_id", WEBSITE_ID)
+                .order("created_at", {
+                    ascending: false
+                })
+                .limit(1)
+                .maybeSingle();
+
+        if (subscriptionResult.error) {
+            console.error(
+                "Subscription check failed while verifying publish access:",
+                subscriptionResult.error
+            );
+
+            return {
+                valid: false,
+                reason:
+                    "Could not confirm your subscription status. Please try again."
+            };
+        }
+
+        if (!subscriptionResult.data) {
+            return {
+                valid: false,
+                reason:
+                    "No subscription was found on your account. Please subscribe to publish results."
+            };
+        }
+
+        const subscription = subscriptionResult.data;
+
+        /* Keep the shared subscription state synchronized with this fresh read. */
+        currentSubscription = subscription;
+
+        const plan = String(
+            subscription.plan ||
+            subscription.subscription_plan ||
+            subscription.package ||
+            ""
+        ).trim().toLowerCase();
+
+        currentSubscriptionPlan = plan;
+
+        const status = String(
+            subscription.status ||
+            ""
+        ).trim().toLowerCase();
+
+        const expiry = new Date(
+            subscription.expires_at || ""
+        );
+
+        const notExpired =
+            Number.isFinite(expiry.getTime()) &&
+            expiry > new Date();
+
+        const validPaidStatuses = [
+            "paid",
+            "active",
+            "success",
+            "successful",
+            "completed"
+        ];
+
+        const statusIsValid =
+            validPaidStatuses.includes(status) ||
+            (plan === FREE_TRIAL_PLAN && status === FREE_TRIAL_STATUS);
+
+        if (!statusIsValid || !notExpired) {
+            return {
+                valid: false,
+                reason:
+                    "Your subscription is not active. Please subscribe or renew to publish results."
+            };
+        }
+
+        return {
+            valid: true,
+            subscription: subscription
+        };
+
+    } catch (error) {
+
+        console.error(
+            "Unexpected error while verifying publish access:",
+            error
+        );
+
+        return {
+            valid: false,
+            reason:
+                "Could not confirm your subscription status. Please try again."
+        };
+
+    }
+
+}
+
+
+function promptSubscriptionRequiredForPublishing(reason) {
+
+    const message =
+        reason ||
+        "An active subscription is required to publish results.";
+
+    setPublishStatus(
+        "❌ " + message,
+        true
+    );
+
+    const shouldGoToPlans =
+        confirm(
+            message +
+            "\n\nGo to subscription plans now?"
+        );
+
+    if (!shouldGoToPlans) {
+        return;
+    }
+
+    /*
+       Deliberately does NOT hide appSection here: the rest of the app
+       (including the renew/upgrade button) must stay visible and
+       usable. This only reveals the subscription plans and scrolls
+       to them.
+    */
+    if (elementExists(subscriptionPlans)) {
+
+        subscriptionPlans.style.display = "block";
+
+        subscriptionPlans.scrollIntoView({
+            behavior: "smooth",
+            block: "start"
+        });
+
+    }
+
+}
+
+
+async function publishSelectedResult() {
+
+    if (!publishStudentSelect) {
+        return;
+    }
+
+    const accessCheck =
+        await verifyActiveSubscriptionForPublishing();
+
+    if (!accessCheck.valid) {
+        promptSubscriptionRequiredForPublishing(
+            accessCheck.reason
+        );
+        return;
+    }
+
+    const index =
+        publishStudentSelect.value;
+
+    if (index === "") {
+        setPublishStatus(
+            "Please select a student to publish.",
+            true
+        );
+        return;
+    }
+
+    const student =
+        students[Number(index)];
+
+    if (!student) {
+        setPublishStatus(
+            "The selected student could not be found.",
+            true
+        );
+        return;
+    }
+
+    if (publishSingleResultButton) {
+        publishSingleResultButton.disabled = true;
+    }
+
+    setPublishStatus(
+        "Publishing result...",
+        false
+    );
+
+    showPublishedResultInfo([]);
+
+    const result =
+        await publishOneStudentResult(student);
+
+    if (publishSingleResultButton) {
+        publishSingleResultButton.disabled = false;
+    }
+
+    if (!result.ok) {
+        setPublishStatus(
+            "❌ " + result.message,
+            true
+        );
+        return;
+    }
+
+    setPublishStatus(
+        "✅ Result published successfully for " +
+        result.studentName +
+        ". PIN uses allowed: " +
+        result.maxUses +
+        ".",
+        false
+    );
+
+    showPublishedResultInfo([
+        result
+    ]);
+
+}
+
+
+async function publishAllResults() {
+
+    const accessCheck =
+        await verifyActiveSubscriptionForPublishing();
+
+    if (!accessCheck.valid) {
+        promptSubscriptionRequiredForPublishing(
+            accessCheck.reason
+        );
+        return;
+    }
+
+    if (!students || students.length === 0) {
+        setPublishStatus(
+            "Please upload an Excel file containing student records first.",
+            true
+        );
+        return;
+    }
+
+    /*
+       Friendly pre-check only: publishing consumes the same report
+       allowance as report generation, one unit per student not already
+       generated. This just warns up front if there obviously isn't
+       enough left; the actual per-student decision (inside the SQL
+       function) remains authoritative.
+    */
+    if (!canGenerateReports(students.length)) {
+        return;
+    }
+
+    const confirmation =
+        confirm(
+            "Publish results for " +
+            students.length +
+            " student(s) online?\n\n" +
+            "Publishing a result that was NOT already generated will use " +
+            "one report from your subscription's report allowance. Results " +
+            "already generated on this website publish for free.\n\n" +
+            "Each student will receive a separate result PIN."
+        );
+
+    if (!confirmation) {
+        return;
+    }
+
+    if (publishAllResultsButton) {
+        publishAllResultsButton.disabled = true;
+    }
+
+    if (publishSingleResultButton) {
+        publishSingleResultButton.disabled = true;
+    }
+
+    setPublishStatus(
+        "Publishing results... 0 / " + students.length,
+        false
+    );
+
+    showPublishedResultInfo([]);
+
+    const successful = [];
+    const failed = [];
+
+    for (let i = 0; i < students.length; i++) {
+
+        const student = students[i];
+
+        const studentName =
+            cleanStudentName(
+                student["Student Name"] || ""
+            );
+
+        try {
+
+            const result =
+                await publishOneStudentResult(student);
+
+            if (result && result.ok) {
+
+                successful.push(result);
+
+            } else {
+
+                failed.push({
+                    studentName: studentName || "(Unnamed student)",
+                    message:
+                        result && result.message
+                            ? result.message
+                            : "Unknown publishing error."
+                });
+            }
+
+        } catch (error) {
+
+            failed.push({
+                studentName: studentName || "(Unnamed student)",
+                message:
+                    error && error.message
+                        ? error.message
+                        : String(error)
+            });
+        }
+
+        setPublishStatus(
+            "Publishing results... " +
+            (i + 1) +
+            " / " +
+            students.length,
+            false
+        );
+    }
+
+    if (publishAllResultsButton) {
+        publishAllResultsButton.disabled = false;
+    }
+
+    if (publishSingleResultButton) {
+        publishSingleResultButton.disabled = false;
+    }
+
+    showPublishedResultInfo(successful);
+
+    let status =
+        "✅ Published " +
+        successful.length +
+        " of " +
+        students.length +
+        " result(s).";
+
+    if (successful.length > 0) {
+        status +=
+            " Each generated PIN allows up to 5 result checks.";
+    }
+
+    if (failed.length > 0) {
+        status +=
+            " " +
+            failed.length +
+            " result(s) failed to publish.";
+
+        console.error(
+            "===== RESULT PUBLISHING ERRORS ====="
+        );
+
+        console.error(failed);
+
+        /*
+         * Display the first few actual errors in the page.
+         */
+        const errorText =
+            failed
+                .slice(0, 10)
+                .map(function (item, index) {
+                    return (
+                        (index + 1) +
+                        ". " +
+                        item.studentName +
+                        " — " +
+                        item.message
+                    );
+                })
+                .join("\n");
+
+        alert(
+            "Some results failed to publish.\n\n" +
+            "Here are the errors:\n\n" +
+            errorText +
+            (
+                failed.length > 10
+                    ? "\n\n...and " +
+                      (failed.length - 10) +
+                      " more."
+                    : ""
+            )
+        );
+    }
+
+    setPublishStatus(
+        status,
+        failed.length > 0 && successful.length === 0
+    );
+}
+
+
+/* =========================================================
+   GENERATE SINGLE REPORT
+   ========================================================= */
+
+async function generateSingleReport() {
+
+    await preloadAttendanceForStudents(students);
+    await preloadFeeBalancesForStudents(students);
+
+    if (!elementExists(studentSelect)) return;
+
+    const index = studentSelect.value;
+
+    if (index === "") {
+        alert("Please select a student.");
+        return;
+    }
+
+    const student = students[Number(index)];
+    if (!student) return;
+
+    const fingerprint = getReportGenerationFingerprint(student);
+    const alreadyGenerated = hasReportBeenGenerated(fingerprint);
+
+    /* Only a genuinely new version of this report consumes allowance. */
+    if (!alreadyGenerated && !canGenerateReports(1)) return;
+
+    /*
+       IMPORTANT:
+       For a brand-new report, the SERVER must confirm the allowance
+       BEFORE anything is rendered — mirrors Generate All, so a report
+       is never shown to the user unless the server actually authorized it.
+    */
+    if (!alreadyGenerated) {
+
+        const countUpdated = await incrementReportCount(1);
+
+        if (!countUpdated) {
+            alert(
+                "❌ The server did not approve this report.\n\n" +
+                "No report was generated. Please refresh the page and check your subscription before trying again."
+            );
+            updateReportStatus();
+            return;
+        }
+
+        markReportsAsGenerated([fingerprint]);
+        await logReportGenerated(student);
+    }
+
+    const report = createReport(student);
+
+    if (reportContainer) {
+        reportContainer.innerHTML = report;
+        saveGeneratedReports();
+        reportContainer.scrollIntoView({ behavior: "smooth" });
+    }
+
+    updateReportStatus();
+
+    if (alreadyGenerated) {
+
+        alert(
+            "✅ Report displayed successfully.\n\n" +
+            "This report was already generated on this website, so no allowance was used."
+        );
+
+    } else {
+
+        const totalAvailable = getReportLimit() + getCarriedOverReports();
+
+        alert(
+            "✅ Report generated successfully.\n\n" +
+            "Reports generated: " + reportsGenerated + " / " + totalAvailable
+        );
+    }
+}
+
+
+/* =========================================================
+   GENERATE ALL REPORTS
+   ========================================================= */
+
+async function generateAllReports() {
+
+    await preloadAttendanceForStudents(students);
+    await preloadFeeBalancesForStudents(students);
+
+    if (!students || students.length === 0) {
+        alert("❌ Please upload an Excel file containing student records first.");
+        return;
+    }
+
+    const limit = getReportLimit();
+    if (!limit) {
+        alert("❌ Your subscription plan could not be determined.");
+        return;
+    }
+
+    const carriedOver = getCarriedOverReports();
+    const totalAvailable = limit + carriedOver;
+    const remaining = Math.max(totalAvailable - reportsGenerated, 0);
+
+    /*
+       Generate All is independent of Generate Student.
+       A report already successfully charged on this website is not charged again.
+       New reports must be successfully claimed by the SERVER before they are rendered.
+    */
+    const reportItems = students.map(function (student) {
+        const fingerprint = getReportGenerationFingerprint(student);
+        return {
+            student: student,
+            fingerprint: fingerprint,
+            alreadyGenerated: hasReportBeenGenerated(fingerprint)
+        };
+    });
+
+    const newItems = reportItems.filter(function (item) {
+        return !item.alreadyGenerated;
+    });
+
+    /* Nothing new needs to consume allowance. */
+    if (newItems.length === 0) {
+        if (reportContainer) reportContainer.innerHTML = "";
+
+        let renderedCount = 0;
+
+        for (let i = 0; i < reportItems.length; i++) {
+            const report = createReport(reportItems[i].student);
+            if (reportContainer) {
+                reportContainer.insertAdjacentHTML("beforeend", report);
+            }
+            renderedCount++;
+
+            if (renderedCount % 10 === 0) {
+                updateTemporaryGenerationMessage(renderedCount, students.length);
+                await new Promise(function (resolve) {
+                    setTimeout(resolve, 0);
+                });
+            }
+        }
+
+        const generationProgress = document.getElementById("generationProgress");
+        if (generationProgress) generationProgress.remove();
+
+        if (reportContainer) saveGeneratedReports();
+        updateReportStatus();
+
+        alert(
+            "✅ Reports displayed successfully.\n\n" +
+            "Reports displayed: " + renderedCount + "\n" +
+            "New reports charged: 0\n" +
+            "These reports were already generated on this website."
+        );
+        return;
+    }
+
+    if (remaining <= 0) {
+        alert(
+            "⚠️ REPORT GENERATION LIMIT REACHED\n\n" +
+            "Subscription: " + getPlanDisplayName() + "\n" +
+            "Reports generated: " + reportsGenerated + " / " + totalAvailable +
+            "\n\nPlease renew or upgrade your subscription to generate more reports."
+        );
+        updateReportStatus();
+        return;
+    }
+
+    const chargeCount = Math.min(newItems.length, remaining);
+    const blockedNewItems = newItems.length > chargeCount;
+
+    const confirmation = confirm(
+        "Generate reports for " + students.length + " student(s)?\n\n" +
+        "Subscription: " + getPlanDisplayName() + "\n" +
+        "Current reports generated: " + reportsGenerated + " / " + formatReportCount(totalAvailable) + "\n" +
+        "Carried-over reports: " + carriedOver + "\n" +
+        "Reports remaining: " + formatReportCount(remaining) + "\n" +
+        "New reports to charge: " + chargeCount +
+        "\n\nAlready-generated reports will not consume allowance again." +
+        (blockedNewItems
+            ? "\n\n⚠️ Only " + chargeCount + " new report(s) can be generated with the remaining allowance."
+            : "")
+    );
+
+    if (!confirmation) return;
+
+    /*
+       IMPORTANT:
+       Claim the complete batch from the SERVER BEFORE creating any new reports.
+       This goes through claim_report_allowance with this website's WEBSITE_ID.
+       There is NO artificial limit based on the number of students.
+       4, 25, 100, 300, etc. are handled according to the actual allowance.
+    */
+    const itemsToCharge = newItems.slice(0, chargeCount);
+    const fingerprintsToCharge = itemsToCharge.map(function (item) {
+        return item.fingerprint;
+    });
+
+    const countUpdated = await incrementReportCount(chargeCount);
+
+    if (!countUpdated) {
+        alert(
+            "❌ The server did not approve the requested allowance.\n\n" +
+            "No new reports were generated. Your report allowance was not locally marked as used.\n\n" +
+            "Please refresh the page and check your subscription before trying again."
+        );
+        updateReportStatus();
+        return;
+    }
+
+    /*
+       The server has now confirmed the FULL requested amount.
+       Only after that confirmation do we mark the reports as charged.
+    */
+    markReportsAsGenerated(fingerprintsToCharge);
+    saveGeneratedReports();
+
+    for (let i = 0; i < itemsToCharge.length; i++) {
+        await logReportGenerated(
+            itemsToCharge[i].student
+        );
+    }
+
+    if (reportContainer) reportContainer.innerHTML = "";
+
+    const allowedNewFingerprints = new Set(fingerprintsToCharge);
+    let renderedCount = 0;
+
+    for (let i = 0; i < reportItems.length; i++) {
+        const item = reportItems[i];
+
+        /*
+           Already-generated reports can always be displayed.
+           Newly generated reports are displayed only if their allowance
+           was successfully claimed above.
+        */
+        if (!item.alreadyGenerated && !allowedNewFingerprints.has(item.fingerprint)) {
+            continue;
+        }
+
+        const report = createReport(item.student);
+        if (reportContainer) {
+            reportContainer.insertAdjacentHTML("beforeend", report);
+        }
+
+        renderedCount++;
+
+        if (renderedCount % 10 === 0) {
+            updateTemporaryGenerationMessage(renderedCount, students.length);
+            await new Promise(function (resolve) {
+                setTimeout(resolve, 0);
+            });
+        }
+    }
+
+    const generationProgress = document.getElementById("generationProgress");
+    if (generationProgress) generationProgress.remove();
+
+    if (reportContainer) saveGeneratedReports();
+    updateReportStatus();
+
+    if (blockedNewItems) {
+        alert(
+            "⚠️ Generation stopped at your available report limit.\n\n" +
+            "Reports displayed: " + renderedCount + "\n" +
+            "New reports charged by server: " + chargeCount + "\n" +
+            "Reports generated: " + reportsGenerated + " / " + totalAvailable +
+            "\n\nRenew or upgrade to generate the remaining reports."
+        );
+    } else {
+        alert(
+            "✅ Reports generated successfully.\n\n" +
+            "Reports displayed: " + renderedCount + "\n" +
+            "New reports charged by server: " + chargeCount + "\n" +
+            "Total reports generated: " + reportsGenerated + " / " + totalAvailable
+        );
+    }
+}
+
+function updateTemporaryGenerationMessage(generated, total) {
+
+    let progress = document.getElementById("generationProgress");
+
+    if (!progress) {
+        progress = document.createElement("div");
+        progress.id = "generationProgress";
+        progress.style.position = "fixed";
+        progress.style.top = "20px";
+        progress.style.left = "50%";
+        progress.style.transform = "translateX(-50%)";
+        progress.style.zIndex = "99999";
+        progress.style.padding = "12px 18px";
+        progress.style.borderRadius = "8px";
+        progress.style.background = "#1f2937";
+        progress.style.color = "#fff";
+        progress.style.fontSize = "14px";
+        progress.style.fontWeight = "600";
+        progress.style.boxShadow = "0 4px 12px rgba(0,0,0,0.25)";
+        progress.style.textAlign = "center";
+        document.body.appendChild(progress);
+    }
+
+    progress.textContent =
+        "⏳ Generating reports: " + generated + " / " + total;
+}
+
+
+/* =========================================================
+   CREATE REPORT
+   ========================================================= */
+
+/* Total (1st CA + 2nd CA + Exams) a student scored in one subject,
+   or null when the student does not offer the subject. */
+function getStudentSubjectTotal(student, subjectName) {
+
+    const parts = studentSubjectParts(student, subjectName);
+
+    const offered = parts.some(function (value) {
+        return String(value ?? "").trim() !== "";
+    });
+
+    if (!offered) return null;
+
+    return parts.reduce(function (sum, value) {
+        return sum + (Number(value) || 0);
+    }, 0);
+
+}
+
+/* Class average and the student's position in one subject, worked out
+   against classmates (same Class) who offer that subject. Equal totals
+   share a position (1, 2, 2, 4). */
+function getSubjectClassStatistics(student, subjectName) {
+
+    const mine = getStudentSubjectTotal(student, subjectName);
+
+    if (mine === null) return { average: null, position: null };
+
+    const classKey = normalizeClassKey(student["Class"]);
+
+    let sum = 0;
+    let count = 0;
+    let ahead = 0;
+    let foundSelf = false;
+
+    (students || []).forEach(function (other) {
+
+        if (other === student) foundSelf = true;
+
+        if (normalizeClassKey(other["Class"]) !== classKey) return;
+
+        const total = getStudentSubjectTotal(other, subjectName);
+
+        if (total === null) return;
+
+        sum += total;
+        count++;
+
+        if (total > mine) ahead++;
+
+    });
+
+    /* A student not in the uploaded list (e.g. the outlook preview sample). */
+    if (!foundSelf) {
+        sum += mine;
+        count++;
+    }
+
+    return {
+        average: count > 0 ? sum / count : null,
+        position: ahead + 1
+    };
+
+}
+
+function createReport(student) {
+
+    const subjects = [];
+    let overallTotal = 0;
+
+    let subjectsToUse = schoolSubjects;
+
+    const detectedSubjects = detectSubjectsFromRows([student]);
+
+    if (detectedSubjects.length > 0) {
+        subjectsToUse = detectedSubjects;
+    }
+
+    /* =====================================================
+       SUBJECT RESULTS
+       ===================================================== */
+
+    subjectsToUse.forEach(function (subjectName) {
+
+        const firstCAKey = subjectName + " 1st CA";
+        const secondCAKey = subjectName + " 2nd CA";
+        const examsKey = subjectName + " Exams";
+
+        const firstCA = Number(student[firstCAKey]) || 0;
+        const secondCA = Number(student[secondCAKey]) || 0;
+        const exams = Number(student[examsKey]) || 0;
+        const extraValues = getExtraAssessments().map(function (item) {
+            return Number(student[subjectName + " " + item.name]) || 0;
+        });
+        const total = firstCA + secondCA + exams +
+            extraValues.reduce(function (sum, value) { return sum + value; }, 0);
+
+        const hasSubject = studentOffersSubject(student, subjectName);
+
+        if (hasSubject) {
+            subjects.push({
+                name: subjectName,
+                firstCA: firstCA,
+                secondCA: secondCA,
+                exams: exams,
+                extras: extraValues,
+                total: total
+            });
+
+            overallTotal += total;
+        }
+    });
+
+    /* =====================================================
+       AVERAGE / GRADE
+       ===================================================== */
+
+    const numberOfSubjects = subjects.length;
+
+    const average = numberOfSubjects > 0
+        ? overallTotal / numberOfSubjects
+        : 0;
+
+    const grade = getGrade(average);
+
+    /* =====================================================
+       POSITION
+       ===================================================== */
+
+    const positionValue = student["Position"];
+
+    const hasPosition = String(positionValue ?? "").trim() !== "";
+
+    let position = null;
+
+    if (hasPosition) {
+        const numericPosition = Number(positionValue);
+
+        if (!isNaN(numericPosition)) {
+            position = numericPosition;
+        }
+    }
+
+    /* =====================================================
+       CLASS SIZE
+       ===================================================== */
+
+    const classSize = students.filter(function (record) {
+        return String(record["Student Name"] || "").trim() !== "";
+    }).length;
+
+    /* =====================================================
+       SUBJECT ROWS
+       ===================================================== */
+
+    let subjectRows = "";
+
+    subjects.forEach(function (subject, index) {
+
+        const subjectGrade = getGrade(subject.total);
+        const subjectStats = getSubjectClassStatistics(student, subject.name);
+
+        subjectRows += `
+            <tr>
+                <td class="serial-cell">${index + 1}</td>
+                <td class="subject-name">${escapeHTML(subject.name)}</td>
+                <td>${formatScore(subject.firstCA)}</td>
+                <td>${formatScore(subject.secondCA)}</td>
+                <td>${formatScore(subject.exams)}</td>
+                ${subject.extras.map(function (value) { return "<td>" + formatScore(value) + "</td>"; }).join("")}
+                <td class="total-cell">${formatScore(subject.total)}</td>
+                <td class="subject-average-cell">${subjectStats.average === null ? "—" : formatScore(subjectStats.average)}</td>
+                <td class="subject-position-cell">${subjectStats.position === null ? "—" : formatPosition(subjectStats.position)}</td>
+                <td class="grade-cell grade-${subjectGrade}">${subjectGrade}</td>
+                <td class="remark-cell grade-${subjectGrade}">${escapeHTML(getGradeRemark(subjectGrade))}</td>
+            </tr>
+        `;
+    });
+
+    /* =====================================================
+       BEHAVIORAL DATA
+       ===================================================== */
+
+    const behavior = withStoredAttendance(student, student.__behavior || {});
+
+    /* One small table per domain (Cognitive, Affective, Psychomotor). */
+    const domainTables = behavioralDomains.map(function (domain) {
+
+        let traitHeaders = `<th class="trait-title">${escapeHTML(domain.name.toUpperCase())}</th>`;
+        let traitRatings = `<td class="trait-title">Rating</td>`;
+
+        domain.traits.forEach(function (trait) {
+            const rating = behavior[trait] !== undefined ? behavior[trait] : "";
+
+            traitHeaders += `<th>${escapeHTML(trait)}</th>`;
+            traitRatings += `<td class="trait-rating">${escapeHTML(rating)}</td>`;
+        });
+
+        return `
+                <table class="behavior-table behavior-domain-table" style="margin-bottom:6px;">
+                    <thead>
+                        <tr>${traitHeaders}</tr>
+                    </thead>
+                    <tbody>
+                        <tr>${traitRatings}</tr>
+                    </tbody>
+                </table>
+        `;
+
+    }).join("");
+
+    const teacherComment = behavior["Class Teacher's Comment"] || "";
+    const principalComment = behavior["Principal's Comment"] || "";
+
+    const studentHouse = student["House"] || "";
+
+    /* =====================================================
+       DYNAMIC MARKING SETTINGS
+       ===================================================== */
+
+    const firstCAMax = Number(reportSettings.firstCAMaximum) || 20;
+    const secondCAMax = Number(reportSettings.secondCAMaximum) || 20;
+    const examsMax = Number(reportSettings.examsMaximum) || 60;
+    const extraAssessmentList = getExtraAssessments();
+    const extraCount = extraAssessmentList.length;
+    const totalMaximum = getTotalMaximumMarks();
+
+    /* Column widths always add up to 100%, so adding assessments shrinks the
+       subject column a little instead of pushing any column off the page.
+       With no extra assessments the widths are exactly the original ones. */
+    const numberWidth = [8, 7.5, 7, 6.5, 6][extraCount];
+    const remarkWidth = [14, 13, 13, 12, 12][extraCount];
+    const serialWidth = extraCount === 0 ? 4 : 3.5;
+    const subjectWidth = Math.round(
+        (100 - serialWidth - remarkWidth - numberWidth * (7 + extraCount)) * 10
+    ) / 10;
+    const numberCol = '<col style="width:' + numberWidth + '%;">';
+    const reportColgroup =
+        '<col style="width:' + serialWidth + '%;">' +
+        '<col style="width:' + subjectWidth + '%;">' +
+        new Array(7 + extraCount + 1).join(numberCol) +
+        '<col style="width:' + remarkWidth + '%;">';
+    const extraHeaderCells = extraAssessmentList.map(function (item) {
+        return "<th>" + escapeHTML(item.name) + "<br><small>" + item.max + " mks</small></th>";
+    }).join("");
+
+    const studentName = student["Student Name"] || "";
+    const admissionNo = student["Admission No"] || "";
+    const gender = student["Gender"] || "";
+    const studentClass = student["Class"] || "";
+    const term = student["Term"] || "";
+    const session = student["Session"] || "";
+    const studentPhoto = getStudentPhoto(student);
+
+    /* Report outlook (Classic / Modern / Elegant / Minimal) */
+    const reportTemplateId = getReportTemplateId();
+
+    /* Classic keeps its original inline header styling. The other outlooks
+       are styled from style.css, so they get no inline styles. */
+    const classicInline = function (css) {
+        return reportTemplateId === "classic" ? ' style="' + css + '"' : "";
+    };
+
+    /* =====================================================
+       PROFESSIONAL REPORT
+       ===================================================== */
+
+    return `
+        <article class="report tpl-${reportTemplateId}" data-report-template="${reportTemplateId}" style="position:relative;" data-report-fingerprint="${escapeHTML(getReportGenerationFingerprint(student))}">
+            ${reportWatermarkHtml()}
+
+            <div class="report-top-accent"></div>
+
+           <header class="school-header"${classicInline("position:relative;width:100%;display:block;text-align:center!important;")}>
+    <div class="school-brand"${classicInline("position:relative;width:100%!important;display:block!important;text-align:center!important;")}>
+        ${
+            reportSettings.schoolLogo
+                ? `
+                    <div class="school-logo-container"${classicInline("position:absolute!important;left:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;")}>
+                        <img
+                            src="${reportSettings.schoolLogo}"
+                            alt="School Logo"
+                            class="school-logo"
+                        >
+                    </div>
+                  `
+                : `
+                    <div class="school-logo-container school-logo-placeholder"${classicInline("position:absolute!important;left:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;")}>
+                        <span>SR</span>
+                    </div>
+                  `
+        }
+
+        ${
+            studentPhoto
+                ? `
+                    <div class="student-passport-container"${classicInline("position:absolute!important;right:0!important;top:50%!important;transform:translateY(-50%)!important;margin:0!important;")}>
+                        <img
+                            src="${escapeHTML(studentPhoto)}"
+                            alt="Student passport photograph"
+                            class="student-passport-photo"
+                        >
+                    </div>
+                  `
+                : (reportTemplateId === "classic" ? "" : '<div class="school-side-spacer"></div>')
+        }
+
+        <div class="school-heading"${classicInline("width:100%!important;max-width:none!important;text-align:center!important;margin:0 auto!important;display:block!important;padding:0 100px!important;")}>
+            <h1${classicInline("display:block!important;width:100%!important;text-align:center!important;margin:0 auto!important;font-size:26px!important;font-weight:800!important;line-height:1.15!important;letter-spacing:0.5px!important;")}>${escapeHTML(reportSettings.schoolName)}</h1>
+            <p${classicInline("display:block!important;width:100%!important;text-align:center!important;margin:5px auto 0!important;font-size:14px!important;font-weight:600!important;line-height:1.25!important;letter-spacing:0.3px!important;")}>${escapeHTML(reportSettings.schoolAddress)}</p>
+            <div class="report-title"${classicInline("display:block!important;width:100%!important;text-align:center!important;margin:8px auto 0!important;font-size:16px!important;font-weight:800!important;line-height:1.2!important;letter-spacing:1.2px!important;")}>STUDENT ACADEMIC REPORT</div>
+        </div>
+    </div>
+
+</header>
+
+<section class="student-profile">
+    <div class="section-heading">
+        <span class="section-number">01</span>
+        <div>
+            <h2>Student Information</h2>
+            <p>Personal and class details</p>
+        </div>
+    </div>
+
+    <div class="student-info">
+        <div class="info-item info-name">
+            <span class="info-label">Student Name</span>
+            <strong>${escapeHTML(studentName)}</strong>
+        </div>
+
+        <div class="info-item">
+            <span class="info-label">Admission No.</span>
+            <strong>${escapeHTML(admissionNo)}</strong>
+        </div>
+
+                    <div class="info-item">
+                        <span class="info-label">Class</span>
+                        <strong>${escapeHTML(studentClass)}</strong>
+                    </div>
+
+                    <div class="info-item">
+                        <span class="info-label">Gender</span>
+                        <strong>${escapeHTML(gender)}</strong>
+                    </div>
+
+                    <div class="info-item">
+                        <span class="info-label">House</span>
+                        <strong>${escapeHTML(studentHouse)}</strong>
+                    </div>
+
+                    <div class="info-item">
+                        <span class="info-label">Class Size</span>
+                        <strong>${classSize}</strong>
+                    </div>
+
+                    <div class="info-item">
+                        <span class="info-label">Term</span>
+                        <strong>${escapeHTML(term)}</strong>
+                    </div>
+
+                    <div class="info-item">
+                        <span class="info-label">Session</span>
+                        <strong>${escapeHTML(session)}</strong>
+                    </div>
+                </div>
+            </section>
+
+            <section class="academic-section">
+                <div class="section-heading">
+                    <span class="section-number">02</span>
+                    <div>
+                        <h2>Academic Performance</h2>
+                        <p>Subject-by-subject assessment</p>
+                    </div>
+                </div>
+
+                <table class="result-table" style="width:100%;max-width:100%;table-layout:fixed;">
+                    <colgroup>
+                        ${reportColgroup}
+                    </colgroup>
+                    <thead>
+                        <tr>
+                            <th>No.</th>
+                            <th>Subject</th>
+                            <th>1st CA<br><small>${firstCAMax} mks</small></th>
+                            <th>2nd CA<br><small>${secondCAMax} mks</small></th>
+                            <th>Exams<br><small>${examsMax} mks</small></th>
+                            ${extraHeaderCells}
+                            <th>Total<br><small>${totalMaximum} mks</small></th>
+                            <th>Subject<br>Avg</th>
+                            <th>Subject<br>Pos.</th>
+                            <th>Grade</th>
+                            <th>Remark</th>
+                        </tr>
+                    </thead>
+
+                    <tbody>
+                        ${subjectRows}
+                    </tbody>
+
+                    <tfoot>
+                        <tr>
+                            <th colspan="${5 + extraCount}">OVERALL TOTAL</th>
+                            <th colspan="5">${overallTotal.toFixed(2)}</th>
+                        </tr>
+                    </tfoot>
+                </table>
+            </section>
+
+            <section class="summary-section">
+                <div class="section-heading compact-heading">
+                    <span class="section-number">03</span>
+                    <div>
+                        <h2>Performance Summary</h2>
+                    </div>
+                </div>
+
+                <div class="summary">
+                    <div class="summary-card">
+                        <span>Overall Total</span>
+                        <strong>${overallTotal.toFixed(2)}</strong>
+                    </div>
+
+                    <div class="summary-card">
+                        <span>Average</span>
+                        <strong>${average.toFixed(2)}%</strong>
+                    </div>
+
+                    <div class="summary-card">
+                        <span>Class Position</span>
+                        <strong class="position-value">
+                            ${
+                                hasPosition && position !== null
+                                    ? formatPosition(position)
+                                    : "—"
+                            }
+                        </strong>
+                    </div>
+
+                    <div class="summary-card highlight-grade">
+                        <span>Overall Grade</span>
+                        <strong>${grade}</strong>
+                    </div>
+                </div>
+
+                ${gradeKeyHtml(grade)}
+            </section>
+
+            <section class="behavior-section">
+                <div class="section-heading">
+                    <span class="section-number">04</span>
+                    <div>
+                        <h2>Behavioural Development</h2>
+                        <p>Rating scale: 1 = Lowest &nbsp;•&nbsp; 5 = Highest</p>
+                    </div>
+                </div>
+
+                ${domainTables}
+            </section>
+
+            <section class="comments">
+                <div class="section-heading">
+                    <span class="section-number">05</span>
+                    <div>
+                        <h2>Assessment & Comments</h2>
+                    </div>
+                </div>
+
+                <div class="comment-grid">
+                    <div class="comment-card">
+                        <div class="comment-label">CLASS TEACHER'S COMMENT</div>
+                        <div class="comment-box">${escapeHTML(teacherComment)}</div>
+                        <div class="signature-line">
+                            <span>Class Teacher</span>
+                            <span>Date</span>
+                        </div>
+                    </div>
+
+                    <div class="comment-card">
+                        <div class="comment-label">PRINCIPAL'S COMMENT</div>
+                        <div class="comment-box">${escapeHTML(principalComment)}</div>
+                        <div class="signature-line">
+                            <span>Principal</span>
+                            <span>Date</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            ${feesNoticeHtml({ className: studentClass, session: session, term: term, admissionNo: admissionNo, name: studentName })}
+
+            <footer class="report-footer">
+                <span>Student Academic Report</span>
+                <span>${escapeHTML(term)} • ${escapeHTML(session)}</span>
+            </footer>
+
+        </article>
+    `;
+}
+
+
+/* =========================================================
+   GRADING
+   ========================================================= */
+
+function getGrade(
+    score
+) {
+
+    if (
+        score >=
+        reportSettings.gradeA
+    ) {
+
+        return "A";
+
+    }
+
+
+    if (
+        score >=
+        reportSettings.gradeB
+    ) {
+
+        return "B";
+
+    }
+
+
+    if (
+        score >=
+        reportSettings.gradeC
+    ) {
+
+        return "C";
+
+    }
+
+
+    if (
+        score >=
+        reportSettings.gradeD
+    ) {
+
+        return "D";
+
+    }
+
+
+    if (
+        score >=
+        reportSettings.gradeE
+    ) {
+
+        return "E";
+
+    }
+
+
+    return "F";
+
+}
+
+
+/* =========================================================
+   GRADE REMARKS + GRADING KEY
+
+   Each grade has a short remark shown next to it on the report.
+   Change the words here if the school prefers another wording
+   (for example "Good" for C or "Fair" for E).
+   ========================================================= */
+
+const GRADE_REMARKS = {
+    A: "Excellent",
+    B: "Very Good",
+    C: "Credit",
+    D: "Fairly Good",
+    E: "Pass",
+    F: "Failed"
+};
+
+function getGradeRemark(grade, settingsOverride) {
+    const source = settingsOverride || reportSettings;
+    const custom = source && source.gradeRemarks;
+    if (custom && typeof custom[grade] === "string" && custom[grade].trim()) {
+        return custom[grade].trim();
+    }
+    return GRADE_REMARKS[grade] || "";
+}
+
+function formatGradeBound(value) {
+    const number = Number(value);
+    return Number.isInteger(number)
+        ? String(number)
+        : String(Math.round(number * 100) / 100);
+}
+
+/* The mark range that earns each grade, read from the school's
+   own Grade A-F minimums (Settings), never hard-coded. */
+function getGradeKeyRows(settingsOverride) {
+
+    const s = settingsOverride || reportSettings;
+
+    const totalMax = getTotalMaximumMarks(s);
+
+    const minimums = {
+        A: Number(s.gradeA),
+        B: Number(s.gradeB),
+        C: Number(s.gradeC),
+        D: Number(s.gradeD),
+        E: Number(s.gradeE),
+        F: Number(s.gradeF) || 0
+    };
+
+    const order = ["A", "B", "C", "D", "E", "F"];
+
+    return order.map(function (grade, index) {
+
+        const low = minimums[grade];
+        const above = index === 0 ? null : minimums[order[index - 1]];
+
+        let range;
+
+        if (above === null) {
+            range = formatGradeBound(low) + " - " + formatGradeBound(totalMax);
+        } else if (Number.isInteger(above)) {
+            range = formatGradeBound(low) + " - " + formatGradeBound(above - 1);
+        } else {
+            range = formatGradeBound(low) + " - below " + formatGradeBound(above);
+        }
+
+        return {
+            grade: grade,
+            remark: getGradeRemark(grade, s),
+            range: range
+        };
+
+    });
+
+}
+
+/* Shown under the Performance Summary; the student's own overall
+   grade is highlighted. */
+function gradeKeyHtml(currentGrade) {
+
+    const items = getGradeKeyRows().map(function (row) {
+        return `
+            <div class="grade-key-item${row.grade === currentGrade ? " is-current" : ""}">
+                <strong>${row.grade}</strong>
+                <span>${escapeHTML(row.remark)}</span>
+                <em>${escapeHTML(row.range)}</em>
+            </div>
+        `;
+    }).join("");
+
+    return `
+        <div class="grade-key">
+            <div class="grade-key-title">Grading Key (marks that earn each grade)</div>
+            <div class="grade-key-grid">${items}</div>
+        </div>
+    `;
+
+}
+
+
+/* =========================================================
+   GENERATE MASTER SHEET (BROADSHEET)
+
+   One table per class. Each row shows only what was asked for:
+   Student Name, Admission No, each subject's total (1st CA +
+   2nd CA + Exams, same rule as createReport/calculateStudentAverage
+   for excluding subjects the student doesn't offer), Overall
+   Total, Average, and Position — computed per class (ranked
+   against classmates only), not read from the "Position" column
+   in the uploaded template.
+   ========================================================= */
+
+function getStudentSubjectTotals(student) {
+    let overallTotal = 0;
+    const subjectTotals = {};
+
+    schoolSubjects.forEach(function (subject) {
+        const firstCAKey = subject + " 1st CA";
+        const secondCAKey = subject + " 2nd CA";
+        const examsKey = subject + " Exams";
+
+        const hasSubject = studentOffersSubject(student, subject);
+
+        if (!hasSubject) {
+            subjectTotals[subject] = null;
+            return;
+        }
+
+        const total = studentSubjectSum(student, subject);
+
+        subjectTotals[subject] = total;
+        overallTotal += total;
+    });
+
+    const numberOfSubjects = Object.keys(subjectTotals).filter(function (subject) {
+        return subjectTotals[subject] !== null;
+    }).length;
+
+    const average = numberOfSubjects > 0 ? overallTotal / numberOfSubjects : 0;
+
+    return {
+        student: student,
+        admissionNo: student["Admission No"] || "",
+        studentName: student["Student Name"] || "",
+        subjectTotals: subjectTotals,
+        overallTotal: overallTotal,
+        average: average
+    };
+}
+
+function assignClassPositions(rows) {
+    /* Standard competition ranking: equal averages share a position,
+       and the next distinct average skips ahead accordingly
+       (e.g. 1, 2, 2, 4). Ranked by average (not overall total) so
+       students who offer fewer subjects aren't unfairly penalized. */
+    const sorted = rows.slice().sort(function (a, b) {
+        return b.average - a.average;
+    });
+
+    let lastAverage = null;
+    let lastPosition = 0;
+
+    sorted.forEach(function (row, index) {
+        if (lastAverage === null || row.average !== lastAverage) {
+            lastPosition = index + 1;
+            lastAverage = row.average;
+        }
+        row.position = lastPosition;
+    });
+
+    return sorted;
+}
+
+function createMasterSheetHTML() {
+    if (!students || students.length === 0) {
+        return "<p>No student data available. Please upload an Excel file first.</p>";
+    }
+
+    /* Group students by class, preserving the order classes first appear in. */
+    const classOrder = [];
+    const classGroups = {};
+
+    students.forEach(function (student) {
+        const studentClass = String(student["Class"] || "").trim() || "Unassigned";
+
+        if (!classGroups[studentClass]) {
+            classGroups[studentClass] = [];
+            classOrder.push(studentClass);
+        }
+
+        classGroups[studentClass].push(student);
+    });
+
+    let html = `
+        <div class="master-sheet-wrapper">
+            <h1 class="master-sheet-title">${escapeHTML(reportSettings.schoolName || "")} — Master Sheet</h1>
+    `;
+
+    classOrder.forEach(function (className) {
+        const classStudents = classGroups[className];
+
+        /* Only show subject columns actually offered by someone in this class. */
+        const classSubjects = schoolSubjects.filter(function (subject) {
+            return classStudents.some(function (student) {
+                return studentOffersSubject(student, subject);
+            });
+        });
+
+        const rows = assignClassPositions(
+            classStudents.map(getStudentSubjectTotals)
+        );
+
+        let subjectHeaderCells = "";
+        classSubjects.forEach(function (subject) {
+            subjectHeaderCells += `<th>${escapeHTML(subject)}</th>`;
+        });
+
+        let bodyRows = "";
+        rows.forEach(function (row, index) {
+            let subjectCells = "";
+            classSubjects.forEach(function (subject) {
+                const value = row.subjectTotals[subject];
+                subjectCells += `<td>${value === null ? "-" : formatScore(value)}</td>`;
+            });
+
+            bodyRows += `
+                <tr>
+                    <td class="serial-cell">${index + 1}</td>
+                    <td>${escapeHTML(row.admissionNo)}</td>
+                    <td class="student-name-cell">${escapeHTML(row.studentName)}</td>
+                    ${subjectCells}
+                    <td class="total-cell">${formatScore(row.overallTotal)}</td>
+                    <td>${row.average.toFixed(2)}%</td>
+                    <td>${formatPosition(row.position)}</td>
+                </tr>
+            `;
+        });
+
+        html += `
+            <section class="master-sheet-class">
+                <h2 class="master-sheet-class-title">Class: ${escapeHTML(className)} (${classStudents.length} student${classStudents.length === 1 ? "" : "s"})</h2>
+                <div class="master-sheet-table-scroll">
+                    <table class="master-sheet-table">
+                        <thead>
+                            <tr>
+                                <th>No.</th>
+                                <th>Adm. No</th>
+                                <th>Student Name</th>
+                                ${subjectHeaderCells}
+                                <th>Total</th>
+                                <th>Average</th>
+                                <th>Position</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${bodyRows}
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        `;
+    });
+
+    html += `</div>`;
+
+    return html;
+}
+
+async function generateMasterSheet() {
+
+    if (!students || students.length === 0) {
+        alert("❌ Please upload an Excel file containing student records first.");
+        return;
+    }
+
+    const html = createMasterSheetHTML();
+
+    if (reportContainer) {
+        reportContainer.innerHTML = html;
+        reportContainer.scrollIntoView({ behavior: "smooth" });
+    }
+
+    alert("✅ Master sheet generated successfully.");
+}
+
+
+/* =========================================================
+   CALCULATE POSITION
+   Kept for compatibility.
+   The report itself reads Position directly
+   from the uploaded Excel template.
+   ========================================================= */
+
+function calculatePosition(
+    currentStudent,
+    allStudents
+) {
+
+    const currentAverage =
+        calculateStudentAverage(
+            currentStudent
+        );
+
+
+    let position =
+        1;
+
+
+    allStudents.forEach(
+        function (student) {
+
+            const studentAverage =
+                calculateStudentAverage(
+                    student
+                );
+
+
+            if (
+                studentAverage >
+                currentAverage
+            ) {
+
+                position++;
+
+            }
+
+        }
+    );
+
+
+    return position;
+
+}
+
+
+/* =========================================================
+   CALCULATE AVERAGE
+   ========================================================= */
+
+function calculateStudentAverage(
+    student
+) {
+
+    let total =
+        0;
+
+
+    let subjectCount =
+        0;
+
+
+    schoolSubjects.forEach(
+        function (subject) {
+
+            const hasSubject = studentOffersSubject(student, subject);
+
+            if (hasSubject) {
+
+                total += studentSubjectSum(student, subject);
+
+
+                subjectCount++;
+
+            }
+
+        }
+    );
+
+
+    if (
+        subjectCount ===
+        0
+    ) {
+
+        return 0;
+
+    }
+
+
+    return (
+        total /
+        subjectCount
+    );
+
+}
+
+
+/* =========================================================
+   FORMAT POSITION
+   ========================================================= */
+
+function formatPosition(
+    position
+) {
+
+    const lastTwo =
+        position %
+        100;
+
+
+    if (
+        lastTwo >= 11 &&
+        lastTwo <= 13
+    ) {
+
+        return (
+            position +
+            "th"
+        );
+
+    }
+
+
+    switch (
+        position %
+        10
+    ) {
+
+        case 1:
+
+            return (
+                position +
+                "st"
+            );
+
+
+        case 2:
+
+            return (
+                position +
+                "nd"
+            );
+
+
+        case 3:
+
+            return (
+                position +
+                "rd"
+            );
+
+
+        default:
+
+            return (
+                position +
+                "th"
+            );
+
+    }
+
+}
+
+
+/* =========================================================
+   FORMAT SCORE
+   ========================================================= */
+
+function formatScore(
+    score
+) {
+
+    const number =
+        Number(score);
+
+
+    if (
+        Number.isInteger(
+            number
+        )
+    ) {
+
+        return String(
+            number
+        );
+
+    }
+
+
+    return number.toFixed(2);
+
+}
+
+
+/* =========================================================
+   PAYSTACK BUTTONS
+   ========================================================= */
+
+function attachPaystackButtons() {
+
+    const buttons =
+        document.querySelectorAll(
+            ".subscribe-button"
+        );
+
+
+    buttons.forEach(
+        function (button) {
+
+            button.addEventListener(
+                "click",
+                function () {
+
+                    startPaystackPayment(
+                        button
+                    );
+
+                }
+            );
+
+        }
+    );
+
+}
+
+
+/* =========================================================
+   START PAYSTACK
+   ========================================================= */
+
+async function startPaystackPayment(
+    button
+) {
+
+    try {
+
+        const {
+            data,
+            error
+        } =
+            await supabaseClient.auth
+                .getSession();
+
+
+        if (
+            error ||
+            !data.session
+        ) {
+
+            alert(
+                "Please create an account or sign in before subscribing."
+            );
+
+            return;
+
+        }
+
+
+        const user =
+            data.session.user;
+
+
+        const plan =
+            button.dataset.plan;
+
+
+        const price =
+            Number(
+                button.dataset.price
+            );
+
+
+        const duration =
+            button.dataset.duration ||
+            "";
+
+        /* CAPTURE THE UNUSED OLD BALANCE BEFORE RENEWAL */
+        const renewalCarryOver = currentSubscription
+            ? (isFreeTrial(currentSubscription)
+                ? 0
+                : getReportsRemaining(currentSubscription))
+            : 0;
+
+
+
+        if (
+            !plan ||
+            !price
+        ) {
+
+            alert(
+                "Invalid subscription plan."
+            );
+
+            return;
+
+        }
+
+
+        if (
+            typeof PaystackPop ===
+            "undefined"
+        ) {
+
+            alert(
+                "Paystack has not loaded."
+            );
+
+            return;
+
+        }
+
+
+        const handler =
+            PaystackPop.setup({
+
+                key:
+                    PAYSTACK_PUBLIC_KEY,
+
+                email:
+                    user.email,
+
+                amount:
+                    price * 100,
+
+                currency:
+                    "NGN",
+
+
+                /* =================================================
+                   PAYSTACK METADATA
+                   ================================================= */
+
+                metadata: {
+
+                    user_id:
+                        user.id,
+
+                    plan:
+                        plan,
+
+                    duration:
+                        duration,
+
+                    website_id:
+                        WEBSITE_ID,
+
+                    previous_remaining_reports:
+                        renewalCarryOver
+
+                },
+
+
+                /* =================================================
+                   PAYMENT CALLBACK
+                   ================================================= */
+
+                callback:
+                    async function (
+                        response
+                    ) {
+
+                        alert(
+                            "Payment received. Verifying payment..."
+                        );
+
+
+                        await verifyPaystackPayment(
+                            response.reference,
+                            plan,
+                            renewalCarryOver
+                        );
+
+                    },
+
+
+                /* =================================================
+                   CLOSE
+                   ================================================= */
+
+                onClose:
+                    function () {
+
+                        console.log(
+                            "Paystack checkout closed."
+                        );
+
+                    }
+
+            });
+
+
+        handler.openIframe();
+
+
+    } catch (error) {
+
+        console.error(
+            "Paystack start error:",
+            error
+        );
+
+
+        alert(
+            "Unable to start payment."
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   VERIFY PAYSTACK PAYMENT
+   ========================================================= */
+
+async function verifyPaystackPayment(
+    reference,
+    plan,
+    previousRemainingReports = 0
+) {
+
+    try {
+
+        const {
+            data,
+            error
+        } =
+            await supabaseClient
+                .functions
+                .invoke(
+                    "paystack-verification1",
+                    {
+
+                        body: {
+
+                            reference:
+                                reference,
+
+                            plan:
+                                plan,
+
+                            website_id:
+                                WEBSITE_ID,
+
+                            previous_remaining_reports:
+                                previousRemainingReports
+
+                        }
+
+                    }
+                );
+
+
+        if (error) {
+
+            console.error(
+                "Payment verification error:",
+                error
+            );
+
+
+            alert(
+                "Payment verification failed. Please contact support."
+            );
+
+
+            return;
+
+        }
+
+
+        if (
+            data &&
+            data.success
+        ) {
+
+            alert(
+
+                "✅ Payment successful!\n\nYour " +
+
+                plan.toUpperCase() +
+
+                " subscription for ReportSheet is now active."
+
+            );
+
+
+            await checkLogin();
+
+
+        } else {
+
+            console.error(
+                "Payment verification response:",
+                data
+            );
+
+
+            alert(
+
+                data &&
+                data.error
+
+                    ? data.error
+
+                    : "Payment could not be verified."
+
+            );
+
+        }
+
+
+    } catch (error) {
+
+        console.error(
+            "Payment verification exception:",
+            error
+        );
+
+
+        alert(
+            "An error occurred while verifying payment."
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   FILE STATUS
+   ========================================================= */
+
+function setFileStatus(
+    message
+) {
+
+    if (
+        elementExists(
+            fileStatus
+        )
+    ) {
+
+        fileStatus.innerHTML =
+            message;
+
+    }
+
+}
+
+
+
+
+
+/* =========================================================
+   HTML SECURITY
+   ========================================================= */
+
+function escapeHTML(
+    value
+) {
+
+    return String(value)
+
+        .replace(
+            /&/g,
+            "&amp;"
+        )
+
+        .replace(
+            /</g,
+            "&lt;"
+        )
+
+        .replace(
+            />/g,
+            "&gt;"
+        )
+
+        .replace(
+            /"/g,
+            "&quot;"
+        )
+
+        .replace(
+            /'/g,
+            "&#039;"
+        );
+
+}
+
+
+/* =========================================================
+   END OF SCRIPT
+   ========================================================= */
+
+/* =========================================================
+   REPORT-ONLY PRINT / SAVE-TO-PDF PROTECTION
+
+   A dedicated print layer is used so the application controls,
+   including Step 3, can NEVER become part of the first report.
+   ========================================================= */
+
+let reportPrintLayer = null;
+let reportPrintStyle = null;
+
+/* =========================================================
+   SHRINK-TO-FIT: force every report onto exactly one printed
+   page, no matter how much content it holds. Instead of
+   letting overflowing content spill onto a second page, the
+   report's content is measured against the real printable
+   page area and scaled down (uniformly, so nothing looks
+   stretched) just enough to fit.
+
+   Same sizing as script.js: the stylesheet has an 8mm @page
+   margin and the injected print style a 5mm one, so the more
+   conservative numbers are used on purpose.
+   ========================================================= */
+
+const MM_TO_PX = 96 / 25.4;          // CSS-spec fixed conversion (96px = 1in = 25.4mm)
+const PAGE_CONTENT_HEIGHT_MM = 303;  // A4 height (297mm) minus the larger 8mm top+bottom @page margin
+const REPORT_WIDTH_MM = 217;         // A4 width (210mm) minus the larger 8mm left+right @page margin
+const REPORT_PAD_TOP_MM = 4;
+const REPORT_PAD_BOTTOM_MM = 2;
+
+/* Android app only. PrintPlugin.java now prints on a full A4 sheet with no
+   margins, so the report gets the whole 210 x 297mm page (with its own inner
+   padding) and is scaled to FILL it, in both directions: shrunk when too
+   tall, enlarged when too short. The website keeps the script.js sizing. */
+const APP_PAGE_WIDTH_MM = 210;
+const APP_PAGE_HEIGHT_MM = 296;      // 1mm under 297mm so the page never spills onto a blank 2nd page
+const APP_PAD_TOP_MM = 5;
+const APP_PAD_SIDE_MM = 6;
+const APP_PAD_BOTTOM_MM = 2;
+const APP_MAX_GROW = 3.0;            // never enlarge more than this, so a tiny report is not blown up absurdly
+
+/* Android app only. The Android print engine lays the page out at a width
+   that is not the same as the A4 width the report was measured at, so a
+   report built from mm and px sizes came out smaller than the page. Putting
+   the finished report inside an SVG with a fixed viewBox makes the engine
+   scale the WHOLE report evenly to the page width, so it fills the page
+   whatever width the engine uses. Text stays sharp (it is not an image). */
+function wrapReportAsSvgPage(report, pageWidthMm, pageHeightMm) {
+    const doc = report.ownerDocument;
+    const NS = "http://www.w3.org/2000/svg";
+    const widthPx = pageWidthMm * MM_TO_PX;
+    const heightPx = pageHeightMm * MM_TO_PX;
+
+    /* The svg page break replaces the report's own page break. */
+    report.style.setProperty("break-after", "auto", "important");
+    report.style.setProperty("page-break-after", "auto", "important");
+    report.style.setProperty("break-before", "auto", "important");
+    report.style.setProperty("page-break-before", "auto", "important");
+    report.style.setProperty("margin", "0", "important");
+
+    const svg = doc.createElementNS(NS, "svg");
+    svg.setAttribute("class", "report-svg-page");
+    svg.setAttribute("xmlns", NS);
+    svg.setAttribute("viewBox", "0 0 " + widthPx + " " + heightPx);
+    svg.setAttribute("preserveAspectRatio", "xMinYMin meet");
+
+    const box = doc.createElementNS(NS, "foreignObject");
+    box.setAttribute("x", "0");
+    box.setAttribute("y", "0");
+    box.setAttribute("width", String(widthPx));
+    box.setAttribute("height", String(heightPx));
+
+    report.parentNode.insertBefore(svg, report);
+    svg.appendChild(box);
+    box.appendChild(report);
+}
+
+function fitReportsToSinglePage(layer, fillPage) {
+    layer = layer || reportPrintLayer;
+    if (!layer) return;
+
+    const reports = layer.querySelectorAll(".report");
+    if (!reports.length) return;
+
+    const pageWidthMm  = fillPage ? APP_PAGE_WIDTH_MM  : REPORT_WIDTH_MM;
+    const pageHeightMm = fillPage ? APP_PAGE_HEIGHT_MM : PAGE_CONTENT_HEIGHT_MM;
+    const padTopMm     = fillPage ? APP_PAD_TOP_MM     : REPORT_PAD_TOP_MM;
+    const padSideMm    = fillPage ? APP_PAD_SIDE_MM    : REPORT_PAD_TOP_MM;
+    const padBottomMm  = fillPage ? APP_PAD_BOTTOM_MM  : REPORT_PAD_BOTTOM_MM;
+
+    const maxInnerHeightPx = (pageHeightMm - padTopMm - padBottomMm) * MM_TO_PX;
+
+    /* Lay the layer out for measurement without letting it flash on screen. */
+    layer.style.display = "block";
+    layer.style.visibility = "hidden";
+    layer.style.position = "fixed";
+    layer.style.top = "0";
+    layer.style.left = "-99999px";
+
+    reports.forEach(function (report) {
+        /* Match the exact box the printed page will give this report. */
+        report.style.setProperty("width", pageWidthMm + "mm", "important");
+        report.style.setProperty("max-width", "none", "important");
+        report.style.setProperty("min-height", "0", "important");
+        report.style.setProperty(
+            "padding",
+            padTopMm + "mm " + padSideMm + "mm " + padBottomMm + "mm",
+            "important"
+        );
+        report.style.setProperty("border", "0", "important");
+        report.style.setProperty("overflow", "hidden", "important");
+
+        /* Move the report's existing content into a scalable wrapper. */
+        const inner = layer.ownerDocument.createElement("div");
+        inner.className = "report-scale-wrap";
+        while (report.firstChild) {
+            inner.appendChild(report.firstChild);
+        }
+        report.appendChild(inner);
+
+        const naturalHeightPx = inner.scrollHeight;
+
+        if (fillPage && naturalHeightPx > 0) {
+            /* Fill the page: scale up OR down. Changing the width changes how
+               the text wraps (and so the height), so the old "re-measure and
+               repeat" loop could bounce between two values and stop short,
+               leaving the bottom of the page empty. The printed height
+               (layout height x scale) only ever grows as the scale grows, so
+               a binary search always lands on the biggest scale that fits. */
+            inner.style.transformOrigin = "top left";
+
+            function printedHeightAt(candidate) {
+                inner.style.width = (100 / candidate) + "%";
+                inner.style.transform = "scale(" + candidate + ")";
+                return inner.scrollHeight * candidate;
+            }
+
+            let low = 0.05;                 // always fits
+            let high = APP_MAX_GROW;
+
+            if (printedHeightAt(high) <= maxInnerHeightPx) {
+                low = high;                 // even the biggest allowed scale fits
+            } else {
+                for (let pass = 0; pass < 14; pass++) {
+                    const middle = (low + high) / 2;
+                    if (printedHeightAt(middle) <= maxInnerHeightPx) low = middle; else high = middle;
+                }
+            }
+
+            printedHeightAt(low);
+            report.style.setProperty("height", pageHeightMm + "mm", "important");
+            wrapReportAsSvgPage(report, pageWidthMm, pageHeightMm);
+        } else if (naturalHeightPx > maxInnerHeightPx && naturalHeightPx > 0) {
+            /* Too tall. The old one-shot scale (page height / natural height)
+               over-shrank the report: widening the content to keep the full
+               page width makes the text re-wrap shorter, so the printed
+               report ended above the bottom of the page. Search for the
+               LARGEST scale whose printed height still fits, so the report
+               fills the page. It only ever shrinks (never above 1). */
+            inner.style.transformOrigin = "top left";
+
+            function fittedHeightAt(candidate) {
+                inner.style.width = (100 / candidate) + "%";
+                inner.style.transform = "scale(" + candidate + ")";
+                return inner.scrollHeight * candidate;
+            }
+
+            let low = 0.05;                 // always fits
+            let high = 1;                   // natural size does not fit (checked above)
+            for (let pass = 0; pass < 16; pass++) {
+                const middle = (low + high) / 2;
+                if (fittedHeightAt(middle) <= maxInnerHeightPx) low = middle; else high = middle;
+            }
+
+            fittedHeightAt(low);
+            report.style.setProperty("height", pageHeightMm + "mm", "important");
+        } else {
+            report.style.setProperty("height", "auto", "important");
+        }
+    });
+
+    /* Hand back to the existing print styling. */
+    layer.style.display = "";
+    layer.style.visibility = "";
+    layer.style.position = "";
+    layer.style.top = "";
+    layer.style.left = "";
+}
+
+function buildReportPrintLayer() {
+    if (!reportContainer) return;
+
+    /* Remove an old layer if a mobile browser fires beforeprint twice. */
+    if (reportPrintLayer) {
+        reportPrintLayer.remove();
+        reportPrintLayer = null;
+    }
+
+    if (reportPrintStyle) {
+        reportPrintStyle.remove();
+        reportPrintStyle = null;
+    }
+
+    reportPrintLayer = document.createElement("div");
+    reportPrintLayer.id = "reportPrintLayer";
+    reportPrintLayer.innerHTML = reportContainer.innerHTML;
+
+    /* Phones/WebViews "boost" text in wide blocks (text autosizing), which
+       makes the on-screen measurement taller than the real printed page and
+       shrinks the report too much. Switch that off for the print layer. */
+    reportPrintLayer.style.setProperty("-webkit-text-size-adjust", "100%", "important");
+    reportPrintLayer.style.setProperty("text-size-adjust", "100%", "important");
+    reportPrintLayer.querySelectorAll("*").forEach(function (node) {
+        node.style.setProperty("-webkit-text-size-adjust", "100%", "important");
+        node.style.setProperty("text-size-adjust", "100%", "important");
+    });
+
+    document.body.appendChild(reportPrintLayer);
+
+    /* Same print rules as script.js, injected so printing works even if the
+       main stylesheet lacks them. Each .report starts on a fresh A4 page
+       and cannot be split between two pages. */
+    reportPrintStyle = document.createElement("style");
+    reportPrintStyle.id = "reportPrintStyle";
+    reportPrintStyle.textContent = `
+        @page {
+            size: A4 portrait;
+            margin: ${(isNativeApp() || printFillMode) ? "0" : "5mm"};
+        }
+
+        @media print {
+            html,
+            body {
+                width: ${(isNativeApp() || printFillMode) ? "100%" : "210mm"} !important;
+                min-width: 0 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                background: #fff !important;
+            }
+
+            body > * {
+                display: none !important;
+            }
+
+            body > #reportPrintLayer {
+                display: block !important;
+                width: 100% !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                background: #fff !important;
+            }
+
+            #reportPrintLayer .report {
+                display: block !important;
+                width: 100% !important;
+                max-width: none !important;
+                margin: 0 !important;
+                box-sizing: border-box !important;
+                break-before: auto;
+                break-after: page;
+                break-inside: avoid;
+                page-break-before: auto;
+                page-break-after: always;
+                page-break-inside: avoid;
+            }
+
+            #reportPrintLayer .report:last-child {
+                break-after: auto;
+                page-break-after: auto;
+            }
+
+            #reportPrintLayer svg.report-svg-page {
+                display: block !important;
+                width: 100% !important;
+                height: auto !important;
+                margin: 0 !important;
+                overflow: hidden !important;
+                break-inside: avoid;
+                page-break-inside: avoid;
+                break-after: page;
+                page-break-after: always;
+            }
+
+            #reportPrintLayer svg.report-svg-page:last-child {
+                break-after: auto;
+                page-break-after: auto;
+            }
+        }
+    `;
+    document.head.appendChild(reportPrintStyle);
+
+}
+
+/* Android app: the app print flow below builds and fits the print layer
+   itself. The WebView can ALSO fire "beforeprint" when the print job starts,
+   and the website handler would then throw that layer away and rebuild it
+   with the website sizing (shrink only, never enlarge) - which is why the
+   app print kept coming out the same whatever was changed. This flag makes
+   the website handler leave the app's layer alone. */
+let appPrintLayerReady = false;
+let printFillMode = false;          // true while the fill-the-page print flow is in use (app and mobile website)
+let appPrintLayerBuiltAt = 0;
+let appPrintLayerSignature = 0;
+
+/* True while the fitted print page built by the fill flow should be kept.
+   In the app it is kept until the next Print tap. On the mobile website it is
+   kept for 10 minutes and only while the reports on screen are unchanged, so
+   a later Print from the browser menu never prints an out-of-date page. */
+function appPrintLayerStillValid() {
+    if (!appPrintLayerReady || !reportPrintLayer) return false;
+    if (isNativeApp()) return true;
+    return (Date.now() - appPrintLayerBuiltAt < 10 * 60 * 1000) &&
+        !!reportContainer &&
+        reportContainer.innerHTML.length === appPrintLayerSignature;
+}
+
+function prepareReportsForPrint() {
+    if (appPrintLayerStillValid()) return;
+
+    if (!reportContainer) return;
+
+    printFillMode = false;
+    buildReportPrintLayer();
+    fitReportsToSinglePage(reportPrintLayer);
+
+    document.documentElement.classList.add("printing-reports");
+}
+
+/* ---------------------------------------------------------
+   Android app: measure the reports in a hidden, desktop-width frame.
+   The stylesheet has phone-only rules (max-width 700px / 400px) that
+   re-flow the report (smaller fonts, stacked columns). Measured on the
+   phone screen the report looks taller than it prints, so it is shrunk
+   too much and the page is left part-empty. A wide frame gets the same
+   layout the printed page (and a desktop browser) uses.
+   --------------------------------------------------------- */
+
+function fitReportsInDesktopFrame() {
+
+    return new Promise(function (resolve, reject) {
+
+        const layer = reportPrintLayer;
+        if (!layer) { resolve(); return; }
+
+        const frame = document.createElement("iframe");
+        frame.setAttribute("aria-hidden", "true");
+        frame.style.cssText =
+            "position:fixed;left:-99999px;top:0;width:1200px;height:1600px;" +
+            "border:0;opacity:0;pointer-events:none;";
+
+        let finished = false;
+        let timer = null;
+
+        function finish(error) {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            if (frame.parentNode) frame.parentNode.removeChild(frame);
+            if (error) reject(error); else resolve();
+        }
+
+        timer = setTimeout(function () {
+            finish(new Error("Print measuring timed out"));
+        }, 6000);
+
+        frame.onload = function () {
+            try {
+                const frameLayer = frame.contentDocument.getElementById("reportPrintLayer");
+                fitReportsToSinglePage(frameLayer, true);
+                layer.innerHTML = frameLayer.innerHTML;
+                finish();
+            } catch (error) {
+                finish(error);
+            }
+        };
+
+        const styles = Array.prototype.filter.call(
+            document.querySelectorAll('link[rel="stylesheet"], style'),
+            function (node) {
+                return !(node.href && /fonts\.(googleapis|gstatic)\.com/.test(node.href));
+            }
+        ).map(function (node) { return node.outerHTML; }).join("\n");
+
+        frame.srcdoc =
+            '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+            '<base href="' + document.baseURI + '">' + styles + '</head><body>' +
+            '<div id="reportPrintLayer" style="display:block">' + layer.innerHTML + '</div>' +
+            '</body></html>';
+
+        document.body.appendChild(frame);
+
+    });
+
+}
+
+/* Waits (up to a few seconds) until the images in the print layer, such as
+   the school logo link from Storage, have loaded. */
+function waitForPrintImages(layer, maxMs) {
+    const images = Array.prototype.slice.call(layer.querySelectorAll("img"));
+
+    return Promise.race([
+        Promise.all(images.map(function (img) {
+            if (img.complete) return null;
+            return new Promise(function (done) {
+                img.addEventListener("load", done, { once: true });
+                img.addEventListener("error", done, { once: true });
+            });
+        })),
+        new Promise(function (done) { setTimeout(done, maxMs); })
+    ]);
+}
+
+async function prepareReportsForPrintInApp() {
+    if (!reportContainer) return;
+
+    printFillMode = true;
+    buildReportPrintLayer();
+
+    if (reportPrintLayer) await waitForPrintImages(reportPrintLayer, 4000);
+
+    try {
+        await fitReportsInDesktopFrame();
+    } catch (error) {
+        console.error("Desktop-width fit failed, using on-screen fit:", error);
+        fitReportsToSinglePage(reportPrintLayer, true);
+    }
+
+    appPrintLayerReady = true;
+    appPrintLayerBuiltAt = Date.now();
+    appPrintLayerSignature = reportContainer.innerHTML.length;
+    document.documentElement.classList.add("printing-reports");
+}
+
+function restoreReportsAfterPrint() {
+    appPrintLayerReady = false;
+    printFillMode = false;
+    document.documentElement.classList.remove("printing-reports");
+
+    if (reportPrintLayer) {
+        reportPrintLayer.remove();
+        reportPrintLayer = null;
+    }
+
+    if (reportPrintStyle) {
+        reportPrintStyle.remove();
+        reportPrintStyle = null;
+    }
+}
+
+document.documentElement.classList.remove("printing-reports");
+
+/* Android app: the PDF is written AFTER the preview, when the person taps
+   Save in the print dialog. The old clean-up (on focus / visibilitychange /
+   afterprint) removed the app's fitted print page before that final write,
+   so the saved PDF came out small again even though the preview was right.
+   In the app the fitted page now stays in place (it is invisible on screen
+   and is rebuilt fresh the next time Print is tapped); only the website
+   cleans up on these events. */
+function cleanUpAfterPrintEvent() {
+    if (appPrintLayerStillValid()) return;
+    restoreReportsAfterPrint();
+}
+
+window.addEventListener("beforeprint", prepareReportsForPrint);
+window.addEventListener("afterprint", cleanUpAfterPrintEvent);
+
+/* Mobile browsers are not always consistent with afterprint. */
+window.addEventListener("focus", function () {
+    if (document.documentElement.classList.contains("printing-reports")) {
+        setTimeout(cleanUpAfterPrintEvent, 500);
+    }
+});
+
+/* Clean up when the page becomes visible again after the print dialog. */
+document.addEventListener("visibilitychange", function () {
+    if (!document.hidden &&
+        document.documentElement.classList.contains("printing-reports")) {
+        setTimeout(cleanUpAfterPrintEvent, 500);
+    }
+});
+
+
+/* =========================================================
+   PROMOTION  (end of session, school owner only)
+
+   - The owner sets, once, which class follows which (Step 1) and the
+     promotion rules (Step 2). Both are saved with the school profile
+     (reportSettings.promotion), so no new SQL table is needed.
+   - At the end of a session the owner picks a class and sees a preview:
+     each student is "Promote", "Repeat" or "Needs review" with the reason.
+     The owner can change any student before confirming.
+   - Confirming only ADDS students to the class list of the new session
+     (class_students). Nothing in the old session is changed or deleted.
+     Passport photos follow the student (they are keyed by Adm No / name).
+   ========================================================= */
+
+const PROMOTION_GRADUATE = "__graduate__";
+
+let promotionState = null;
+let promotionBusy = false;
+
+function promotionSettings() {
+    if (!reportSettings.promotion || typeof reportSettings.promotion !== "object") {
+        reportSettings.promotion = {};
+    }
+    const p = reportSettings.promotion;
+    if (!p.nextClass || typeof p.nextClass !== "object") p.nextClass = {};
+    if (!p.rules || typeof p.rules !== "object") p.rules = {};
+    if (!p.rules.all || typeof p.rules.all !== "object") p.rules.all = {};
+    if (!p.rules.byClass || typeof p.rules.byClass !== "object") p.rules.byClass = {};
+    return p;
+}
+
+function promotionNum(value, fallback, min, max) {
+    if (value === "" || value === null || value === undefined) return fallback;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+}
+
+function promotionNormalizeRule(raw) {
+    raw = raw || {};
+    const gradeE = Number(reportSettings.gradeE);
+    const base = Number.isFinite(gradeE) && gradeE > 0 ? gradeE : 40;
+    return {
+        minAverage: promotionNum(raw.minAverage, base, 0, 100),
+        subjectPassMark: promotionNum(raw.subjectPassMark, base, 0, 100),
+        minSubjectsPassed: promotionNum(raw.minSubjectsPassed, 0, 0, 100),
+        minAttendance: promotionNum(raw.minAttendance, 0, 0, 100),
+        compulsory: Array.isArray(raw.compulsory)
+            ? raw.compulsory.filter(function (s) { return typeof s === "string" && s; })
+            : []
+    };
+}
+
+function promotionRuleFor(className) {
+    const p = promotionSettings();
+    return promotionNormalizeRule(p.rules.byClass[className] || p.rules.all);
+}
+
+function promotionFmt(n) {
+    return (Math.round(Number(n) * 10) / 10).toString();
+}
+
+/* Pure decision for one student.
+   input = { hasScores, average, subjects:[{subject, cumulative}],
+             attendance: {present, opened} | null } */
+function promotionJudge(rule, input) {
+
+    const subjects = (input && input.subjects) || [];
+
+    if (!input || !input.hasScores || subjects.length === 0) {
+        return { status: "review", reasons: ["No scores saved"], passed: 0, total: 0, attendancePct: null };
+    }
+
+    const fails = [];
+    const missing = [];
+
+    const passed = subjects.filter(function (s) {
+        return s.cumulative !== null && s.cumulative !== undefined && s.cumulative >= rule.subjectPassMark;
+    }).length;
+
+    if (input.average === null || input.average === undefined || input.average < rule.minAverage) {
+        fails.push("Average " + (input.average === null || input.average === undefined ? "-" : promotionFmt(input.average)) +
+            " is below " + promotionFmt(rule.minAverage));
+    }
+
+    if (rule.minSubjectsPassed > 0 && passed < rule.minSubjectsPassed) {
+        fails.push("Passed " + passed + " subject(s), needs " + rule.minSubjectsPassed);
+    }
+
+    rule.compulsory.forEach(function (name) {
+        const key = normalizeStudentName(name);
+        const row = subjects.find(function (s) { return normalizeStudentName(s.subject) === key; });
+        if (!row || row.cumulative === null || row.cumulative === undefined) {
+            missing.push("No score in " + name);
+        } else if (row.cumulative < rule.subjectPassMark) {
+            fails.push(name + " " + promotionFmt(row.cumulative) + " is below " + promotionFmt(rule.subjectPassMark));
+        }
+    });
+
+    let attendancePct = null;
+
+    if (rule.minAttendance > 0) {
+        const att = input.attendance;
+        if (!att || !(att.opened > 0)) {
+            missing.push("Attendance not recorded");
+        } else {
+            attendancePct = (att.present / att.opened) * 100;
+            if (attendancePct < rule.minAttendance) {
+                fails.push("Attendance " + promotionFmt(attendancePct) + "% is below " + promotionFmt(rule.minAttendance) + "%");
+            }
+        }
+    } else if (input.attendance && input.attendance.opened > 0) {
+        attendancePct = (input.attendance.present / input.attendance.opened) * 100;
+    }
+
+    const status = fails.length ? "repeat" : (missing.length ? "review" : "promote");
+
+    return {
+        status: status,
+        reasons: fails.concat(missing),
+        passed: passed,
+        total: subjects.length,
+        attendancePct: attendancePct
+    };
+}
+
+function promotionClassNames() {
+    return (Array.isArray(schoolClasses) ? schoolClasses : []).map(function (c) { return c.class_name; });
+}
+
+function promotionSessionList() {
+    const defaultStart = Number(defaultAcademicSession().split("/")[0]);
+    const list = [];
+    for (let y = SESSION_LIST_START_YEAR; y <= defaultStart + 1; y++) list.push(y + "/" + (y + 1));
+    return list;
+}
+
+function promotionNextSession(session) {
+    const m = /^(\d{4})\/(\d{4})$/.exec(String(session || "").trim());
+    if (!m) return "";
+    return (Number(m[1]) + 1) + "/" + (Number(m[2]) + 1);
+}
+
+function promotionSetStatus(id, message, isError) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = message || "";
+    el.style.color = isError ? "#b00020" : "";
+}
+
+function initializePromotionSection() {
+
+    if (document.getElementById("promotionSection")) return;
+
+    const card = document.createElement("section");
+    card.id = "promotionSection";
+    card.className = "card";
+
+    card.innerHTML =
+        "<style>" +
+        "body.srg-staff-mode #promotionSection{display:none !important;}" +
+        "#promotionSection .promo-block{margin:12px 0;padding-top:8px;border-top:1px solid #ddd;}" +
+        "#promotionSection .promo-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0;}" +
+        "#promotionSection .promo-table-wrap{overflow-x:auto;margin-top:8px;}" +
+        "#promotionSection table{border-collapse:collapse;width:100%;font-size:13px;}" +
+        "#promotionSection th,#promotionSection td{border:1px solid #ccc;padding:5px;text-align:left;vertical-align:top;}" +
+        "#promotionSection .promo-field{display:block;margin:8px 0;}" +
+        "#promotionSection .promo-field input[type=number]{width:90px;}" +
+        "</style>" +
+        "<h2>Promotion</h2>" +
+        "<p>Set which class follows which and the promotion rules. At the end of the session, " +
+        "check a class and promote the students who meet the rules. Only the school owner sees this section.</p>" +
+
+        "<div class=\"promo-block\"><h3>1. Next class</h3>" +
+        "<p>Choose where each class's students go when they pass.</p>" +
+        "<div class=\"promo-table-wrap\"><table><thead><tr><th>Class</th><th>Passed students go to</th></tr></thead>" +
+        "<tbody id=\"promoNextBody\"></tbody></table></div>" +
+        "<p id=\"promoNextStatus\"></p></div>" +
+
+        "<div class=\"promo-block\"><h3>2. Promotion rules</h3>" +
+        "<div class=\"promo-row\"><label for=\"promoRuleScope\">Rules for</label>" +
+        "<select id=\"promoRuleScope\"></select></div>" +
+        "<label class=\"promo-field\" id=\"promoSameWrap\" style=\"display:none;\">" +
+        "<input type=\"checkbox\" id=\"promoRuleSame\"> Use the same rules as all classes</label>" +
+        "<div id=\"promoRuleFields\">" +
+        "<label class=\"promo-field\">Minimum cumulative average (%) " +
+        "<input type=\"number\" id=\"promoMinAverage\" min=\"0\" max=\"100\" step=\"0.1\"></label>" +
+        "<label class=\"promo-field\">A subject counts as passed from (%) " +
+        "<input type=\"number\" id=\"promoSubjectPass\" min=\"0\" max=\"100\" step=\"0.1\"></label>" +
+        "<label class=\"promo-field\">Minimum subjects passed (0 = not required) " +
+        "<input type=\"number\" id=\"promoMinSubjects\" min=\"0\" max=\"100\" step=\"1\"></label>" +
+        "<label class=\"promo-field\">Minimum attendance % (0 = not required) " +
+        "<input type=\"number\" id=\"promoMinAttendance\" min=\"0\" max=\"100\" step=\"1\"></label>" +
+        "<div class=\"promo-field\"><strong>Compulsory subjects</strong> (must be passed)" +
+        "<div id=\"promoCompulsory\"></div></div>" +
+        "</div>" +
+        "<button type=\"button\" id=\"promoSaveRules\">Save rules</button>" +
+        "<p id=\"promoRuleStatus\"></p></div>" +
+
+        "<div class=\"promo-block\"><h3>3. Promote students</h3>" +
+        "<div class=\"promo-row\"><label for=\"promoClass\">Class</label><select id=\"promoClass\"></select></div>" +
+        "<div class=\"promo-row\"><label for=\"promoFrom\">From session</label><select id=\"promoFrom\"></select></div>" +
+        "<div class=\"promo-row\"><label for=\"promoTo\">To session</label><select id=\"promoTo\"></select></div>" +
+        "<button type=\"button\" id=\"promoCheck\">Check students</button>" +
+        "<p id=\"promoRunStatus\"></p>" +
+        "<div id=\"promoResult\"></div>" +
+        "<button type=\"button\" id=\"promoApply\" style=\"display:none;\">Promote students</button>" +
+        "</div>";
+
+    const comments = document.getElementById("autoCommentManager");
+
+    if (comments && comments.parentNode) {
+        comments.parentNode.insertBefore(card, comments.nextSibling);
+    } else {
+        document.body.appendChild(card);
+    }
+
+    document.getElementById("promoRuleScope").addEventListener("change", promotionLoadRuleForm);
+    document.getElementById("promoRuleSame").addEventListener("change", promotionToggleRuleFields);
+    document.getElementById("promoSaveRules").addEventListener("click", promotionSaveRules);
+    document.getElementById("promoFrom").addEventListener("change", function () {
+        document.getElementById("promoTo").value = promotionNextSession(this.value);
+        promotionClearResult();
+    });
+    document.getElementById("promoTo").addEventListener("change", promotionClearResult);
+    document.getElementById("promoClass").addEventListener("change", promotionClearResult);
+    document.getElementById("promoCheck").addEventListener("click", promotionCheck);
+    document.getElementById("promoApply").addEventListener("click", promotionApply);
+
+    promotionRefresh();
+
+}
+
+function promotionClearResult() {
+    promotionState = null;
+    const result = document.getElementById("promoResult");
+    const apply = document.getElementById("promoApply");
+    if (result) result.innerHTML = "";
+    if (apply) apply.style.display = "none";
+    promotionSetStatus("promoRunStatus", "");
+}
+
+/* Redraws the class dropdowns, next-class table and rule form.
+   Called after the class list or school profile loads. */
+function promotionRefresh() {
+
+    const card = document.getElementById("promotionSection");
+    if (!card) return;
+
+    const classes = promotionClassNames();
+    const p = promotionSettings();
+
+    /* 1. Next class table */
+    const body = document.getElementById("promoNextBody");
+
+    if (body) {
+        if (classes.length === 0) {
+            body.innerHTML = "<tr><td colspan=\"2\"><em>Add classes in Manage Classes first.</em></td></tr>";
+        } else {
+            body.innerHTML = classes.map(function (cls) {
+                const current = p.nextClass[cls] || "";
+                const options =
+                    "<option value=\"\">- not set -</option>" +
+                    classes.filter(function (other) { return other !== cls; }).map(function (other) {
+                        return "<option value=\"" + escapeHTML(other) + "\"" +
+                            (current === other ? " selected" : "") + ">" + escapeHTML(other) + "</option>";
+                    }).join("") +
+                    "<option value=\"" + PROMOTION_GRADUATE + "\"" +
+                    (current === PROMOTION_GRADUATE ? " selected" : "") + ">Graduates (leaves the school)</option>";
+                return "<tr><td>" + escapeHTML(cls) + "</td><td><select data-promo-next=\"" +
+                    escapeHTML(cls) + "\">" + options + "</select></td></tr>";
+            }).join("");
+
+            body.querySelectorAll("select[data-promo-next]").forEach(function (select) {
+                select.addEventListener("change", function () {
+                    const cls = select.getAttribute("data-promo-next");
+                    const ps = promotionSettings();
+                    if (select.value) ps.nextClass[cls] = select.value;
+                    else delete ps.nextClass[cls];
+                    saveAppData();
+                    promotionSetStatus("promoNextStatus", "✅ Saved.");
+                    promotionClearResult();
+                });
+            });
+        }
+    }
+
+    /* 2. Rule scope + class dropdown */
+    const scope = document.getElementById("promoRuleScope");
+
+    if (scope) {
+        const previous = scope.value;
+        scope.innerHTML = "<option value=\"\">All classes</option>" + classes.map(function (cls) {
+            return "<option value=\"" + escapeHTML(cls) + "\">" + escapeHTML(cls) + "</option>";
+        }).join("");
+        scope.value = classes.indexOf(previous) !== -1 ? previous : "";
+    }
+
+    const runClass = document.getElementById("promoClass");
+
+    if (runClass) {
+        const previous = runClass.value;
+        runClass.innerHTML = "<option value=\"\">-- Select Class --</option>" + classes.map(function (cls) {
+            return "<option value=\"" + escapeHTML(cls) + "\">" + escapeHTML(cls) + "</option>";
+        }).join("");
+        runClass.value = classes.indexOf(previous) !== -1 ? previous : "";
+    }
+
+    /* Compulsory subject checkboxes */
+    const compulsory = document.getElementById("promoCompulsory");
+
+    if (compulsory) {
+        const subjects = Array.isArray(schoolSubjects) ? schoolSubjects : [];
+        compulsory.innerHTML = subjects.length === 0
+            ? "<em>No subjects added yet.</em>"
+            : subjects.map(function (subject, i) {
+                return "<label style=\"display:block;\"><input type=\"checkbox\" data-promo-subject=\"" +
+                    escapeHTML(subject) + "\" id=\"promoSub" + i + "\"> " + escapeHTML(subject) + "</label>";
+            }).join("");
+    }
+
+    /* Sessions */
+    const from = document.getElementById("promoFrom");
+    const to = document.getElementById("promoTo");
+
+    if (from && to) {
+        const sessions = promotionSessionList();
+        const fromPrev = from.value;
+        const toPrev = to.value;
+        const optionsHtml = sessions.map(function (s) {
+            return "<option value=\"" + s + "\">" + s + "</option>";
+        }).join("");
+        from.innerHTML = optionsHtml;
+        to.innerHTML = optionsHtml;
+        const chosen = fromPrev && sessions.indexOf(fromPrev) !== -1
+            ? fromPrev
+            : (typeof getSelectedSession === "function" && sessions.indexOf(getSelectedSession()) !== -1
+                ? getSelectedSession()
+                : defaultAcademicSession());
+        from.value = chosen;
+        const target = toPrev && sessions.indexOf(toPrev) !== -1 && toPrev !== chosen
+            ? toPrev
+            : promotionNextSession(chosen);
+        if (sessions.indexOf(target) !== -1) to.value = target;
+    }
+
+    promotionLoadRuleForm();
+
+}
+
+function promotionToggleRuleFields() {
+    const scope = document.getElementById("promoRuleScope");
+    const same = document.getElementById("promoRuleSame");
+    const fields = document.getElementById("promoRuleFields");
+    if (!scope || !same || !fields) return;
+    fields.style.display = scope.value && same.checked ? "none" : "";
+}
+
+function promotionLoadRuleForm() {
+
+    const scope = document.getElementById("promoRuleScope");
+    if (!scope) return;
+
+    const p = promotionSettings();
+    const cls = scope.value;
+    const sameWrap = document.getElementById("promoSameWrap");
+    const same = document.getElementById("promoRuleSame");
+
+    if (sameWrap) sameWrap.style.display = cls ? "" : "none";
+
+    const hasOwn = !!(cls && p.rules.byClass[cls]);
+    if (same) same.checked = !!cls && !hasOwn;
+
+    const rule = promotionNormalizeRule(cls && hasOwn ? p.rules.byClass[cls] : p.rules.all);
+
+    document.getElementById("promoMinAverage").value = rule.minAverage;
+    document.getElementById("promoSubjectPass").value = rule.subjectPassMark;
+    document.getElementById("promoMinSubjects").value = rule.minSubjectsPassed;
+    document.getElementById("promoMinAttendance").value = rule.minAttendance;
+
+    document.querySelectorAll("#promoCompulsory input[data-promo-subject]").forEach(function (box) {
+        const key = normalizeStudentName(box.getAttribute("data-promo-subject"));
+        box.checked = rule.compulsory.some(function (name) { return normalizeStudentName(name) === key; });
+    });
+
+    promotionToggleRuleFields();
+
+}
+
+function promotionSaveRules() {
+
+    if (staffContext) return;
+
+    const scope = document.getElementById("promoRuleScope");
+    const same = document.getElementById("promoRuleSame");
+    const p = promotionSettings();
+    const cls = scope.value;
+
+    if (cls && same.checked) {
+        delete p.rules.byClass[cls];
+        saveAppData();
+        promotionLoadRuleForm();
+        promotionSetStatus("promoRuleStatus", "✅ " + cls + " now uses the rules for all classes.");
+        promotionClearResult();
+        return;
+    }
+
+    const rule = promotionNormalizeRule({
+        minAverage: document.getElementById("promoMinAverage").value,
+        subjectPassMark: document.getElementById("promoSubjectPass").value,
+        minSubjectsPassed: document.getElementById("promoMinSubjects").value,
+        minAttendance: document.getElementById("promoMinAttendance").value,
+        compulsory: Array.from(document.querySelectorAll("#promoCompulsory input[data-promo-subject]:checked"))
+            .map(function (box) { return box.getAttribute("data-promo-subject"); })
+    });
+
+    if (cls) p.rules.byClass[cls] = rule;
+    else p.rules.all = rule;
+
+    saveAppData();
+    promotionLoadRuleForm();
+    promotionSetStatus("promoRuleStatus", "✅ Rules saved for " + (cls || "all classes") + ".");
+    promotionClearResult();
+
+}
+
+function promotionIdentity(admission, name) {
+    const adm = normalizeStudentAdmissionNo(admission);
+    return adm ? "adm:" + adm : "name:" + normalizeStudentName(name);
+}
+
+/* Attendance for a class across the three terms of a session.
+   Returns { map, failed } - map is keyed like promotionIdentity(). */
+async function promotionLoadAttendance(className, session) {
+
+    const map = new Map();
+    let failed = false;
+
+    for (const term of ACADEMIC_TERMS) {
+        const rows = await fetchAttendanceRows(className, session, term);
+        if (rows === null) { failed = true; continue; }
+        rows.forEach(function (row) {
+            const keys = [promotionIdentity(row.admission_no, row.student_name), "name:" + normalizeStudentName(row.student_name)];
+            const entry = keys.map(function (k) { return map.get(k); }).find(Boolean) || { present: 0, opened: 0 };
+            if (Number.isFinite(row.days_present)) entry.present += row.days_present;
+            if (Number.isFinite(row.days_opened)) entry.opened += row.days_opened;
+            keys.forEach(function (k) { map.set(k, entry); });
+        });
+    }
+
+    return { map: map, failed: failed };
+
+}
+
+/* True when the owner has saved promotion rules that apply to this class.
+   Until then the report sheet shows nothing about promotion. */
+function promotionRulesAreSet(className) {
+    const p = promotionSettings();
+    return !!p.rules.byClass[className] || Object.keys(p.rules.all).length > 0;
+}
+
+/* Judges every student of a cumulative model with the school's promotion
+   rules. Returns a Map (student object -> judge result), or null when no
+   rules have been set. Never throws: the report must still generate. */
+async function promotionVerdictsForModel(model) {
+
+    try {
+
+        const className = model.context.className;
+
+        if (!promotionRulesAreSet(className)) return null;
+
+        const rule = promotionRuleFor(className);
+
+        let attendance = new Map();
+        let attendanceFailed = false;
+
+        if (rule.minAttendance > 0) {
+            const loaded = model.attendanceInfo || await promotionLoadAttendance(className, model.context.session);
+            attendance = loaded.map;
+            attendanceFailed = loaded.failed;
+        }
+
+        const verdicts = new Map();
+
+        model.students.forEach(function (student) {
+
+            const keyA = promotionIdentity(student.admission_no, student.student_name);
+            const keyB = "name:" + normalizeStudentName(student.student_name);
+
+            verdicts.set(student, promotionJudge(rule, {
+                hasScores: true,
+                average: student.cumulativeAverage,
+                subjects: student.subjectRows.map(function (r) {
+                    return { subject: r.subject, cumulative: r.cumulative };
+                }),
+                attendance: attendanceFailed ? null : (attendance.get(keyA) || attendance.get(keyB) || null)
+            }));
+
+        });
+
+        return verdicts;
+
+    } catch (error) {
+        console.error("Promotion check for the report failed:", error);
+        return null;
+    }
+
+}
+
+async function promotionCheck() {
+
+    if (promotionBusy) return;
+
+    if (staffContext) { alert("Only the school owner can use promotion."); return; }
+    if (!currentUserId) { promotionSetStatus("promoRunStatus", "❌ Please sign in first.", true); return; }
+
+    const className = document.getElementById("promoClass").value;
+    const fromSession = document.getElementById("promoFrom").value;
+    const toSession = document.getElementById("promoTo").value;
+
+    if (!className) { promotionSetStatus("promoRunStatus", "Please select a class.", true); return; }
+    if (!fromSession || !toSession || fromSession === toSession) {
+        promotionSetStatus("promoRunStatus", "Choose two different sessions (from and to).", true);
+        return;
+    }
+
+    const p = promotionSettings();
+    const nextClass = p.nextClass[className] || "";
+
+    if (!nextClass) {
+        promotionSetStatus("promoRunStatus", "Set the next class for " + className + " in step 1 first.", true);
+        return;
+    }
+
+    promotionBusy = true;
+    document.getElementById("promoCheck").disabled = true;
+    promotionClearResult();
+    promotionSetStatus("promoRunStatus", "⏳ Checking " + className + " (" + fromSession + ")…");
+
+    try {
+
+        const roster = await fetchClassRoster(className, fromSession);
+
+        if (rosterFetchFailed) throw new Error("Could not load the class list.");
+        if (roster.length === 0) throw new Error("There is no class list for " + className + " in " + fromSession + ".");
+
+        const model = await buildCumulativeModel({ className: className, session: fromSession, term: "" });
+
+        const scored = new Map();
+        model.students.forEach(function (s) {
+            scored.set(promotionIdentity(s.admission_no, s.student_name), s);
+            const byName = "name:" + normalizeStudentName(s.student_name);
+            if (!scored.has(byName)) scored.set(byName, s);
+        });
+
+        /* Attendance across the three terms */
+        const attendanceResult = await promotionLoadAttendance(className, fromSession);
+        const attendance = attendanceResult.map;
+        const attendanceFailed = attendanceResult.failed;
+
+        const rule = promotionRuleFor(className);
+        const isGraduate = nextClass === PROMOTION_GRADUATE;
+
+        const rows = roster.map(function (student) {
+
+            const keyA = promotionIdentity(student.admission_no, student.student_name);
+            const keyB = "name:" + normalizeStudentName(student.student_name);
+            const scoreRow = scored.get(keyA) || scored.get(keyB) || null;
+            const att = attendance.get(keyA) || attendance.get(keyB) || null;
+
+            const judge = promotionJudge(rule, {
+                hasScores: !!scoreRow,
+                average: scoreRow ? scoreRow.cumulativeAverage : null,
+                subjects: scoreRow
+                    ? scoreRow.subjectRows.map(function (r) { return { subject: r.subject, cumulative: r.cumulative }; })
+                    : [],
+                attendance: att
+            });
+
+            return {
+                student: student,
+                average: scoreRow ? scoreRow.cumulativeAverage : null,
+                judge: judge,
+                decision: judge.status === "promote" ? (isGraduate ? "graduate" : "promote")
+                    : (judge.status === "repeat" ? "repeat" : "skip")
+            };
+
+        });
+
+        promotionState = {
+            className: className,
+            fromSession: fromSession,
+            toSession: toSession,
+            nextClass: nextClass,
+            rows: rows
+        };
+
+        promotionRender(attendanceFailed && rule.minAttendance > 0);
+
+        promotionSetStatus("promoRunStatus", "");
+
+    } catch (error) {
+        promotionSetStatus("promoRunStatus", "❌ " + (error && error.message ? error.message : "Could not check the class."), true);
+    } finally {
+        promotionBusy = false;
+        document.getElementById("promoCheck").disabled = false;
+    }
+
+}
+
+function promotionRender(attendanceWarning) {
+
+    const state = promotionState;
+    const result = document.getElementById("promoResult");
+    const apply = document.getElementById("promoApply");
+    if (!state || !result) return;
+
+    const isGraduate = state.nextClass === PROMOTION_GRADUATE;
+    const goLabel = isGraduate ? "Graduate" : "Promote to " + state.nextClass;
+    const goValue = isGraduate ? "graduate" : "promote";
+
+    const counts = { promote: 0, repeat: 0, review: 0 };
+    state.rows.forEach(function (r) { counts[r.judge.status]++; });
+
+    const rule = promotionRuleFor(state.className);
+
+    let html =
+        "<p><strong>" + escapeHTML(state.className) + " " + escapeHTML(state.fromSession) + "</strong>: " +
+        counts.promote + " meet the rules, " + counts.repeat + " do not, " + counts.review + " need review.</p>" +
+        "<p style=\"font-size:13px;\">Rules used: average at least " + promotionFmt(rule.minAverage) +
+        ", subject pass mark " + promotionFmt(rule.subjectPassMark) +
+        (rule.minSubjectsPassed ? ", at least " + rule.minSubjectsPassed + " subjects passed" : "") +
+        (rule.compulsory.length ? ", compulsory: " + escapeHTML(rule.compulsory.join(", ")) : "") +
+        (rule.minAttendance ? ", attendance at least " + promotionFmt(rule.minAttendance) + "%" : "") + ".</p>";
+
+    if (attendanceWarning) {
+        html += "<p style=\"color:#b00020;\">Some attendance records could not be loaded.</p>";
+    }
+
+    html += "<div class=\"promo-table-wrap\"><table><thead><tr>" +
+        "<th>#</th><th>Adm No</th><th>Name</th><th>Avg</th><th>Passed</th><th>Attend.</th><th>Result</th><th>Action</th>" +
+        "</tr></thead><tbody>";
+
+    state.rows.forEach(function (row, index) {
+
+        const j = row.judge;
+        const label = j.status === "promote" ? "Meets the rules" : (j.status === "repeat" ? "Does not meet" : "Needs review");
+        const reasonText = j.reasons.length ? "<br><small>" + escapeHTML(j.reasons.join("; ")) + "</small>" : "";
+
+        html += "<tr><td>" + (index + 1) + "</td>" +
+            "<td>" + escapeHTML(row.student.admission_no) + "</td>" +
+            "<td>" + escapeHTML(row.student.student_name) + "</td>" +
+            "<td>" + (row.average === null ? "-" : promotionFmt(row.average)) + "</td>" +
+            "<td>" + (j.total ? j.passed + "/" + j.total : "-") + "</td>" +
+            "<td>" + (j.attendancePct === null ? "-" : promotionFmt(j.attendancePct) + "%") + "</td>" +
+            "<td>" + label + reasonText + "</td>" +
+            "<td><select data-promo-row=\"" + index + "\">" +
+            "<option value=\"" + goValue + "\"" + (row.decision === goValue ? " selected" : "") + ">" + escapeHTML(goLabel) + "</option>" +
+            "<option value=\"repeat\"" + (row.decision === "repeat" ? " selected" : "") + ">Repeat " + escapeHTML(state.className) + "</option>" +
+            "<option value=\"skip\"" + (row.decision === "skip" ? " selected" : "") + ">Do not move</option>" +
+            "</select></td></tr>";
+
+    });
+
+    html += "</tbody></table></div>";
+
+    result.innerHTML = html;
+
+    result.querySelectorAll("select[data-promo-row]").forEach(function (select) {
+        select.addEventListener("change", function () {
+            state.rows[Number(select.getAttribute("data-promo-row"))].decision = select.value;
+        });
+    });
+
+    apply.textContent = "Promote students to " + state.toSession;
+    apply.style.display = "";
+
+}
+
+async function promotionApply() {
+
+    if (promotionBusy || !promotionState) return;
+
+    if (staffContext) { alert("Only the school owner can use promotion."); return; }
+    if (!currentUserId) { promotionSetStatus("promoRunStatus", "❌ Please sign in first.", true); return; }
+
+    const state = promotionState;
+    const isGraduate = state.nextClass === PROMOTION_GRADUATE;
+
+    const movers = state.rows.filter(function (r) { return r.decision === "promote"; });
+    const repeaters = state.rows.filter(function (r) { return r.decision === "repeat"; });
+    const graduates = state.rows.filter(function (r) { return r.decision === "graduate"; });
+    const skipped = state.rows.length - movers.length - repeaters.length - graduates.length;
+
+    if (movers.length + repeaters.length === 0) {
+        promotionSetStatus("promoRunStatus", graduates.length
+            ? graduates.length + " student(s) graduate. There is nothing to add to a new class list."
+            : "No student is set to be promoted or to repeat.", graduates.length === 0);
+        return;
+    }
+
+    const lines = [];
+    if (movers.length) lines.push(movers.length + " student(s) to " + state.nextClass + " (" + state.toSession + ")");
+    if (repeaters.length) lines.push(repeaters.length + " student(s) repeating " + state.className + " (" + state.toSession + ")");
+    if (graduates.length) lines.push(graduates.length + " graduating");
+    if (skipped) lines.push(skipped + " not moved");
+
+    if (!confirm("Confirm promotion:\n\n" + lines.join("\n") +
+        "\n\nStudents are only added to the new session's class list. Nothing in " + state.fromSession + " is changed or deleted.")) {
+        return;
+    }
+
+    promotionBusy = true;
+    const applyButton = document.getElementById("promoApply");
+    applyButton.disabled = true;
+    promotionSetStatus("promoRunStatus", "⏳ Saving…");
+
+    try {
+
+        const groups = [];
+        if (movers.length) groups.push({ className: state.nextClass, rows: movers });
+        if (repeaters.length) groups.push({ className: state.className, rows: repeaters });
+
+        const now = new Date().toISOString();
+        const payloadAll = [];
+        const added = {};
+        const alreadyThere = {};
+
+        for (const group of groups) {
+
+            const existing = await fetchClassRoster(group.className, state.toSession);
+            if (rosterFetchFailed) throw new Error("Could not read the " + group.className + " list for " + state.toSession + ".");
+
+            const existingKeys = new Set(existing.map(function (s) { return rosterKey(s.admission_no, s.student_name); }));
+            const fresh = group.rows.filter(function (r) {
+                return !existingKeys.has(rosterKey(r.student.admission_no, r.student.student_name));
+            });
+
+            if (existing.length + fresh.length > TEMPLATE_STUDENT_ROWS) {
+                throw new Error(group.className + " (" + state.toSession + ") would have " + (existing.length + fresh.length) +
+                    " students; a class can have at most " + TEMPLATE_STUDENT_ROWS + ".");
+            }
+
+            added[group.className] = (added[group.className] || 0) + fresh.length;
+            alreadyThere[group.className] = (alreadyThere[group.className] || 0) + (group.rows.length - fresh.length);
+
+            fresh.forEach(function (r, i) {
+                payloadAll.push({
+                    owner_user_id: currentUserId,
+                    website_id: WEBSITE_ID,
+                    class_name: group.className,
+                    session: state.toSession,
+                    admission_no: r.student.admission_no,
+                    student_name: r.student.student_name,
+                    gender: r.student.gender,
+                    house: r.student.house,
+                    match_key: rosterKey(r.student.admission_no, r.student.student_name),
+                    sort_order: existing.length + i,
+                    updated_at: now
+                });
+            });
+
+        }
+
+        /* Saved on this phone first; it syncs to Supabase when online
+           (same way the Step 1A class list upload saves). */
+        if (payloadAll.length) {
+            await Offline.upsertManyByKey(
+                CLASS_ROSTER_TABLE,
+                ["owner_user_id", "website_id", "class_name", "session", "match_key"],
+                payloadAll
+            );
+        }
+
+        const parts = [];
+        Object.keys(added).forEach(function (cls) {
+            parts.push(added[cls] + " added to " + cls + " (" + state.toSession + ")" +
+                (alreadyThere[cls] ? ", " + alreadyThere[cls] + " already there" : ""));
+        });
+        if (graduates.length) parts.push(graduates.length + " graduating");
+
+        promotionState = null;
+        document.getElementById("promoResult").innerHTML = "";
+        applyButton.style.display = "none";
+        promotionSetStatus("promoRunStatus", "✅ Done. " + parts.join("; ") + ".");
+
+        /* If the class on screen is one that just changed, show the new list. */
+        try {
+            const context = getWorkflowContext(false);
+            if (context && context.className && context.session === state.toSession &&
+                (added[context.className] !== undefined)) {
+                classRoster = await fetchClassRoster(context.className, context.session);
+                renderStudentPreview();
+            }
+        } catch (ignore) { /* not important */ }
+
+    } catch (error) {
+        promotionSetStatus("promoRunStatus", "❌ " + (error && error.message ? error.message : "Promotion failed."), true);
+    } finally {
+        promotionBusy = false;
+        applyButton.disabled = false;
+    }
+
+}
+
+
+/* =========================================================
+   WHAT'S NEW BADGE
+   Developer posts updates in the Supabase table `app_updates`.
+   The menu link "What's New" shows a NEW badge until the owner
+   opens whats-new.html (which records the newest update seen).
+   ========================================================= */
+
+function initializeWhatsNewBadge() {
+
+    const link = document.getElementById("srgWhatsNewLink");
+
+    if (!link) { return; }
+
+    if (!document.getElementById("srgWhatsNewStyle")) {
+        const style = document.createElement("style");
+        style.id = "srgWhatsNewStyle";
+        style.textContent =
+            "#srgWhatsNewLink.srg-has-new::after{content:'NEW';" +
+            "margin-left:8px;padding:2px 7px;border-radius:999px;" +
+            "background:#dc2626;color:#fff;font-size:11px;" +
+            "font-weight:700;letter-spacing:.5px;}";
+        document.head.appendChild(style);
+    }
+
+    const seenKey = "srg_whatsnew_seen_" + WEBSITE_ID;
+
+    async function refresh() {
+
+        try {
+
+            const result = await supabaseClient
+                .from("app_updates")
+                .select("created_at")
+                .in("website_id", [WEBSITE_ID, "all"])
+                .eq("published", true)
+                .order("created_at", { ascending: false })
+                .limit(1);
+
+            if (result.error || !result.data || !result.data.length) {
+                link.classList.remove("srg-has-new");
+                return;
+            }
+
+            const newest = result.data[0].created_at;
+            let seen = "";
+
+            try { seen = localStorage.getItem(seenKey) || ""; } catch (e) { }
+
+            const isNew = !seen || new Date(newest) > new Date(seen);
+
+            link.classList.toggle("srg-has-new", isNew);
+
+        } catch (error) {
+            /* Never let the badge break the app. */
+            console.warn("What's New badge:", error);
+        }
+    }
+
+    refresh();
+
+    const toggle = document.getElementById("srgMenuToggle");
+
+    if (toggle) {
+        toggle.addEventListener("click", refresh);
+    }
+}
+
+
+/* =========================================================
+   NEXT TERM FEES & RESUMPTION DATE  (School Information)
+   Stored in reportSettings (school_profile.report_settings), so no
+   new table is needed. Shown on every generated report together with
+   the student's outstanding balance from the Fees area.
+   ========================================================= */
+
+function nextTermEl(id) {
+    return document.getElementById(id);
+}
+
+function renderNextTermBlock() {
+
+    if (!elementExists(saveSchoolInformationButton)) return;
+
+    let block = nextTermEl("nextTermBlock");
+
+    if (!block) {
+        block = document.createElement("div");
+        block.id = "nextTermBlock";
+        block.style.cssText = "margin:16px 0;";
+        saveSchoolInformationButton.insertAdjacentElement("beforebegin", block);
+    }
+
+    /* Keep what the owner has typed but not saved yet when this redraws. */
+    const typed = {};
+    block.querySelectorAll("input[data-next-term-class]").forEach(function (input) {
+        typed[input.getAttribute("data-next-term-class")] = input.value;
+    });
+    const dateInput = nextTermEl("nextTermResumption");
+    const typedDate = dateInput ? dateInput.value : null;
+
+    const saved = reportSettings.nextTermFees || {};
+    const names = (typeof schoolClasses !== "undefined" ? schoolClasses : [])
+        .map(function (c) { return c.class_name; })
+        .filter(Boolean)
+        .sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+
+    const inputStyle = "width:100%;box-sizing:border-box;padding:6px;";
+
+    let rows = "";
+
+    names.forEach(function (name) {
+
+        const key = normalizeClassKey(name);
+        let value = typed[name];
+
+        if (value === undefined) {
+            value = "";
+            Object.keys(saved).forEach(function (savedName) {
+                if (normalizeClassKey(savedName) === key && Number(saved[savedName]) > 0) {
+                    value = String(saved[savedName]);
+                }
+            });
+        }
+
+        rows +=
+            "<tr>" +
+            '<td style="padding:4px;border-bottom:1px solid #ddd;">' + escapeHTML(name) + "</td>" +
+            '<td style="padding:4px;border-bottom:1px solid #ddd;width:50%;">' +
+            '<input type="number" inputmode="decimal" min="0" step="any" ' +
+            'data-next-term-class="' + escapeHTML(name) + '" ' +
+            'value="' + escapeHTML(value) + '" placeholder="₦ amount" style="' + inputStyle + '">' +
+            "</td></tr>";
+    });
+
+    block.innerHTML =
+        '<div style="font-weight:bold;margin-bottom:4px;">Next Term Information</div>' +
+        '<p style="margin:0 0 8px;font-size:13px;">' +
+        "These appear on every generated report, so parents know when school resumes and what to pay." +
+        "</p>" +
+
+        '<label for="nextTermResumption" style="display:block;font-size:13px;margin-bottom:4px;">Next term resumption date</label>' +
+        '<input type="date" id="nextTermResumption" style="' + inputStyle + 'max-width:260px;">' +
+
+        '<div style="font-size:13px;margin:12px 0 4px;">Next term school fees per class</div>' +
+        (names.length
+            ? '<table style="border-collapse:collapse;width:100%;font-size:14px;">' +
+              "<thead><tr>" +
+              '<th style="text-align:left;padding:4px;border-bottom:2px solid #999;">Class</th>' +
+              '<th style="text-align:left;padding:4px;border-bottom:2px solid #999;">Fees (₦)</th>' +
+              "</tr></thead><tbody>" + rows + "</tbody></table>"
+            : '<p style="font-size:13px;opacity:.75;">Add your classes in Step 0 first, then enter their fees here.</p>') +
+
+        '<div id="nextTermMessage" style="font-size:13px;min-height:18px;margin-top:6px;"></div>' +
+        '<div style="font-size:12px;opacity:.75;margin-top:2px;">' +
+        "Leave a class empty to hide its fee. Press Save School Information to apply." +
+        "</div>";
+
+    const dateNow = nextTermEl("nextTermResumption");
+    if (dateNow) {
+        dateNow.value = typedDate !== null ? typedDate : (reportSettings.nextTermResumption || "");
+    }
+}
+
+/* Returns false (and shows why) when the form has a problem. */
+function applyNextTermFromForm() {
+
+    const block = nextTermEl("nextTermBlock");
+
+    /* The block is not on the page: leave the saved values alone. */
+    if (!block) return true;
+
+    const message = nextTermEl("nextTermMessage");
+    const fees = {};
+    let problem = "";
+
+    block.querySelectorAll("input[data-next-term-class]").forEach(function (input) {
+
+        const raw = input.value.trim();
+        if (!raw) return;
+
+        const amount = Number(raw);
+
+        if (!isFinite(amount) || amount < 0) {
+            problem = "Fees for " + input.getAttribute("data-next-term-class") + " must be a positive amount.";
+            return;
+        }
+
+        if (amount > 0) fees[input.getAttribute("data-next-term-class")] = Math.round(amount * 100) / 100;
+    });
+
+    if (problem) {
+        if (message) message.textContent = "❌ " + problem;
+        if (schoolInformationStatus) schoolInformationStatus.textContent = "❌ Not saved: " + problem;
+        return false;
+    }
+
+    const dateInput = nextTermEl("nextTermResumption");
+    const date = dateInput ? dateInput.value : "";
+
+    /* Keep fees of classes that are not listed now (e.g. a class not loaded yet). */
+    const previous = reportSettings.nextTermFees || {};
+    const listed = {};
+    block.querySelectorAll("input[data-next-term-class]").forEach(function (input) {
+        listed[normalizeClassKey(input.getAttribute("data-next-term-class"))] = true;
+    });
+    Object.keys(previous).forEach(function (name) {
+        if (!listed[normalizeClassKey(name)] && Number(previous[name]) > 0 && schoolClasses.length === 0) {
+            fees[name] = previous[name];
+        }
+    });
+
+    reportSettings.nextTermFees = fees;
+    reportSettings.nextTermResumption = date;
+
+    if (message) message.textContent = "";
+    return true;
+}
+
+
+/* =========================================================
+   FEES & NEXT TERM BLOCK ON THE REPORT
+   ========================================================= */
+
+/* "session|term|matchKey" -> { carry, due, paid, balance } */
+const feeBalanceCache = new Map();
+
+/* The "Show outstanding balance on the reports" tick box (Step 2 & 3).
+   Ticked = the balance prints on each report; unticked = it does not.
+   The choice is remembered on this device. */
+const SHOW_BALANCE_KEY = "srgShowBalanceOnReport";
+
+function showFeeBalanceOnReports() {
+    const box = document.getElementById("showBalanceOnReport");
+    return box ? !!box.checked : true;
+}
+
+(function setupShowBalanceBox() {
+    function start() {
+        const box = document.getElementById("showBalanceOnReport");
+        if (!box) return;
+        try {
+            if (localStorage.getItem(SHOW_BALANCE_KEY) === "0") box.checked = false;
+        } catch (e) { /* storage blocked: keep the default */ }
+        box.addEventListener("change", function () {
+            try { localStorage.setItem(SHOW_BALANCE_KEY, box.checked ? "1" : "0"); } catch (e) { /* ignore */ }
+        });
+    }
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+    else start();
+})();
+
+function feeCacheKey(session, term, matchKey) {
+    return String(session || "") + "|" + String(term || "") + "|" + String(matchKey || "");
+}
+
+/* entries: [{ className, session, term, admissionNo, name }] */
+async function preloadFeeBalances(entries) {
+
+    try {
+
+        if (!window.SRG_FEES || !Array.isArray(entries)) return;
+
+        const groups = new Map();
+
+        entries.forEach(function (entry) {
+            if (!entry.className || !entry.session || !entry.term) return;
+            const groupKey = entry.className + "|" + entry.session + "|" + entry.term;
+            if (!groups.has(groupKey)) groups.set(groupKey, { entry: entry, keys: new Set() });
+            groups.get(groupKey).keys.add(computeMatchKey(entry.admissionNo, entry.name));
+        });
+
+        for (const group of groups.values()) {
+
+            const e = group.entry;
+            const keys = Array.from(group.keys);
+            const result = await window.SRG_FEES.balancesForReports(e.className, e.session, e.term, keys);
+
+            keys.forEach(function (key) {
+                const cacheKey = feeCacheKey(e.session, e.term, key);
+                if (result && result[key]) feeBalanceCache.set(cacheKey, result[key]);
+                else feeBalanceCache.delete(cacheKey);
+            });
+        }
+
+    } catch (error) {
+        console.warn("Fee balances not loaded:", error);
+    }
+}
+
+function preloadFeeBalancesForStudents(list) {
+
+    return preloadFeeBalances((list || []).map(function (student) {
+        return {
+            className: String(student["Class"] || "").trim(),
+            session: String(student["Session"] || "").trim(),
+            term: String(student["Term"] || "").trim(),
+            admissionNo: student["Admission No"],
+            name: student["Student Name"]
+        };
+    }));
+}
+
+/* The cumulative (annual) report shows the balance at the end of the session. */
+function preloadFeeBalancesForCumulative(list, context) {
+
+    const term = ACADEMIC_TERMS[ACADEMIC_TERMS.length - 1];
+
+    return preloadFeeBalances((list || []).map(function (student) {
+        return {
+            className: String((context && context.className) || "").trim(),
+            session: String((context && context.session) || "").trim(),
+            term: term,
+            admissionNo: student.admission_no,
+            name: student.student_name
+        };
+    }));
+}
+
+function formatNairaForReport(amount) {
+    try {
+        return new Intl.NumberFormat("en-NG", { style: "currency", currency: "NGN", maximumFractionDigits: 2 }).format(Number(amount) || 0);
+    } catch (e) {
+        return "₦" + (Number(amount) || 0).toFixed(2);
+    }
+}
+
+function formatResumptionDate(iso) {
+    if (!iso) return "";
+    const d = new Date(iso + "T00:00:00");
+    return isNaN(d) ? iso : d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+}
+
+/* info: { className, session, term, admissionNo, name } */
+function feesNoticeHtml(info) {
+
+    const fees = reportSettings.nextTermFees || {};
+    const classKey = normalizeClassKey(info.className);
+
+    let nextFee = null;
+
+    Object.keys(fees).forEach(function (name) {
+        if (normalizeClassKey(name) === classKey && Number(fees[name]) > 0) nextFee = Number(fees[name]);
+    });
+
+    const resumption = formatResumptionDate(reportSettings.nextTermResumption);
+
+    const balance = showFeeBalanceOnReports()
+        ? feeBalanceCache.get(
+            feeCacheKey(info.session, info.term, computeMatchKey(info.admissionNo, info.name))
+        )
+        : undefined;
+
+    const cards = [];
+    const cardStyle = "border:1px solid #999;border-radius:6px;padding:8px 10px;break-inside:avoid;";
+    const labelStyle = "font-size:11px;text-transform:uppercase;letter-spacing:.4px;opacity:.75;";
+
+    function card(label, value, color) {
+        cards.push(
+            '<div style="' + cardStyle + '">' +
+            '<div style="' + labelStyle + '">' + escapeHTML(label) + "</div>" +
+            '<strong style="font-size:16px;' + (color ? "color:" + color + ";" : "") + '">' + escapeHTML(value) + "</strong>" +
+            "</div>"
+        );
+    }
+
+    let outstanding = 0;
+
+    if (balance) {
+        if (balance.balance > 0) {
+            outstanding = balance.balance;
+            card("Outstanding balance", formatNairaForReport(balance.balance), "#b91c1c");
+        } else {
+            card("School fees", "Fully paid ✓", "#15803d");
+        }
+    }
+
+    if (resumption) card("Next term begins", resumption);
+    if (nextFee !== null) card("Next term fees", formatNairaForReport(nextFee));
+
+    if (outstanding > 0 && nextFee !== null) {
+        card("Total to pay at resumption", formatNairaForReport(outstanding + nextFee), "#1d4ed8");
+    }
+
+    if (!cards.length) return "";
+
+    return `
+            <section class="fees-notice-section" style="margin-top:12px;break-inside:avoid;page-break-inside:avoid;">
+                <div class="section-heading">
+                    <span class="section-number">06</span>
+                    <div>
+                        <h2>Fees &amp; Next Term</h2>
+                    </div>
+                </div>
+
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;">
+                    ${cards.join("")}
+                </div>
+            </section>
+    `;
+}
